@@ -60,6 +60,22 @@ Step 10-a에서 planner는 이제 합법적으로 `EscalationProposal`을 제출
 - 과거 founder replies 전부를 planner에 먹이지 않습니다
 - latest active reply chain 또는 최근 2개 intervention만 context에 유지합니다
 
+6. **Escalation quota 초과는 illegal rejection이 아니라 bounded exhaustion으로 처리**
+- 같은 phase 안에서 founder hint quota를 초과한 추가 escalation이 들어오면,
+  시스템은 그 escalation attempt를 기록한 뒤 현재 founder-help lane을
+  `exhausted` 또는 동등한 bounded stopped 상태로 전이합니다
+- 단순 `illegal`로만 튕기지 않습니다
+
+7. **Founder hint는 auto-approve를 부여하지 않음**
+- founder가 `hint`를 줬다고 해서 그 다음 planner proposal이 자동 승인되지는 않습니다
+- hint 이후 planner가 낸 새 proposal은 여전히 기존 legality / governance 경로를 탑니다
+- founder가 직접 실행을 밀고 싶을 때만 `override`를 사용합니다
+
+8. **Founder override는 별도 founder-driven execution path로 기록**
+- override는 planner proposal을 흉내 내는 것이 아니라
+  `founder intervention`이 작성한 직접 개입 이벤트로 남겨야 합니다
+- 다만 실행 자체는 기존 bounded execution / legal action 파이프라인에 연결되어야 합니다
+
 ## 이번 단계에서 하지 않는 것
 
 - production provider hardening
@@ -82,6 +98,8 @@ Step 10-a에서 planner는 이제 합법적으로 `EscalationProposal`을 제출
   같은 phase 안에서는 escalation quota를 둬야 합니다
 - override 이후에는 planner가 인과관계를 잃지 않도록
   founder intervention summary를 다음 context에 주입해야 합니다
+- founder hint 이후 planner가 낸 proposal을 자동 승인하면
+  hint와 override의 의미 차이가 흐려지므로, auto-approve는 열지 않습니다
 
 ## Acceptance Criteria
 
@@ -93,6 +111,8 @@ Step 10-a에서 planner는 이제 합법적으로 `EscalationProposal`을 제출
 - founder reject는 planner에게 억지 action 선택을 강요하지 않는다
 - founder override는 bounded override로만 동작한다
 - founder intervention은 다음 planner context와 replay에 연결된다
+- escalation quota 초과는 explicit bounded exhaustion으로 기록된다
+- founder hint 이후의 planner proposal은 기존 approval / governance 규칙을 유지한다
 - CLI에서 founder reply와 이후 planner 재진입을 proof할 수 있다
 
 ## 메모
