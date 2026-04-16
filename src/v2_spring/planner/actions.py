@@ -29,6 +29,8 @@ def evaluate_possible_actions(snapshot: RunSnapshotView) -> PossibleActionEvalua
                 context_hint=snapshot.pending_approval.reason,
             ),
         )
+    elif snapshot.pending_founder_escalation is not None:
+        actions = []
     elif snapshot.run.status == RunStatus.READY and snapshot.task_summary.created == 0 and snapshot.task_summary.running == 0:
         actions.append(
             PossibleActionView(
@@ -57,6 +59,9 @@ def evaluate_possible_actions(snapshot: RunSnapshotView) -> PossibleActionEvalua
     if actions:
         action_state = SnapshotActionState.AVAILABLE
         action_state_reason = "One or more legal next actions are available."
+    elif snapshot.pending_founder_escalation is not None:
+        action_state = SnapshotActionState.BLOCKED
+        action_state_reason = "A founder reply is required before planner actions can continue."
     elif snapshot.run.status == RunStatus.RUNNING:
         action_state = SnapshotActionState.BLOCKED
         action_state_reason = "A bounded task is currently running."

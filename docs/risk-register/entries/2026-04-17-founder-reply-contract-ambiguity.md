@@ -1,7 +1,7 @@
 # Risk ID: RISK-0017
-Title: Founder reply semantics are still ambiguous after planner escalation
+Title: ~~Founder reply semantics were ambiguous after planner escalation~~
 Class: Before Next Phase
-Status: Open
+Status: Resolved
 Owner: Core / Founder interaction
 Observed In: Step 10 design review
 
@@ -47,8 +47,8 @@ Until founder reply semantics are typed, escalation remains only half-defined.
 - GitHub Issue: #22
 
 ## Doc Links
-- ADR: ../../adr/0007-planner-decision-output-contract.md
-- Design note: ../../implementation-notes/STEP_10_LANGGRAPH_PLANNER_ADAPTER.md
+- ADR: ../../adr/0008-founder-reply-contract.md
+- Design note: ../../implementation-notes/STEP_10B_FOUNDER_REPLY_CONTRACT.md
 
 ## Exit Criteria
 

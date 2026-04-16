@@ -7,6 +7,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator
 
+from v2_spring.domain.founder_intervention import FounderInterventionDigest
 from v2_spring.domain.planner_attempt import PlannerAttemptOutcome
 from v2_spring.domain.snapshot import PossibleActionName, PossibleActionView, RunSnapshotView
 
@@ -120,6 +121,7 @@ class PlannerContextWindow(BaseModel):
     legal_actions: list[PossibleActionView]
     masked_actions: list[MaskedActionView]
     recent_attempts: list[PlannerAttemptDigest]
+    founder_interventions: list[FounderInterventionDigest]
     latest_rejection_reason: str | None = Field(default=None, max_length=4000)
     failure_report: FailureReportView | None = None
     stale_quota_limit: int = Field(ge=1)

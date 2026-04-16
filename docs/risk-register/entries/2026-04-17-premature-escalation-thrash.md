@@ -1,7 +1,7 @@
 # Risk ID: RISK-0016
 Title: Planner may escalate too early or too often once escalation becomes a legal output type
 Class: Before Next Phase
-Status: Open
+Status: Mitigating
 Owner: Core / Planner governance
 Observed In: Step 10 design review
 
@@ -37,6 +37,7 @@ actions) for another (constant escalation).
 - define stronger founder reply semantics before opening richer planner loops
 - if a planner burns the founder-hint quota for the current phase, transition the
   current loop into a bounded exhausted state instead of allowing endless ping-pong
+- block planner reinvocation while a founder escalation is still pending
 
 ## Capability Gate
 - Capability: planner-backed tracer bullet / founder hint loop
@@ -47,8 +48,8 @@ actions) for another (constant escalation).
 - GitHub Issue: #22
 
 ## Doc Links
-- ADR: ../../adr/0007-planner-decision-output-contract.md
-- Design note: ../../implementation-notes/STEP_10_LANGGRAPH_PLANNER_ADAPTER.md
+- ADR: ../../adr/0008-founder-reply-contract.md
+- Design note: ../../implementation-notes/STEP_10B_FOUNDER_REPLY_CONTRACT.md
 
 ## Exit Criteria
 

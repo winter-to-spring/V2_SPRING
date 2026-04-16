@@ -14,6 +14,13 @@ from sqlalchemy.orm import Session, sessionmaker
 from v2_spring.domain.approval import ApprovalStatus, ApprovalView
 from v2_spring.domain.artifact import ArtifactStorageKind, ArtifactType, ArtifactView
 from v2_spring.domain.decision import DecisionKind, DecisionView
+from v2_spring.domain.founder_intervention import (
+    FounderInterventionDigest,
+    FounderInterventionView,
+    FounderOverrideInput,
+    FounderReplyInput,
+    FounderReplyKind,
+)
 from v2_spring.domain.observation import ObservationKind, ObservationView
 from v2_spring.domain.planner_adapter import (
     EscalationProposal,
@@ -33,6 +40,7 @@ from v2_spring.domain.replay import ArtifactInspectionView, RunReplayView, TaskR
 from v2_spring.domain.run import RunCreateInput, RunStatus, RunView
 from v2_spring.domain.snapshot import (
     ArtifactHeadlineView,
+    PendingFounderEscalationView,
     PossibleActionView,
     PossibleActionName,
     RunSnapshotView,
@@ -53,6 +61,7 @@ from v2_spring.ledger.models import (
     Base,
     DecisionRecord,
     EventLedgerRecord,
+    FounderInterventionRecord,
     LedgerEventType,
     ObservationRecord,
     PlannerAttemptRecord,
@@ -93,6 +102,7 @@ class LedgerStore:
     )
     _PLANNER_PHASE_BUDGET_LIMIT = 3
     _PLANNER_STALE_QUOTA_LIMIT = 3
+    _FOUNDER_HINT_QUOTA_LIMIT = 2
     _PLANNER_BUDGET_CONSUMING_OUTCOMES = frozenset(
         {
             PlannerAttemptOutcome.REJECTED_ILLEGAL,
@@ -403,6 +413,17 @@ class LedgerStore:
             records = list(session.scalars(statement).all())
             return [self._to_planner_attempt_view(record) for record in records]
 
+    def list_founder_interventions_for_run(self, run_id: str) -> list[FounderInterventionView]:
+        self.ensure_schema()
+        with self.session() as session:
+            statement = (
+                select(FounderInterventionRecord)
+                .where(FounderInterventionRecord.run_id == run_id)
+                .order_by(FounderInterventionRecord.created_at.asc(), FounderInterventionRecord.id.asc())
+            )
+            records = list(session.scalars(statement).all())
+            return [self._to_founder_intervention_view(record) for record in records]
+
     def list_tasks_for_run(self, run_id: str) -> list[TaskView]:
         self.ensure_schema()
         with self.session() as session:
@@ -495,6 +516,13 @@ class LedgerStore:
                     .order_by(PlannerAttemptRecord.created_at.asc(), PlannerAttemptRecord.id.asc()),
                 ).all(),
             )
+            founder_intervention_records = list(
+                session.scalars(
+                    select(FounderInterventionRecord)
+                    .where(FounderInterventionRecord.run_id == run_id)
+                    .order_by(FounderInterventionRecord.created_at.asc(), FounderInterventionRecord.id.asc()),
+                ).all(),
+            )
             ledger_events = list(
                 session.scalars(
                     select(EventLedgerRecord)
@@ -503,6 +531,9 @@ class LedgerStore:
                 ).all(),
             )
             planner_attempts = [self._to_planner_attempt_view(record) for record in planner_attempt_records]
+            founder_interventions = [
+                self._to_founder_intervention_view(record) for record in founder_intervention_records
+            ]
 
             decision_map = {str(decision.id): decision for decision in decisions}
             task_map = {record.id: self._to_task_view(record) for record in task_records}
@@ -543,6 +574,7 @@ class LedgerStore:
                 decisions=decisions,
                 tasks=task_replays,
                 planner_attempts=planner_attempts,
+                founder_interventions=founder_interventions,
                 observations=observations,
                 orphan_artifacts=orphan_artifacts,
                 consistency_warnings=self._build_consistency_warnings(
@@ -579,6 +611,13 @@ class LedgerStore:
                     .order_by(DecisionRecord.created_at.asc(), DecisionRecord.id.asc()),
                 ).all()
             ]
+            observation_records = list(
+                session.scalars(
+                    select(ObservationRecord)
+                    .where(ObservationRecord.run_id == run_id)
+                    .order_by(ObservationRecord.created_at.asc(), ObservationRecord.id.asc()),
+                ).all(),
+            )
             task_records = list(
                 session.scalars(
                     select(TaskRecord)
@@ -598,6 +637,13 @@ class LedgerStore:
                     select(PlannerAttemptRecord)
                     .where(PlannerAttemptRecord.run_id == run_id)
                     .order_by(PlannerAttemptRecord.created_at.asc(), PlannerAttemptRecord.id.asc()),
+                ).all(),
+            )
+            founder_intervention_records = list(
+                session.scalars(
+                    select(FounderInterventionRecord)
+                    .where(FounderInterventionRecord.run_id == run_id)
+                    .order_by(FounderInterventionRecord.created_at.asc(), FounderInterventionRecord.id.asc()),
                 ).all(),
             )
 
@@ -620,6 +666,26 @@ class LedgerStore:
                 if artifact_records
                 else None
             )
+            pending_founder_escalation = self._build_pending_founder_escalation(
+                observation_records=observation_records,
+                founder_intervention_records=founder_intervention_records,
+            )
+            founder_interventions = [
+                self._to_founder_intervention_view(record) for record in founder_intervention_records
+            ]
+            recent_founder_interventions = [
+                FounderInterventionDigest(
+                    reply_kind=item.reply_kind,
+                    summary=self._sanitize_planner_text(item.summary, limit=400)
+                    or "Founder intervention recorded.",
+                    detail=self._sanitize_planner_text(item.detail, limit=1000)
+                    or "Founder intervention detail is unavailable.",
+                    override_action=item.override_action,
+                    created_at=item.created_at,
+                )
+                for item in founder_interventions[-2:]
+            ]
+            latest_founder_intervention_summary = founder_interventions[-1].summary if founder_interventions else None
             task_summary = self._build_task_status_summary(task_records)
             planner_phase_key = self._build_planner_phase_key(
                 run=self._to_run_view(run_record),
@@ -639,6 +705,10 @@ class LedgerStore:
                 "policy_version": POSSIBLE_ACTIONS_ENGINE_VERSION,
                 "run": self._to_run_view(run_record).model_dump(mode="json"),
                 "pending_approval": pending_approval.model_dump(mode="json") if pending_approval else None,
+                "pending_founder_escalation": (
+                    pending_founder_escalation.model_dump(mode="json") if pending_founder_escalation else None
+                ),
+                "latest_founder_intervention_summary": latest_founder_intervention_summary,
                 "latest_rejection_reason": latest_rejection_reason,
                 "latest_decision_summary": latest_decision_summary,
                 "planner_phase_key": planner_governance.phase_key,
@@ -667,6 +737,8 @@ class LedgerStore:
                 action_state=SnapshotActionState.STUCK,
                 action_state_reason="Possible actions have not been evaluated yet.",
                 pending_approval=pending_approval,
+                pending_founder_escalation=pending_founder_escalation,
+                latest_founder_intervention_summary=latest_founder_intervention_summary,
                 latest_rejection_reason=latest_rejection_reason,
                 latest_decision_summary=latest_decision_summary,
                 planner_phase_key=planner_governance.phase_key,
@@ -682,6 +754,7 @@ class LedgerStore:
                 task_summary=task_summary,
                 latest_task=latest_task,
                 latest_artifact=latest_artifact,
+                recent_founder_interventions=recent_founder_interventions,
             )
 
     def record_planner_proposal(
@@ -716,6 +789,11 @@ class LedgerStore:
             raise PlannerPhaseExhaustedError(
                 "Planner phase budget is exhausted for the current state segment. "
                 "Use `v2-spring planner recharge <run-id> --reason ...` before proposing again.",
+            )
+        if snapshot.pending_founder_escalation is not None:
+            raise PermissionError(
+                "Founder reply is still required for the current planner escalation before new proposals are allowed. "
+                f"Pending escalation={snapshot.pending_founder_escalation.observation_id}.",
             )
 
         if proposal.submission_key is not None:
@@ -843,7 +921,7 @@ class LedgerStore:
             (
                 attempt
                 for attempt in current_attempts
-                if attempt.outcome == PlannerAttemptOutcome.ACCEPTED
+                if attempt.outcome == PlannerAttemptOutcome.ACCEPTED and attempt.selected_action is not None
             ),
             None,
         )
@@ -1171,6 +1249,7 @@ class LedgerStore:
             legal_actions=legal_actions,
             masked_actions=masked_actions,
             recent_attempts=recent_attempts,
+            founder_interventions=evaluation.snapshot.recent_founder_interventions,
             latest_rejection_reason=self._sanitize_planner_text(
                 evaluation.snapshot.latest_rejection_reason,
                 limit=4000,
@@ -1196,6 +1275,36 @@ class LedgerStore:
 
         snapshot = self.build_run_snapshot(run_id)
         governance = self.build_planner_governance(run_id)
+        if governance.exhausted:
+            raise PlannerPhaseExhaustedError(
+                "Planner phase budget is exhausted for the current state segment. "
+                "Use `v2-spring planner recharge <run-id> --reason ...` before escalating again.",
+            )
+        if snapshot.pending_founder_escalation is not None:
+            raise PermissionError(
+                "Founder reply is still required for the current planner escalation before another escalation can be recorded. "
+                f"Pending escalation={snapshot.pending_founder_escalation.observation_id}.",
+            )
+        founder_interventions = self.list_founder_interventions_for_run(run_id)
+        phase_hint_count = sum(
+            1
+            for intervention in founder_interventions
+            if intervention.phase_key == governance.phase_key and intervention.reply_kind == FounderReplyKind.HINT
+        )
+        if phase_hint_count >= self._FOUNDER_HINT_QUOTA_LIMIT:
+            refreshed_governance = self.build_planner_governance(run_id)
+            self._record_phase_exhaustion(
+                run_id=run_id,
+                governance=refreshed_governance,
+                snapshot_hash=snapshot.state_hash,
+                reason=(
+                    "Planner escalation quota was exhausted after repeated founder hints in the current phase."
+                ),
+            )
+            raise PlannerPhaseExhaustedError(
+                "Planner escalation quota is exhausted for the current phase after repeated founder hints. "
+                "Recharge or advance state before escalating again.",
+            )
         proposal_fingerprint = sha256(
             json.dumps(
                 {
@@ -1270,6 +1379,152 @@ class LedgerStore:
                 f"requested_help={self._sanitize_planner_text(requested_help, limit=500)}."
             ),
         )
+
+    def record_founder_reply(
+        self,
+        *,
+        run_id: str,
+        target_escalation_id: str,
+        reply: FounderReplyInput,
+    ) -> FounderInterventionView:
+        """Record one typed founder intervention against the current open escalation."""
+
+        snapshot = self.build_run_snapshot(run_id)
+        governance = self.build_planner_governance(run_id)
+        pending_escalation = snapshot.pending_founder_escalation
+        if pending_escalation is None:
+            raise LookupError("No pending planner escalation is waiting for a founder reply.")
+        if str(pending_escalation.observation_id) != target_escalation_id:
+            raise ValueError(
+                "Founder reply must target the current open planner escalation. "
+                f"Expected={pending_escalation.observation_id}, provided={target_escalation_id}.",
+            )
+
+        override_action: PossibleActionName | None = None
+        summary: str
+        detail: str
+        if reply.kind == "hint":
+            summary = "Founder provided a bounded hint for the planner."
+            detail = reply.message
+        elif reply.kind == "override":
+            legal_actions = {
+                action.name
+                for action in evaluate_possible_actions(
+                    snapshot.model_copy(
+                        update={
+                            "pending_founder_escalation": None,
+                            "action_state": SnapshotActionState.STUCK,
+                            "action_state_reason": "Possible actions have not been evaluated yet.",
+                        },
+                    ),
+                ).actions
+            }
+            if reply.selected_action not in legal_actions:
+                legal_action_summary = ", ".join(action.value for action in sorted(legal_actions, key=lambda item: item.value))
+                raise ValueError(
+                    f"Founder override action {reply.selected_action.value} is not currently legal. "
+                    f"Legal actions: {legal_action_summary if legal_action_summary else 'none'}.",
+                )
+            override_action = reply.selected_action
+            summary = f"Founder overrode the planner and selected {reply.selected_action.value}."
+            detail = reply.reason
+        else:
+            summary = "Founder rejected the planner escalation and stopped the current help lane."
+            detail = reply.reason
+
+        self.ensure_schema()
+        with self.session() as session:
+            target_observation = session.get(ObservationRecord, target_escalation_id)
+            if target_observation is None or target_observation.run_id != run_id:
+                raise LookupError(
+                    f"Planner escalation observation {target_escalation_id} was not found for run {run_id}.",
+                )
+            if target_observation.kind != ObservationKind.PLANNER_ESCALATION:
+                raise ValueError(
+                    f"Observation {target_escalation_id} is not a planner escalation and cannot receive a founder reply.",
+                )
+            existing = session.scalars(
+                select(FounderInterventionRecord).where(
+                    FounderInterventionRecord.target_observation_id == target_escalation_id,
+                ),
+            ).first()
+            if existing is not None:
+                raise ValueError(
+                    f"Planner escalation {target_escalation_id} already has a founder reply recorded.",
+                )
+
+            record = FounderInterventionRecord(
+                run_id=run_id,
+                target_observation_id=target_escalation_id,
+                phase_key=governance.phase_key,
+                policy_version=governance.policy_version,
+                reply_kind=FounderReplyKind(reply.kind),
+                summary=summary,
+                detail=detail,
+                override_action=override_action.value if override_action is not None else None,
+            )
+            session.add(record)
+            session.flush()
+            session.add(
+                EventLedgerRecord(
+                    run_id=run_id,
+                    event_type=LedgerEventType.FOUNDER_INTERVENTION_RECORDED,
+                    payload={
+                        "founder_intervention_id": record.id,
+                        "target_escalation_id": target_escalation_id,
+                        "reply_kind": record.reply_kind.value,
+                        "summary": record.summary,
+                        "override_action": record.override_action,
+                        "phase_key": record.phase_key,
+                    },
+                ),
+            )
+            if override_action is not None:
+                decision = DecisionRecord(
+                    run_id=run_id,
+                    kind=DecisionKind.FOUNDER_OVERRIDE_ACCEPTED,
+                    summary=f"Founder manually selected {override_action.value}.",
+                    rationale=detail,
+                )
+                session.add(decision)
+                session.flush()
+                session.add(
+                    EventLedgerRecord(
+                        run_id=run_id,
+                        event_type=LedgerEventType.DECISION_RECORDED,
+                        payload={
+                            "decision_id": decision.id,
+                            "kind": decision.kind.value,
+                            "summary": decision.summary,
+                            "rationale": decision.rationale,
+                            "policy_version": governance.policy_version,
+                            "selected_action": override_action.value,
+                            "source": "founder_override",
+                        },
+                    ),
+                )
+            session.flush()
+
+        intervention = self.list_founder_interventions_for_run(run_id)[-1]
+        if reply.kind == "override":
+            refreshed_governance = self.build_planner_governance(run_id)
+            self._record_phase_exhaustion(
+                run_id=run_id,
+                governance=refreshed_governance,
+                snapshot_hash=self.build_run_snapshot(run_id).state_hash,
+                reason=(
+                    f"Founder override selected {override_action.value}; planner proposals stay closed until state advances."
+                ),
+            )
+        elif reply.kind == "reject":
+            refreshed_governance = self.build_planner_governance(run_id)
+            self._record_phase_exhaustion(
+                run_id=run_id,
+                governance=refreshed_governance,
+                snapshot_hash=self.build_run_snapshot(run_id).state_hash,
+                reason="Founder rejected further help for the current planner escalation lane.",
+            )
+        return intervention
 
     def record_planner_format_failure(
         self,
@@ -1774,6 +2029,23 @@ class LedgerStore:
         )
 
     @staticmethod
+    def _to_founder_intervention_view(record: FounderInterventionRecord) -> FounderInterventionView:
+        return FounderInterventionView.model_validate(
+            {
+                "id": record.id,
+                "run_id": record.run_id,
+                "target_escalation_id": record.target_observation_id,
+                "phase_key": record.phase_key,
+                "policy_version": record.policy_version,
+                "reply_kind": record.reply_kind,
+                "summary": record.summary,
+                "detail": record.detail,
+                "override_action": record.override_action,
+                "created_at": record.created_at,
+            },
+        )
+
+    @staticmethod
     def _to_approval_view(record: ApprovalRecord) -> ApprovalView:
         return ApprovalView.model_validate(
             {
@@ -1807,6 +2079,30 @@ class LedgerStore:
             running=counts[TaskStatus.RUNNING],
             completed=counts[TaskStatus.COMPLETED],
             failed=counts[TaskStatus.FAILED],
+        )
+
+    @staticmethod
+    def _build_pending_founder_escalation(
+        *,
+        observation_records: list[ObservationRecord],
+        founder_intervention_records: list[FounderInterventionRecord],
+    ) -> PendingFounderEscalationView | None:
+        resolved_targets = {record.target_observation_id for record in founder_intervention_records}
+        open_escalation = next(
+            (
+                record
+                for record in reversed(observation_records)
+                if record.kind == ObservationKind.PLANNER_ESCALATION and record.id not in resolved_targets
+            ),
+            None,
+        )
+        if open_escalation is None:
+            return None
+        return PendingFounderEscalationView(
+            observation_id=open_escalation.id,
+            summary=open_escalation.summary,
+            details=open_escalation.details[:1000],
+            created_at=open_escalation.created_at,
         )
 
     @staticmethod

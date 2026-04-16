@@ -13,6 +13,10 @@ from v2_spring.adapters.langgraph_planner import (
 )
 from v2_spring.config import load_config
 from v2_spring.domain.approval import ApprovalStatus
+from v2_spring.domain.founder_intervention import (
+    FOUNDER_REPLY_INPUT_ADAPTER,
+    FounderInterventionView,
+)
 from v2_spring.domain.planner_adapter import (
     ActionProposal,
     EscalationProposal,
@@ -384,6 +388,116 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override DATABASE_URL for this invocation.",
     )
+
+    planner_interventions_parser = planner_subparsers.add_parser(
+        "interventions",
+        help="Show founder interventions for one run.",
+    )
+    planner_interventions_parser.add_argument("run_id", help="Run id to inspect.")
+    planner_interventions_parser.add_argument(
+        "--format",
+        default="pretty",
+        choices=["pretty", "json"],
+        help="Output format. Defaults to pretty.",
+    )
+    planner_interventions_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Override DATABASE_URL for this invocation.",
+    )
+
+    planner_reply_parser = planner_subparsers.add_parser(
+        "reply",
+        help="Record one typed founder reply against the current planner escalation.",
+    )
+    planner_reply_subparsers = planner_reply_parser.add_subparsers(dest="planner_reply_kind")
+
+    planner_reply_hint_parser = planner_reply_subparsers.add_parser(
+        "hint",
+        help="Give the planner a bounded hint and reopen the founder-help lane.",
+    )
+    planner_reply_hint_parser.add_argument("run_id", help="Run id to target.")
+    planner_reply_hint_parser.add_argument(
+        "--escalation-id",
+        required=True,
+        help="Current pending planner escalation observation id.",
+    )
+    planner_reply_hint_parser.add_argument(
+        "--message",
+        required=True,
+        help="Founder hint that the planner should consider on the next bounded attempt.",
+    )
+    planner_reply_hint_parser.add_argument(
+        "--format",
+        default="pretty",
+        choices=["pretty", "json"],
+        help="Output format. Defaults to pretty.",
+    )
+    planner_reply_hint_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Override DATABASE_URL for this invocation.",
+    )
+
+    planner_reply_override_parser = planner_reply_subparsers.add_parser(
+        "override",
+        help="Force one currently legal action without opening god mode.",
+    )
+    planner_reply_override_parser.add_argument("run_id", help="Run id to target.")
+    planner_reply_override_parser.add_argument(
+        "--escalation-id",
+        required=True,
+        help="Current pending planner escalation observation id.",
+    )
+    planner_reply_override_parser.add_argument(
+        "--action",
+        required=True,
+        choices=[action.value for action in PossibleActionName],
+        help="Currently legal action that the founder wants to force.",
+    )
+    planner_reply_override_parser.add_argument(
+        "--reason",
+        required=True,
+        help="Why the founder is manually forcing this action.",
+    )
+    planner_reply_override_parser.add_argument(
+        "--format",
+        default="pretty",
+        choices=["pretty", "json"],
+        help="Output format. Defaults to pretty.",
+    )
+    planner_reply_override_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Override DATABASE_URL for this invocation.",
+    )
+
+    planner_reply_reject_parser = planner_reply_subparsers.add_parser(
+        "reject",
+        help="Reject the current planner escalation and stop the founder-help lane.",
+    )
+    planner_reply_reject_parser.add_argument("run_id", help="Run id to target.")
+    planner_reply_reject_parser.add_argument(
+        "--escalation-id",
+        required=True,
+        help="Current pending planner escalation observation id.",
+    )
+    planner_reply_reject_parser.add_argument(
+        "--reason",
+        required=True,
+        help="Why the founder refuses to help further in the current phase.",
+    )
+    planner_reply_reject_parser.add_argument(
+        "--format",
+        default="pretty",
+        choices=["pretty", "json"],
+        help="Output format. Defaults to pretty.",
+    )
+    planner_reply_reject_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Override DATABASE_URL for this invocation.",
+    )
     return parser
 
 
@@ -620,7 +734,9 @@ def _render_snapshot(snapshot: RunSnapshotView) -> str:
         f"status:              {snapshot.run.status.value}",
         f"action_state:        {snapshot.action_state.value}",
         f"action_state_reason: {snapshot.action_state_reason}",
+        f"pending_escalation:  {snapshot.pending_founder_escalation.observation_id if snapshot.pending_founder_escalation is not None else '-'}",
         f"latest_decision:     {snapshot.latest_decision_summary if snapshot.latest_decision_summary else '-'}",
+        f"latest_founder:      {snapshot.latest_founder_intervention_summary if snapshot.latest_founder_intervention_summary else '-'}",
         f"latest_rejection:    {snapshot.latest_rejection_reason if snapshot.latest_rejection_reason else '-'}",
         f"planner_budget:      {snapshot.planner_budget_used}/{snapshot.planner_budget_limit}",
         f"planner_remaining:   {snapshot.planner_budget_remaining}",
@@ -646,6 +762,17 @@ def _render_snapshot(snapshot: RunSnapshotView) -> str:
                 f"id:                  {snapshot.pending_approval.id}",
                 f"requested_action:    {snapshot.pending_approval.requested_action}",
                 f"reason:              {snapshot.pending_approval.reason}",
+            ],
+        )
+    if snapshot.pending_founder_escalation is not None:
+        lines.extend(
+            [
+                "",
+                "Pending founder escalation",
+                "-------------------------",
+                f"id:                  {snapshot.pending_founder_escalation.observation_id}",
+                f"summary:             {snapshot.pending_founder_escalation.summary}",
+                f"details:             {snapshot.pending_founder_escalation.details}",
             ],
         )
     if snapshot.latest_task is not None:
@@ -675,6 +802,17 @@ def _render_snapshot(snapshot: RunSnapshotView) -> str:
                 f"hash_matches:        {snapshot.latest_artifact.hash_matches}",
             ],
         )
+    if snapshot.recent_founder_interventions:
+        lines.extend(["", "Recent founder interventions", "---------------------------"])
+        for intervention in snapshot.recent_founder_interventions:
+            lines.append(
+                f"- {intervention.reply_kind.value}: {intervention.summary}"
+                + (
+                    f" (override={intervention.override_action.value})"
+                    if intervention.override_action is not None
+                    else ""
+                )
+            )
     return "\n".join(lines)
 
 
@@ -688,6 +826,7 @@ def _render_actions(evaluation: PossibleActionEvaluationView) -> str:
         f"state_hash:          {evaluation.snapshot.state_hash}",
         f"action_state:        {evaluation.snapshot.action_state.value}",
         f"action_state_reason: {evaluation.snapshot.action_state_reason}",
+        f"pending_escalation:  {evaluation.snapshot.pending_founder_escalation.observation_id if evaluation.snapshot.pending_founder_escalation is not None else '-'}",
         f"planner_budget:      {evaluation.snapshot.planner_budget_used}/{evaluation.snapshot.planner_budget_limit}",
         f"stale_quota:         {evaluation.snapshot.planner_stale_quota_used}/{evaluation.snapshot.planner_stale_quota_limit}",
     ]
@@ -872,6 +1011,47 @@ def _render_planner_attempts(attempts: list[PlannerAttemptView], *, run_id: str)
     return "\n".join(lines)
 
 
+def _render_founder_intervention(intervention: FounderInterventionView) -> str:
+    return dedent(
+        f"""\
+        Founder intervention
+        -------------------
+        id:                 {intervention.id}
+        run_id:             {intervention.run_id}
+        target_escalation:  {intervention.target_escalation_id}
+        phase_key:          {intervention.phase_key}
+        policy_version:     {intervention.policy_version}
+        reply_kind:         {intervention.reply_kind.value}
+        summary:            {intervention.summary}
+        detail:             {intervention.detail}
+        override_action:    {intervention.override_action.value if intervention.override_action is not None else '-'}
+        created_at:         {intervention.created_at.isoformat()}
+        """,
+    ).strip()
+
+
+def _render_founder_interventions(interventions: list[FounderInterventionView], *, run_id: str) -> str:
+    lines = ["Founder interventions", "---------------------", f"run_id: {run_id}"]
+    if not interventions:
+        lines.append("No founder interventions are recorded for this run yet.")
+        return "\n".join(lines)
+
+    for index, intervention in enumerate(interventions, start=1):
+        lines.extend(
+            [
+                "",
+                f"{index}. {intervention.reply_kind.value}",
+                f"   intervention_id:   {intervention.id}",
+                f"   target_escalation: {intervention.target_escalation_id}",
+                f"   override_action:   {intervention.override_action.value if intervention.override_action is not None else '-'}",
+                f"   summary:           {intervention.summary}",
+                f"   detail:            {intervention.detail}",
+                f"   created_at:        {intervention.created_at.isoformat()}",
+            ],
+        )
+    return "\n".join(lines)
+
+
 def _render_replay(replay: RunReplayView, *, verbose: bool) -> str:
     lines = [
         "Run replay",
@@ -946,6 +1126,16 @@ def _render_replay(replay: RunReplayView, *, verbose: bool) -> str:
             lines.append(f"- first failure: {grouped_failures[0].outcome.value} / {grouped_failures[0].outcome_reason}")
             lines.append(f"- latest failure: {grouped_failures[-1].outcome.value} / {grouped_failures[-1].outcome_reason}")
 
+    if replay.founder_interventions:
+        lines.extend(["", "Founder interventions", "--------------------"])
+        latest_intervention = replay.founder_interventions[-1]
+        lines.append(
+            f"- total interventions: {len(replay.founder_interventions)} / latest reply: {latest_intervention.reply_kind.value}",
+        )
+        lines.append(f"- latest summary: {latest_intervention.summary}")
+        if latest_intervention.override_action is not None:
+            lines.append(f"- latest override action: {latest_intervention.override_action.value}")
+
     if replay.consistency_warnings:
         lines.extend(["", "Consistency warnings", "--------------------"])
         for warning in replay.consistency_warnings:
@@ -975,6 +1165,17 @@ def _render_replay(replay: RunReplayView, *, verbose: bool) -> str:
                 lines.append(f"  action: {attempt.selected_action.value if attempt.selected_action is not None else '-'}")
                 lines.append(f"  reason: {attempt.outcome_reason}")
                 lines.append(f"  phase_key: {attempt.phase_key}")
+
+        if replay.founder_interventions:
+            lines.extend(["", "Detailed founder interventions", "-----------------------------"])
+            for intervention in replay.founder_interventions:
+                lines.append(f"- {intervention.reply_kind.value}: {intervention.summary}")
+                lines.append(f"  target_escalation: {intervention.target_escalation_id}")
+                lines.append(
+                    f"  override_action: {intervention.override_action.value if intervention.override_action is not None else '-'}",
+                )
+                lines.append(f"  detail: {intervention.detail}")
+                lines.append(f"  phase_key: {intervention.phase_key}")
 
     return "\n".join(lines)
 
@@ -1292,6 +1493,16 @@ def main() -> None:
         store = _build_store(args.database_url)
         try:
             context = store.build_planner_context(args.run_id)
+            if context.snapshot.pending_founder_escalation is not None:
+                raise PermissionError(
+                    "Founder reply is still required for the current planner escalation before another planner invoke is allowed. "
+                    f"Pending escalation={context.snapshot.pending_founder_escalation.observation_id}.",
+                )
+            if context.snapshot.planner_phase_exhausted:
+                raise PlannerPhaseExhaustedError(
+                    "Planner phase budget is exhausted for the current state segment. "
+                    "Use `v2-spring planner recharge <run-id> --reason ...` or resolve the founder lane first.",
+                )
             scripted_responses = _load_scripted_planner_responses(
                 inline_json=args.scripted_response_json,
                 file_path=args.scripted_response_file,
@@ -1361,6 +1572,66 @@ def main() -> None:
             PlannerPhaseExhaustedError,
             PermissionError,
         ) as exc:
+            print(str(exc))
+            raise SystemExit(1) from exc
+        return
+
+    if args.command == "planner" and args.planner_command == "interventions":
+        store = _build_store(args.database_url)
+        if store.get_run(args.run_id) is None:
+            print(f"Run {args.run_id} was not found.")
+            raise SystemExit(1)
+        interventions = store.list_founder_interventions_for_run(args.run_id)
+        if args.format == "json":
+            print(json.dumps([item.model_dump(mode="json") for item in interventions], indent=2, ensure_ascii=False))
+        else:
+            print(_render_founder_interventions(interventions, run_id=args.run_id))
+        return
+
+    if args.command == "planner" and args.planner_command == "reply":
+        store = _build_store(args.database_url)
+        try:
+            if args.planner_reply_kind == "hint":
+                reply = FOUNDER_REPLY_INPUT_ADAPTER.validate_python(
+                    {
+                        "kind": "hint",
+                        "message": args.message,
+                    },
+                )
+            elif args.planner_reply_kind == "override":
+                reply = FOUNDER_REPLY_INPUT_ADAPTER.validate_python(
+                    {
+                        "kind": "override",
+                        "selected_action": args.action,
+                        "reason": args.reason,
+                    },
+                )
+            elif args.planner_reply_kind == "reject":
+                reply = FOUNDER_REPLY_INPUT_ADAPTER.validate_python(
+                    {
+                        "kind": "reject",
+                        "reason": args.reason,
+                    },
+                )
+            else:
+                print("planner reply requires one of: hint, override, reject.")
+                raise SystemExit(2)
+        except ValidationError as exc:
+            print("Founder reply failed validation.")
+            print(exc)
+            raise SystemExit(2) from exc
+
+        try:
+            intervention = store.record_founder_reply(
+                run_id=args.run_id,
+                target_escalation_id=args.escalation_id,
+                reply=reply,
+            )
+            if args.format == "json":
+                print(json.dumps(intervention.model_dump(mode="json"), indent=2, ensure_ascii=False))
+            else:
+                print(_render_founder_intervention(intervention))
+        except (LookupError, PermissionError, ValueError, PlannerPhaseExhaustedError) as exc:
             print(str(exc))
             raise SystemExit(1) from exc
         return

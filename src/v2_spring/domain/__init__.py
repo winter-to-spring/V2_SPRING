@@ -2,6 +2,16 @@
 from v2_spring.domain.approval import ApprovalStatus, ApprovalView
 from v2_spring.domain.artifact import ArtifactStorageKind, ArtifactType, ArtifactView
 from v2_spring.domain.decision import DecisionKind, DecisionView
+from v2_spring.domain.founder_intervention import (
+    FOUNDER_REPLY_INPUT_ADAPTER,
+    FounderInterventionDigest,
+    FounderInterventionView,
+    FounderRejectInput,
+    FounderReplyInput,
+    FounderReplyKind,
+    FounderHintInput,
+    FounderOverrideInput,
+)
 from v2_spring.domain.observation import ObservationKind, ObservationView
 from v2_spring.domain.planner_attempt import PlannerAttemptOutcome, PlannerAttemptView, PlannerGovernanceView
 from v2_spring.domain.proposal import PlannerProposalInput, PlannerProposalView
@@ -28,6 +38,14 @@ __all__ = [
     "ArtifactInspectionView",
     "DecisionKind",
     "DecisionView",
+    "FounderHintInput",
+    "FounderInterventionDigest",
+    "FounderInterventionView",
+    "FounderOverrideInput",
+    "FounderRejectInput",
+    "FounderReplyInput",
+    "FounderReplyKind",
+    "FOUNDER_REPLY_INPUT_ADAPTER",
     "ObservationKind",
     "ObservationView",
     "PlannerAttemptOutcome",

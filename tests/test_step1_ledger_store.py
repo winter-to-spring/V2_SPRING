@@ -8,6 +8,7 @@ from pydantic import ValidationError
 from v2_spring.domain.artifact import ArtifactStorageKind, ArtifactType
 from v2_spring.domain.approval import ApprovalStatus
 from v2_spring.domain.decision import DecisionKind
+from v2_spring.domain.founder_intervention import FOUNDER_REPLY_INPUT_ADAPTER, FounderReplyKind
 from v2_spring.domain.observation import ObservationKind
 from v2_spring.domain.planner_attempt import PlannerAttemptOutcome
 from v2_spring.domain.proposal import PlannerProposalInput
@@ -803,3 +804,223 @@ def test_build_planner_context_includes_structured_failure_report(
     assert context.failure_report.previous_rationale is None
     assert context.failure_report.repeated_failure_streak == 1
     assert context.legal_actions[0].name == PossibleActionName.REPLAN_FROM_FAILED_EXECUTION
+
+
+def test_founder_hint_clears_pending_escalation_and_reopens_planner_lane(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    run = store.create_run(
+        RunCreateInput(
+            project="demo",
+            goal="Allow founder hints to unblock a planner escalation",
+            urgency="normal",
+            risk="medium",
+        ),
+    )
+    initial_snapshot = store.build_run_snapshot(str(run.id))
+    escalation = store.record_planner_escalation(
+        run_id=str(run.id),
+        snapshot_hash=initial_snapshot.state_hash,
+        analysis_summary="Approval is still pending, so a founder policy call is required.",
+        confidence="low_needs_review",
+        help_kind="policy_decision",
+        blocking_reason="A pending approval gate blocks every other legal move.",
+        requested_help="Approve or reject the run before bounded execution can continue.",
+    )
+    blocked_snapshot = store.build_run_snapshot(str(run.id))
+
+    with pytest.raises(PermissionError):
+        store.record_planner_proposal(
+            run_id=str(run.id),
+            proposal=PlannerProposalInput(
+                snapshot_hash=blocked_snapshot.state_hash,
+                selected_action=PossibleActionName.RESOLVE_PENDING_APPROVAL,
+                rationale="This should stay blocked until the founder replies to the open escalation.",
+                expected_outcome="Nothing should be accepted yet.",
+            ),
+        )
+
+    intervention = store.record_founder_reply(
+        run_id=str(run.id),
+        target_escalation_id=str(escalation.id),
+        reply=FOUNDER_REPLY_INPUT_ADAPTER.validate_python(
+            {
+                "kind": "hint",
+                "message": "Use the founder-help lane only for explicit approval guidance.",
+            },
+        ),
+    )
+    reopened_snapshot = store.build_run_snapshot(str(run.id))
+    accepted = store.record_planner_proposal(
+        run_id=str(run.id),
+        proposal=PlannerProposalInput(
+            snapshot_hash=reopened_snapshot.state_hash,
+            selected_action=PossibleActionName.RESOLVE_PENDING_APPROVAL,
+            rationale="The founder confirmed that approval resolution is still the right next step.",
+            expected_outcome="The founder should now approve or reject the intake gate explicitly.",
+        ),
+    )
+
+    assert intervention.reply_kind == FounderReplyKind.HINT
+    assert blocked_snapshot.pending_founder_escalation is not None
+    assert reopened_snapshot.pending_founder_escalation is None
+    assert reopened_snapshot.planner_phase_exhausted is False
+    assert reopened_snapshot.planner_phase_key == initial_snapshot.planner_phase_key
+    assert reopened_snapshot.latest_founder_intervention_summary == intervention.summary
+    assert accepted.selected_action == PossibleActionName.RESOLVE_PENDING_APPROVAL
+
+
+def test_founder_reject_exhausts_current_phase_and_records_intervention(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    run = store.create_run(
+        RunCreateInput(
+            project="demo",
+            goal="Stop the founder-help lane after a reject",
+            urgency="normal",
+            risk="medium",
+        ),
+    )
+    snapshot = store.build_run_snapshot(str(run.id))
+    escalation = store.record_planner_escalation(
+        run_id=str(run.id),
+        snapshot_hash=snapshot.state_hash,
+        analysis_summary="The founder must decide whether approval should be resolved manually.",
+        confidence="low_needs_review",
+        help_kind="policy_decision",
+        blocking_reason="Approval is still pending.",
+        requested_help="Please decide whether to approve or reject the run.",
+    )
+
+    intervention = store.record_founder_reply(
+        run_id=str(run.id),
+        target_escalation_id=str(escalation.id),
+        reply=FOUNDER_REPLY_INPUT_ADAPTER.validate_python(
+            {
+                "kind": "reject",
+                "reason": "Do not escalate this again; the planner must stop here for now.",
+            },
+        ),
+    )
+    rejected_snapshot = store.build_run_snapshot(str(run.id))
+    replay = store.build_run_replay(str(run.id))
+
+    assert intervention.reply_kind == FounderReplyKind.REJECT
+    assert rejected_snapshot.pending_founder_escalation is None
+    assert rejected_snapshot.planner_phase_exhausted is True
+    assert replay.founder_interventions[-1].reply_kind == FounderReplyKind.REJECT
+    assert replay.planner_attempts[-1].outcome == PlannerAttemptOutcome.PHASE_EXHAUSTED
+
+    with pytest.raises(PlannerPhaseExhaustedError):
+        store.record_planner_proposal(
+            run_id=str(run.id),
+            proposal=PlannerProposalInput(
+                snapshot_hash=rejected_snapshot.state_hash,
+                selected_action=PossibleActionName.RESOLVE_PENDING_APPROVAL,
+                rationale="This should fail because the founder rejected more help in this phase.",
+                expected_outcome="No new planner proposal should be accepted.",
+            ),
+        )
+
+
+def test_founder_override_is_bounded_and_records_founder_override_decision(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    run = store.create_run(
+        RunCreateInput(
+            project="demo",
+            goal="Allow a bounded founder override",
+            urgency="normal",
+            risk="medium",
+        ),
+    )
+    snapshot = store.build_run_snapshot(str(run.id))
+    escalation = store.record_planner_escalation(
+        run_id=str(run.id),
+        snapshot_hash=snapshot.state_hash,
+        analysis_summary="The founder may want to force a currently legal move.",
+        confidence="medium",
+        help_kind="manual_override_request",
+        blocking_reason="Approval is pending and the founder might prefer a manual decision.",
+        requested_help="Choose the current legal action explicitly if you want to override the planner.",
+    )
+
+    with pytest.raises(ValueError):
+        store.record_founder_reply(
+            run_id=str(run.id),
+            target_escalation_id=str(escalation.id),
+            reply=FOUNDER_REPLY_INPUT_ADAPTER.validate_python(
+                {
+                    "kind": "override",
+                    "selected_action": "execute_bounded_task",
+                    "reason": "This should fail because bounded execution is not legal before approval.",
+                },
+            ),
+        )
+
+    intervention = store.record_founder_reply(
+        run_id=str(run.id),
+        target_escalation_id=str(escalation.id),
+        reply=FOUNDER_REPLY_INPUT_ADAPTER.validate_python(
+            {
+                "kind": "override",
+                "selected_action": "resolve_pending_approval",
+                "reason": "The founder wants to force the current legal approval action.",
+            },
+        ),
+    )
+    snapshot_after = store.build_run_snapshot(str(run.id))
+    decisions = store.list_decisions_for_run(str(run.id))
+
+    assert intervention.reply_kind == FounderReplyKind.OVERRIDE
+    assert intervention.override_action == PossibleActionName.RESOLVE_PENDING_APPROVAL
+    assert snapshot_after.planner_phase_exhausted is True
+    assert decisions[-1].kind == DecisionKind.FOUNDER_OVERRIDE_ACCEPTED
+
+
+def test_founder_hint_quota_exhausts_after_two_replies_in_one_phase(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    run = store.create_run(
+        RunCreateInput(
+            project="demo",
+            goal="Bound repeated founder hint ping-pong in one phase",
+            urgency="normal",
+            risk="medium",
+        ),
+    )
+    for index in range(2):
+        snapshot = store.build_run_snapshot(str(run.id))
+        escalation = store.record_planner_escalation(
+            run_id=str(run.id),
+            snapshot_hash=snapshot.state_hash,
+            analysis_summary=f"Founder help request {index + 1}",
+            confidence="low_needs_review",
+            help_kind="clarification",
+            blocking_reason="The founder keeps being asked to clarify the same policy boundary.",
+            requested_help="Confirm whether the approval lane should remain the only legal move.",
+        )
+        store.record_founder_reply(
+            run_id=str(run.id),
+            target_escalation_id=str(escalation.id),
+            reply=FOUNDER_REPLY_INPUT_ADAPTER.validate_python(
+                {
+                    "kind": "hint",
+                    "message": f"Hint {index + 1}: stay inside the current approval boundary.",
+                },
+            ),
+        )
+
+    third_snapshot = store.build_run_snapshot(str(run.id))
+    with pytest.raises(PlannerPhaseExhaustedError):
+        store.record_planner_escalation(
+            run_id=str(run.id),
+            snapshot_hash=third_snapshot.state_hash,
+            analysis_summary="A third founder escalation should exhaust the phase.",
+            confidence="low_needs_review",
+            help_kind="clarification",
+            blocking_reason="The planner should stop instead of ping-ponging forever.",
+            requested_help="This should not open a third founder-help lane in the same phase.",
+        )
+
+    exhausted_snapshot = store.build_run_snapshot(str(run.id))
+    attempts = store.list_planner_attempts_for_run(str(run.id))
+
+    assert exhausted_snapshot.planner_phase_exhausted is True
+    assert attempts[-1].outcome == PlannerAttemptOutcome.PHASE_EXHAUSTED
