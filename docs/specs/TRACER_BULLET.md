@@ -183,6 +183,8 @@ Minimum commands:
 Optional but helpful:
 - `v2 task list`
 - `v2 artifact list`
+- `v2 run snapshot`
+- `v2 run actions`
 
 ## Acceptance Criteria
 

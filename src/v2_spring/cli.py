@@ -10,7 +10,9 @@ from pydantic import ValidationError
 from v2_spring.config import load_config
 from v2_spring.domain.approval import ApprovalStatus
 from v2_spring.domain.replay import ArtifactInspectionView, RunReplayView, TaskReplayView
+from v2_spring.domain.snapshot import PossibleActionEvaluationView, RunSnapshotView
 from v2_spring.ledger.store import BoundedExecutionResult, LedgerStore
+from v2_spring.planner.actions import evaluate_possible_actions
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -58,6 +60,40 @@ def build_parser() -> argparse.ArgumentParser:
     events_parser = run_subparsers.add_parser("events", help="Show ledger events for a run.")
     events_parser.add_argument("run_id", help="Run id to inspect.")
     events_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Override DATABASE_URL for this invocation.",
+    )
+
+    snapshot_parser = run_subparsers.add_parser(
+        "snapshot",
+        help="Show the current planner-ready run snapshot.",
+    )
+    snapshot_parser.add_argument("run_id", help="Run id to inspect.")
+    snapshot_parser.add_argument(
+        "--format",
+        default="pretty",
+        choices=["pretty", "json"],
+        help="Output format. Defaults to pretty.",
+    )
+    snapshot_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Override DATABASE_URL for this invocation.",
+    )
+
+    actions_parser = run_subparsers.add_parser(
+        "actions",
+        help="Show deterministic legal next actions for a run.",
+    )
+    actions_parser.add_argument("run_id", help="Run id to inspect.")
+    actions_parser.add_argument(
+        "--format",
+        default="pretty",
+        choices=["pretty", "json"],
+        help="Output format. Defaults to pretty.",
+    )
+    actions_parser.add_argument(
         "--database-url",
         default=None,
         help="Override DATABASE_URL for this invocation.",
@@ -424,6 +460,94 @@ def _render_execution_result(result: BoundedExecutionResult) -> str:
     ).strip()
 
 
+def _render_snapshot(snapshot: RunSnapshotView) -> str:
+    lines = [
+        "Run snapshot",
+        "------------",
+        f"run_id:              {snapshot.run.id}",
+        f"snapshot_timestamp:  {snapshot.snapshot_timestamp.isoformat()}",
+        f"state_hash:          {snapshot.state_hash}",
+        f"status:              {snapshot.run.status.value}",
+        f"action_state:        {snapshot.action_state.value}",
+        f"action_state_reason: {snapshot.action_state_reason}",
+        f"latest_decision:     {snapshot.latest_decision_summary if snapshot.latest_decision_summary else '-'}",
+        f"latest_rejection:    {snapshot.latest_rejection_reason if snapshot.latest_rejection_reason else '-'}",
+        "",
+        "Task summary",
+        "------------",
+        f"created:             {snapshot.task_summary.created}",
+        f"ready:               {snapshot.task_summary.ready}",
+        f"running:             {snapshot.task_summary.running}",
+        f"completed:           {snapshot.task_summary.completed}",
+        f"failed:              {snapshot.task_summary.failed}",
+    ]
+    if snapshot.pending_approval is not None:
+        lines.extend(
+            [
+                "",
+                "Pending approval",
+                "----------------",
+                f"id:                  {snapshot.pending_approval.id}",
+                f"requested_action:    {snapshot.pending_approval.requested_action}",
+                f"reason:              {snapshot.pending_approval.reason}",
+            ],
+        )
+    if snapshot.latest_task is not None:
+        lines.extend(
+            [
+                "",
+                "Latest task",
+                "-----------",
+                f"id:                  {snapshot.latest_task.id}",
+                f"status:              {snapshot.latest_task.status.value}",
+                f"kind:                {snapshot.latest_task.kind.value}",
+                f"summary:             {snapshot.latest_task.summary}",
+                f"failure_hint:        {snapshot.latest_task.failure_hint if snapshot.latest_task.failure_hint else '-'}",
+            ],
+        )
+    if snapshot.latest_artifact is not None:
+        lines.extend(
+            [
+                "",
+                "Latest artifact",
+                "---------------",
+                f"id:                  {snapshot.latest_artifact.id}",
+                f"title:               {snapshot.latest_artifact.title}",
+                f"type:                {snapshot.latest_artifact.artifact_type.value}",
+                f"size_bytes:          {snapshot.latest_artifact.size_bytes}",
+                f"file_exists:         {snapshot.latest_artifact.file_exists}",
+                f"hash_matches:        {snapshot.latest_artifact.hash_matches}",
+            ],
+        )
+    return "\n".join(lines)
+
+
+def _render_actions(evaluation: PossibleActionEvaluationView) -> str:
+    lines = [
+        "Run actions",
+        "-----------",
+        f"run_id:              {evaluation.snapshot.run.id}",
+        f"snapshot_timestamp:  {evaluation.snapshot.snapshot_timestamp.isoformat()}",
+        f"state_hash:          {evaluation.snapshot.state_hash}",
+        f"action_state:        {evaluation.snapshot.action_state.value}",
+        f"action_state_reason: {evaluation.snapshot.action_state_reason}",
+    ]
+    if not evaluation.actions:
+        lines.extend(["", "No legal next actions are available."])
+        return "\n".join(lines)
+
+    lines.extend(["", "Legal moves", "-----------"])
+    for index, action in enumerate(evaluation.actions, start=1):
+        lines.extend(
+            [
+                f"{index}. {action.name.value}",
+                f"   reason:       {action.reason}",
+                f"   context_hint: {action.context_hint if action.context_hint else '-'}",
+            ],
+        )
+    return "\n".join(lines)
+
+
 def _render_replay(replay: RunReplayView, *, verbose: bool) -> str:
     lines = [
         "Run replay",
@@ -621,6 +745,33 @@ def main() -> None:
         store = _build_store(args.database_url)
         try:
             print(_render_events(args.run_id, store))
+        except LookupError as exc:
+            print(str(exc))
+            raise SystemExit(1) from exc
+        return
+
+    if args.command == "run" and args.run_command == "snapshot":
+        store = _build_store(args.database_url)
+        try:
+            snapshot = evaluate_possible_actions(store.build_run_snapshot(args.run_id)).snapshot
+            if args.format == "json":
+                print(json.dumps(snapshot.model_dump(mode="json"), indent=2, ensure_ascii=False))
+            else:
+                print(_render_snapshot(snapshot))
+        except LookupError as exc:
+            print(str(exc))
+            raise SystemExit(1) from exc
+        return
+
+    if args.command == "run" and args.run_command == "actions":
+        store = _build_store(args.database_url)
+        try:
+            snapshot = store.build_run_snapshot(args.run_id)
+            evaluation = evaluate_possible_actions(snapshot)
+            if args.format == "json":
+                print(json.dumps(evaluation.model_dump(mode="json"), indent=2, ensure_ascii=False))
+            else:
+                print(_render_actions(evaluation))
         except LookupError as exc:
             print(str(exc))
             raise SystemExit(1) from exc

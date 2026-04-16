@@ -533,3 +533,66 @@ def test_run_replay_and_detail_queries_cli(capsys, monkeypatch, tmp_path: Path) 
     artifact_output = capsys.readouterr().out
     assert "Artifact" in artifact_output
     assert "hash_matches:       True" in artifact_output
+
+
+def test_run_snapshot_and_actions_cli(capsys, monkeypatch, tmp_path: Path) -> None:
+    database_url = f"sqlite+pysqlite:///{tmp_path / 'cli-step7.db'}"
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "run",
+            "create",
+            "--project",
+            "demo",
+            "--goal",
+            "Prepare a planner-ready snapshot",
+            "--urgency",
+            "normal",
+            "--risk",
+            "medium",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    run_id = capsys.readouterr().out.splitlines()[0].split()[-1]
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["v2-spring", "run", "snapshot", run_id, "--database-url", database_url],
+    )
+    main()
+    snapshot_output = capsys.readouterr().out
+    assert "Run snapshot" in snapshot_output
+    assert "state_hash:" in snapshot_output
+    assert "action_state:        available" in snapshot_output
+    assert "Pending approval" in snapshot_output
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["v2-spring", "run", "actions", run_id, "--database-url", database_url],
+    )
+    main()
+    actions_output = capsys.readouterr().out
+    assert "Run actions" in actions_output
+    assert "resolve_pending_approval" in actions_output
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "run",
+            "actions",
+            run_id,
+            "--format",
+            "json",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    actions_payload = json.loads(capsys.readouterr().out)
+    assert actions_payload["snapshot"]["run"]["id"] == run_id
+    assert actions_payload["actions"][0]["name"] == "resolve_pending_approval"
