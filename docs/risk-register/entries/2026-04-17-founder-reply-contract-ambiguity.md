@@ -1,0 +1,61 @@
+# Risk ID: RISK-0017
+Title: ~~Founder reply semantics were ambiguous after planner escalation~~
+Class: Before Next Phase
+Status: Resolved
+Owner: Core / Founder interaction
+Observed In: Step 10 design review
+
+## Description
+
+Step 10 formalizes planner escalation, but founder replies are not yet typed.
+
+That means the next phase still needs a clear distinction between:
+
+- a hint that the planner should consider
+- a direct override that should bypass planner choice
+- a rejection that should block the current loop
+
+## Impact
+
+- human-in-the-loop semantics can blur under stress
+- future founder CLI could create contradictory state transitions
+- planner learning loops may misread founder responses
+
+## Why This Matters
+
+Hint-first only works if the system knows what a hint is.
+
+Until founder reply semantics are typed, escalation remains only half-defined.
+
+## Suggested Mitigation
+
+- define a founder reply contract before the next planner-feedback phase
+- separate hint, override, and rejection response types
+- document which responses do and do not mutate run state directly
+- bind founder replies to the targeted escalation request rather than forcing
+  raw snapshot-hash matching in the CLI
+- record founder interventions as explicit replayable events so the planner can
+  see when a human manually steered the loop
+- keep override bounded to currently legal actions instead of opening god mode
+
+## Capability Gate
+- Capability: founder hint loop / founder override surface
+- Gate mode: Before Next Phase
+- Blocked until: founder reply contract is explicit
+
+## Issue Link
+- GitHub Issue: #22
+
+## Doc Links
+- ADR: ../../adr/0008-founder-reply-contract.md
+- Design note: ../../implementation-notes/STEP_10B_FOUNDER_REPLY_CONTRACT.md
+
+## Exit Criteria
+
+- founder replies are typed and replayable
+- hint-first vs override-available semantics are explicit in code and docs
+- founder override is bounded and does not silently bypass core legality rules
+- the next planner context can explain founder intervention without amnesia
+
+## Last Updated
+- 2026-04-17

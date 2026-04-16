@@ -1,7 +1,7 @@
 # Risk ID: RISK-0013
-Title: Accepted legal proposals may loop through repeated execution failure without planner budget pressure
+Title: ~~Accepted legal proposals may loop through repeated execution failure without planner budget pressure~~
 Class: Before Next Phase
-Status: Open
+Status: Resolved
 Owner: Core / Planner-executor boundary
 Observed In: Step 9 post-implementation review
 
@@ -41,6 +41,20 @@ back into replanning governance.
 - surface failed execution streaks into the next planner snapshot
 - decide whether repeated execution failure should eventually escalate, block,
   or require explicit founder intervention
+- Step 10 now adds a structured failure report to planner context, but stronger
+  masking / escalation rules still need follow-up proof
+
+Current resolution:
+
+- planner context already carries `FailureReportView`, including repeated
+  deterministic failure streaks
+- deterministic repeated failures still mask unsafe re-entry into the same
+  bounded execution family
+- if deterministic execution failure repeats without state advancement, the
+  control plane now opens a founder-help escalation lane automatically before
+  accepting another planner proposal
+- that escalation blocks further planner proposals until the founder responds,
+  so repeated failed execution cannot keep re-opening planner work forever
 
 ## Capability Gate
 - Capability: real planner adapter / automatic execution chaining
@@ -48,7 +62,7 @@ back into replanning governance.
 - Blocked until: execution failure feedback is folded into bounded replanning governance
 
 ## Issue Link
-- GitHub Issue: none yet
+- GitHub Issue: #19
 
 ## Doc Links
 - ADR: ../../adr/0006-bounded-replanning-governance.md
@@ -61,4 +75,4 @@ back into replanning governance.
 - a governed stop or escalation path exists for repeated failed execution cycles
 
 ## Last Updated
-- 2026-04-16
+- 2026-04-17

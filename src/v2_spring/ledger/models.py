@@ -11,6 +11,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from v2_spring.domain.approval import ApprovalStatus
 from v2_spring.domain.artifact import ArtifactStorageKind, ArtifactType
 from v2_spring.domain.decision import DecisionKind
+from v2_spring.domain.founder_intervention import FounderReplyKind
 from v2_spring.domain.observation import ObservationKind
 from v2_spring.domain.planner_attempt import PlannerAttemptOutcome
 from v2_spring.domain.run import RiskLevel, RunStatus, UrgencyLevel
@@ -37,6 +38,7 @@ class LedgerEventType(StrEnum):
     TASK_FAILED = "TASK_FAILED"
     ARTIFACT_RECORDED = "ARTIFACT_RECORDED"
     PLANNER_ATTEMPT_RECORDED = "PLANNER_ATTEMPT_RECORDED"
+    FOUNDER_INTERVENTION_RECORDED = "FOUNDER_INTERVENTION_RECORDED"
 
 
 class RunRecord(Base):
@@ -95,6 +97,10 @@ class RunRecord(Base):
         cascade="all, delete-orphan",
     )
     planner_attempts: Mapped[list["PlannerAttemptRecord"]] = relationship(
+        back_populates="run",
+        cascade="all, delete-orphan",
+    )
+    founder_interventions: Mapped[list["FounderInterventionRecord"]] = relationship(
         back_populates="run",
         cascade="all, delete-orphan",
     )
@@ -171,6 +177,7 @@ class ApprovalRecord(Base):
         nullable=False,
         default=utc_now,
     )
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     resolution_reason: Mapped[str | None] = mapped_column(String(4000), nullable=True)
 
@@ -330,6 +337,40 @@ class PlannerAttemptRecord(Base):
     run: Mapped[RunRecord] = relationship(back_populates="planner_attempts")
 
 
+class FounderInterventionRecord(Base):
+    __tablename__ = "founder_interventions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("runs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    target_observation_id: Mapped[str] = mapped_column(
+        ForeignKey("observations.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    phase_key: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    policy_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    reply_kind: Mapped[FounderReplyKind] = mapped_column(
+        Enum(FounderReplyKind, native_enum=False),
+        nullable=False,
+    )
+    summary: Mapped[str] = mapped_column(String(400), nullable=False)
+    detail: Mapped[str] = mapped_column(String(4000), nullable=False)
+    override_action: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=utc_now,
+    )
+
+    run: Mapped[RunRecord] = relationship(back_populates="founder_interventions")
+    target_observation: Mapped["ObservationRecord"] = relationship()
+
+
 def _prevent_mutation(_: Any, __: Any, target: EventLedgerRecord) -> None:
     raise ValueError(
         f"EventLedgerRecord {target.id} is append-only and cannot be mutated or deleted.",
@@ -346,3 +387,5 @@ event.listen(ArtifactRecord, "before_update", _prevent_mutation)
 event.listen(ArtifactRecord, "before_delete", _prevent_mutation)
 event.listen(PlannerAttemptRecord, "before_update", _prevent_mutation)
 event.listen(PlannerAttemptRecord, "before_delete", _prevent_mutation)
+event.listen(FounderInterventionRecord, "before_update", _prevent_mutation)
+event.listen(FounderInterventionRecord, "before_delete", _prevent_mutation)

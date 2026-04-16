@@ -27,5 +27,9 @@ Human approval is mandatory for:
   resolved, even before stronger concurrency controls are added.
 - Approval barriers must fail explicitly. Silent drop is forbidden because the
   caller must know the write was blocked by governance rather than accepted.
+- Approval gates are bounded pauses rather than infinite pauses. Each approval
+  records `expires_at`, and an explicit timeout sweep may resolve overdue gates
+  as `expired`, moving the run into `suspended` until a later recovery policy
+  is introduced.
 - Passive audit observations may still be recorded while approval is pending,
   but they must never advance state or act as planner-driving follow-up work.

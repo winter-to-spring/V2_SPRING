@@ -6,6 +6,9 @@ import json
 import pytest
 
 from v2_spring.cli import main
+from v2_spring.adapters.langgraph_planner import PlannerTransportCancelledError, StructuredTransportResponse
+from v2_spring.ledger.store import LedgerStore
+from v2_spring.domain.planner_adapter import PlannerTransportProvider
 
 
 def test_run_create_and_show_cli_flow(capsys, monkeypatch, tmp_path: Path) -> None:
@@ -228,6 +231,106 @@ def test_reject_requires_reason_and_is_visible_in_cli(capsys, monkeypatch, tmp_p
     show_output = capsys.readouterr().out
 
     assert "status:     rejected" in show_output
+
+
+def test_approval_timeout_sweep_is_visible_in_cli_and_replay(capsys, monkeypatch, tmp_path: Path) -> None:
+    database_url = f"sqlite+pysqlite:///{tmp_path / 'cli-approval-timeout.db'}"
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "run",
+            "create",
+            "--project",
+            "demo",
+            "--goal",
+            "Suspend a run by expiring approval",
+            "--urgency",
+            "normal",
+            "--risk",
+            "medium",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    create_output = capsys.readouterr().out
+    created_run_id = create_output.splitlines()[0].split()[-1]
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "approval",
+            "list",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    approval_output = capsys.readouterr().out
+    approval_id = next(
+        line.strip().replace("1. ", "")
+        for line in approval_output.splitlines()
+        if line.startswith("1. ")
+    )
+    expires_at_line = next(
+        line for line in approval_output.splitlines() if "expires_at:" in line
+    )
+    expires_at_value = expires_at_line.split("expires_at:")[1].strip()
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "approval",
+            "sweep-timeouts",
+            "--now",
+            expires_at_value,
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    sweep_output = capsys.readouterr().out
+
+    assert "Approval timeout sweep" in sweep_output
+    assert approval_id in sweep_output
+    assert "approval_status:  expired" in sweep_output
+    assert "run_status:       suspended" in sweep_output
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "run",
+            "show",
+            created_run_id,
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    show_output = capsys.readouterr().out
+    assert "status:     suspended" in show_output
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "run",
+            "replay",
+            created_run_id,
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    replay_output = capsys.readouterr().out
+
+    assert "current approval state: expired" in replay_output
+    assert "status:         suspended" in replay_output
 
 
 def test_bounded_execution_cli_flow(capsys, monkeypatch, tmp_path: Path) -> None:
@@ -665,7 +768,7 @@ def test_planner_propose_and_show_cli(capsys, monkeypatch, tmp_path: Path) -> No
     )
     main()
     snapshot_payload = json.loads(capsys.readouterr().out)
-    assert snapshot_payload["policy_version"] == "v1"
+    assert snapshot_payload["policy_version"] == "v2"
     snapshot_hash = snapshot_payload["state_hash"]
 
     monkeypatch.setattr(
@@ -690,7 +793,7 @@ def test_planner_propose_and_show_cli(capsys, monkeypatch, tmp_path: Path) -> No
     main()
     proposal_output = capsys.readouterr().out
     assert "Planner proposal accepted" in proposal_output
-    assert "policy_version:     v1" in proposal_output
+    assert "policy_version:     v2" in proposal_output
     assert "selected_action:    execute_bounded_task" in proposal_output
 
     monkeypatch.setattr(
@@ -700,7 +803,7 @@ def test_planner_propose_and_show_cli(capsys, monkeypatch, tmp_path: Path) -> No
     main()
     show_output = capsys.readouterr().out
     assert "Planner proposals" in show_output
-    assert "policy_version:    v1" in show_output
+    assert "policy_version:    v2" in show_output
     assert "execute_bounded_task" in show_output
 
     monkeypatch.setattr(
@@ -727,3 +830,810 @@ def test_planner_propose_and_show_cli(capsys, monkeypatch, tmp_path: Path) -> No
     assert exc.value.code == 1
     stale_output = capsys.readouterr().out
     assert "snapshot hash is stale" in stale_output
+
+
+def test_planner_invoke_cli_accepts_action_and_escalation(capsys, monkeypatch, tmp_path: Path) -> None:
+    database_url = f"sqlite+pysqlite:///{tmp_path / 'cli-step10.db'}"
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "run",
+            "create",
+            "--project",
+            "demo",
+            "--goal",
+            "Attach a bounded planner adapter",
+            "--urgency",
+            "normal",
+            "--risk",
+            "medium",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    run_id = capsys.readouterr().out.splitlines()[0].split()[-1]
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["v2-spring", "approval", "list", "--database-url", database_url],
+    )
+    main()
+    approval_output = capsys.readouterr().out
+    approval_id = next(line.strip().replace("1. ", "") for line in approval_output.splitlines() if line.startswith("1. "))
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "approval",
+            "resolve",
+            approval_id,
+            "--approve",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    capsys.readouterr()
+
+    action_response = json.dumps(
+        {
+            "kind": "action",
+            "analysis_summary": "The run is approved and bounded execution has not happened yet.",
+            "confidence": "medium",
+            "selected_action": "execute_bounded_task",
+            "expected_outcome": "The system should accept one bounded execution proposal.",
+        },
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "planner",
+            "invoke",
+            run_id,
+            "--scripted-response-json",
+            action_response,
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    invoke_output = capsys.readouterr().out
+    assert "Planner invocation" in invoke_output
+    assert "provider:             scripted" in invoke_output
+    assert "selected_action:     execute_bounded_task" in invoke_output
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "run",
+            "create",
+            "--project",
+            "demo",
+            "--goal",
+            "Force an escalation proposal",
+            "--urgency",
+            "normal",
+            "--risk",
+            "high",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    escalated_run_id = capsys.readouterr().out.splitlines()[0].split()[-1]
+
+    escalation_response = json.dumps(
+        {
+            "kind": "escalation",
+            "analysis_summary": "The run is waiting for approval, so the founder must decide how to proceed.",
+            "confidence": "low_needs_review",
+            "escalation_target": "founder",
+            "help_kind": "policy_decision",
+            "blocking_reason": "A pending approval gate prevents further progress.",
+            "requested_help": "Approve or reject the run before the planner can choose a legal action.",
+        },
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "planner",
+            "invoke",
+            escalated_run_id,
+            "--scripted-response-json",
+            escalation_response,
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    escalation_output = capsys.readouterr().out
+    assert "provider:             scripted" in escalation_output
+    assert "kind:                escalation" in escalation_output
+    assert "help_kind:           policy_decision" in escalation_output
+
+
+def test_planner_invoke_cli_records_format_failure(capsys, monkeypatch, tmp_path: Path) -> None:
+    database_url = f"sqlite+pysqlite:///{tmp_path / 'cli-step10-format.db'}"
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "run",
+            "create",
+            "--project",
+            "demo",
+            "--goal",
+            "Prove malformed planner responses are bounded",
+            "--urgency",
+            "normal",
+            "--risk",
+            "medium",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    run_id = capsys.readouterr().out.splitlines()[0].split()[-1]
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["v2-spring", "approval", "list", "--database-url", database_url],
+    )
+    main()
+    approval_output = capsys.readouterr().out
+    approval_id = next(line.strip().replace("1. ", "") for line in approval_output.splitlines() if line.startswith("1. "))
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "approval",
+            "resolve",
+            approval_id,
+            "--approve",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    capsys.readouterr()
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "planner",
+            "invoke",
+            run_id,
+            "--scripted-response-json",
+            '{"kind":"action","selected_action":"execute_bounded_task"}',
+            "--database-url",
+            database_url,
+        ],
+    )
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 1
+    output = capsys.readouterr().out
+    assert "could not parse a schema-valid structured response" in output
+
+
+def test_planner_invoke_cli_accepts_openai_provider_path_without_network(
+    capsys,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    database_url = f"sqlite+pysqlite:///{tmp_path / 'cli-step10c-openai.db'}"
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("PLANNER_OPENAI_MODEL", "gpt-4o-test")
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "run",
+            "create",
+            "--project",
+            "demo",
+            "--goal",
+            "Exercise the openai transport seam without a real network call",
+            "--urgency",
+            "normal",
+            "--risk",
+            "medium",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    run_id = capsys.readouterr().out.splitlines()[0].split()[-1]
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["v2-spring", "approval", "list", "--database-url", database_url],
+    )
+    main()
+    approval_output = capsys.readouterr().out
+    approval_id = next(line.strip().replace("1. ", "") for line in approval_output.splitlines() if line.startswith("1. "))
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "approval",
+            "resolve",
+            approval_id,
+            "--approve",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    capsys.readouterr()
+
+    class FakeOpenAITransport:
+        def __init__(self, **kwargs) -> None:
+            self.model = kwargs["model"]
+
+        def invoke(self, *, system_prompt: str, user_prompt: str, output_schema: dict[str, object]):
+            return StructuredTransportResponse(
+                raw_response=json.dumps(
+                    {
+                        "kind": "action",
+                        "analysis_summary": "The openai seam should still choose bounded execution.",
+                        "confidence": "medium",
+                        "selected_action": "execute_bounded_task",
+                        "expected_outcome": "One accepted proposal should be recorded without a network call.",
+                    },
+                ),
+                provider=PlannerTransportProvider.OPENAI,
+                model=self.model,
+                response_id="resp_test_openai",
+                retry_count=1,
+                input_tokens=50,
+                output_tokens=20,
+                total_tokens=70,
+            )
+
+    monkeypatch.setattr("v2_spring.cli.OpenAIStructuredPlannerTransport", FakeOpenAITransport)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "planner",
+            "invoke",
+            run_id,
+            "--provider",
+            "openai",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    output = capsys.readouterr().out
+    assert "provider:             openai" in output
+    assert "model:                gpt-4o-test" in output
+    assert "selected_action:     execute_bounded_task" in output
+
+
+def test_planner_invoke_cli_accepts_anthropic_provider_path_without_network(
+    capsys,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    database_url = f"sqlite+pysqlite:///{tmp_path / 'cli-step10c-anthropic.db'}"
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv("PLANNER_ANTHROPIC_MODEL", "claude-3-5-test")
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "run",
+            "create",
+            "--project",
+            "demo",
+            "--goal",
+            "Exercise the anthropic transport seam without a real network call",
+            "--urgency",
+            "normal",
+            "--risk",
+            "medium",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    run_id = capsys.readouterr().out.splitlines()[0].split()[-1]
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["v2-spring", "approval", "list", "--database-url", database_url],
+    )
+    main()
+    approval_output = capsys.readouterr().out
+    approval_id = next(line.strip().replace("1. ", "") for line in approval_output.splitlines() if line.startswith("1. "))
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "approval",
+            "resolve",
+            approval_id,
+            "--approve",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    capsys.readouterr()
+
+    class FakeAnthropicTransport:
+        def __init__(self, **kwargs) -> None:
+            self.model = kwargs["model"]
+
+        def invoke(self, *, system_prompt: str, user_prompt: str, output_schema: dict[str, object]):
+            return StructuredTransportResponse(
+                raw_response={
+                    "kind": "escalation",
+                    "analysis_summary": "The anthropic seam can request bounded founder help without a network call.",
+                    "confidence": "low_needs_review",
+                    "escalation_target": "founder",
+                    "help_kind": "clarification",
+                    "blocking_reason": "A precise founder hint is still needed here.",
+                    "requested_help": "Clarify whether approval should still be resolved first.",
+                },
+                provider=PlannerTransportProvider.ANTHROPIC,
+                model=self.model,
+                response_id="resp_test_anthropic",
+                retry_count=0,
+                input_tokens=44,
+                output_tokens=16,
+                total_tokens=60,
+            )
+
+    monkeypatch.setattr("v2_spring.cli.AnthropicStructuredPlannerTransport", FakeAnthropicTransport)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "planner",
+            "invoke",
+            run_id,
+            "--provider",
+            "anthropic",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    output = capsys.readouterr().out
+    assert "provider:             anthropic" in output
+    assert "model:                claude-3-5-test" in output
+    assert "kind:                escalation" in output
+
+
+def test_planner_invoke_cli_records_local_cancel_with_orphan_risk_metadata(
+    capsys,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    database_url = f"sqlite+pysqlite:///{tmp_path / 'cli-step10c-cancel.db'}"
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("PLANNER_OPENAI_MODEL", "gpt-4o-test")
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "run",
+            "create",
+            "--project",
+            "demo",
+            "--goal",
+            "Surface local cancellation as bounded orphan-risk audit evidence",
+            "--urgency",
+            "normal",
+            "--risk",
+            "medium",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    run_id = capsys.readouterr().out.splitlines()[0].split()[-1]
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["v2-spring", "approval", "list", "--database-url", database_url],
+    )
+    main()
+    approval_output = capsys.readouterr().out
+    approval_id = next(line.strip().replace("1. ", "") for line in approval_output.splitlines() if line.startswith("1. "))
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "approval",
+            "resolve",
+            approval_id,
+            "--approve",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    capsys.readouterr()
+
+    class CancelledOpenAITransport:
+        def __init__(self, **kwargs) -> None:
+            self.model = kwargs["model"]
+
+        def invoke(self, *, system_prompt: str, user_prompt: str, output_schema: dict[str, object]):
+            raise PlannerTransportCancelledError(
+                "Planner provider invocation was interrupted locally before completion.",
+                code="cancelled",
+                provider=PlannerTransportProvider.OPENAI,
+                model=self.model,
+                retryable=False,
+                retry_count=0,
+                timeout_seconds=19,
+                orphan_risk_possible=True,
+            )
+
+    monkeypatch.setattr("v2_spring.cli.OpenAIStructuredPlannerTransport", CancelledOpenAITransport)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "planner",
+            "invoke",
+            run_id,
+            "--provider",
+            "openai",
+            "--database-url",
+            database_url,
+        ],
+    )
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 1
+    output = capsys.readouterr().out
+    assert "interrupted locally before completion" in output
+
+    store = LedgerStore(database_url)
+    observations = store.list_observations_for_run(run_id)
+    audit = observations[-1]
+    assert "error_code=cancelled" in audit.details
+    assert "orphan_risk_possible=True" in audit.details
+    assert "timeout_seconds=19" in audit.details
+    assert "cancellation_scope=local_cli_only" in audit.details
+
+
+def test_founder_hint_cli_reopens_pending_escalation_and_lists_interventions(
+    capsys,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    database_url = f"sqlite+pysqlite:///{tmp_path / 'cli-step10b-hint.db'}"
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "run",
+            "create",
+            "--project",
+            "demo",
+            "--goal",
+            "Route one founder hint back into the planner loop",
+            "--urgency",
+            "normal",
+            "--risk",
+            "medium",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    run_id = capsys.readouterr().out.splitlines()[0].split()[-1]
+
+    escalation_response = json.dumps(
+        {
+            "kind": "escalation",
+            "analysis_summary": "The founder should clarify how approval handling should proceed.",
+            "confidence": "low_needs_review",
+            "escalation_target": "founder",
+            "help_kind": "clarification",
+            "blocking_reason": "The planner wants a founder hint before choosing another move.",
+            "requested_help": "Confirm that the approval lane remains the intended next step.",
+        },
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "planner",
+            "invoke",
+            run_id,
+            "--scripted-response-json",
+            escalation_response,
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    escalation_output = capsys.readouterr().out
+    escalation_id = next(
+        line.split(":", maxsplit=1)[1].strip()
+        for line in escalation_output.splitlines()
+        if line.startswith("escalation_obs_id:")
+    )
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "planner",
+            "invoke",
+            run_id,
+            "--scripted-response-json",
+            escalation_response,
+            "--database-url",
+            database_url,
+        ],
+    )
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 1
+    blocked_output = capsys.readouterr().out
+    assert "Founder reply is still required" in blocked_output
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "planner",
+            "reply",
+            "hint",
+            run_id,
+            "--escalation-id",
+            escalation_id,
+            "--message",
+            "Keep the next move inside the existing approval boundary.",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    hint_output = capsys.readouterr().out
+    assert "Founder intervention" in hint_output
+    assert "reply_kind:         hint" in hint_output
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "planner",
+            "interventions",
+            run_id,
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    interventions_output = capsys.readouterr().out
+    assert "Founder interventions" in interventions_output
+    assert "hint" in interventions_output
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "run",
+            "snapshot",
+            run_id,
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    snapshot_output = capsys.readouterr().out
+    assert f"pending_escalation:  -" in snapshot_output
+    assert "Recent founder interventions" in snapshot_output
+
+
+def test_founder_reject_and_override_cli_follow_bounded_policy(
+    capsys,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    database_url = f"sqlite+pysqlite:///{tmp_path / 'cli-step10b-reject-override.db'}"
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "run",
+            "create",
+            "--project",
+            "demo",
+            "--goal",
+            "Exercise founder reject and override contracts",
+            "--urgency",
+            "normal",
+            "--risk",
+            "medium",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    rejected_run_id = capsys.readouterr().out.splitlines()[0].split()[-1]
+
+    escalation_response = json.dumps(
+        {
+            "kind": "escalation",
+            "analysis_summary": "The founder must decide how to proceed.",
+            "confidence": "low_needs_review",
+            "escalation_target": "founder",
+            "help_kind": "policy_decision",
+            "blocking_reason": "Approval is still pending.",
+            "requested_help": "Decide whether this phase should continue at all.",
+        },
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "planner",
+            "invoke",
+            rejected_run_id,
+            "--scripted-response-json",
+            escalation_response,
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    escalation_output = capsys.readouterr().out
+    rejection_escalation_id = next(
+        line.split(":", maxsplit=1)[1].strip()
+        for line in escalation_output.splitlines()
+        if line.startswith("escalation_obs_id:")
+    )
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "planner",
+            "reply",
+            "reject",
+            rejected_run_id,
+            "--escalation-id",
+            rejection_escalation_id,
+            "--reason",
+            "Do not reopen this founder-help lane right now.",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    reject_output = capsys.readouterr().out
+    assert "reply_kind:         reject" in reject_output
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "planner",
+            "invoke",
+            rejected_run_id,
+            "--scripted-response-json",
+            escalation_response,
+            "--database-url",
+            database_url,
+        ],
+    )
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 1
+    exhausted_output = capsys.readouterr().out
+    assert "Planner phase budget is exhausted" in exhausted_output
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "run",
+            "create",
+            "--project",
+            "demo",
+            "--goal",
+            "Allow one bounded founder override",
+            "--urgency",
+            "normal",
+            "--risk",
+            "medium",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    override_run_id = capsys.readouterr().out.splitlines()[0].split()[-1]
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "planner",
+            "invoke",
+            override_run_id,
+            "--scripted-response-json",
+            escalation_response,
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    override_escalation_output = capsys.readouterr().out
+    override_escalation_id = next(
+        line.split(":", maxsplit=1)[1].strip()
+        for line in override_escalation_output.splitlines()
+        if line.startswith("escalation_obs_id:")
+    )
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "planner",
+            "reply",
+            "override",
+            override_run_id,
+            "--escalation-id",
+            override_escalation_id,
+            "--action",
+            "resolve_pending_approval",
+            "--reason",
+            "The founder wants to force the current legal approval action.",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    override_output = capsys.readouterr().out
+    assert "reply_kind:         override" in override_output
+    assert "override_action:    resolve_pending_approval" in override_output
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "run",
+            "replay",
+            override_run_id,
+            "--verbose",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    replay_output = capsys.readouterr().out
+    assert "Founder interventions" in replay_output
+    assert "Detailed founder interventions" in replay_output
+    assert "override: Founder overrode the planner and selected resolve_pending_approval." in replay_output

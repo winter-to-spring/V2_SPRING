@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -8,19 +9,22 @@ from pydantic import ValidationError
 from v2_spring.domain.artifact import ArtifactStorageKind, ArtifactType
 from v2_spring.domain.approval import ApprovalStatus
 from v2_spring.domain.decision import DecisionKind
+from v2_spring.domain.founder_intervention import FOUNDER_REPLY_INPUT_ADAPTER, FounderReplyKind
 from v2_spring.domain.observation import ObservationKind
-from v2_spring.domain.planner_attempt import PlannerAttemptOutcome
+from v2_spring.domain.planner_attempt import PlannerAttemptOutcome, PlannerRechargeCautionCode
 from v2_spring.domain.proposal import PlannerProposalInput
 from v2_spring.domain.run import RunCreateInput, RunStatus
 from v2_spring.domain.snapshot import PossibleActionName, SnapshotActionState
 from v2_spring.domain.task import TaskKind, TaskStatus
 from v2_spring.planner.actions import POSSIBLE_ACTIONS_ENGINE_VERSION, evaluate_possible_actions
 from v2_spring.executor.bounded import BoundedExecutorTimeout
-from v2_spring.ledger.models import LedgerEventType
+from v2_spring.ledger.models import LedgerEventType, RunRecord, TaskRecord
 from v2_spring.ledger.store import LedgerStore
 from v2_spring.planner.proposals import (
+    CognitiveDuplicatePlannerProposalError,
     IllegalPlannerProposalError,
     PlannerPhaseExhaustedError,
+    PlannerStaleQuotaExhaustedError,
     StalePlannerProposalError,
     TransportDuplicatePlannerProposalError,
 )
@@ -28,6 +32,39 @@ from v2_spring.planner.proposals import (
 
 def make_store(tmp_path: Path) -> LedgerStore:
     return LedgerStore(f"sqlite+pysqlite:///{tmp_path / 'step1.db'}")
+
+
+def assert_budget_consuming_proposal_rejection(
+    store: LedgerStore,
+    *,
+    run_id: str,
+    snapshot_hash: str,
+    selected_action: PossibleActionName,
+    rationale: str,
+    expected_outcome: str,
+) -> None:
+    """Accept either an initial illegal rejection or a later cognitive duplicate.
+
+    Step 9 now treats paraphrased retries of the same blocked move as
+    `rejected_duplicate_cognitive`, so repeated budget-consuming failures may
+    surface either domain error depending on where the current phase is.
+    """
+
+    with pytest.raises(
+        (
+            IllegalPlannerProposalError,
+            CognitiveDuplicatePlannerProposalError,
+        ),
+    ):
+        store.record_planner_proposal(
+            run_id=run_id,
+            proposal=PlannerProposalInput(
+                snapshot_hash=snapshot_hash,
+                selected_action=selected_action,
+                rationale=rationale,
+                expected_outcome=expected_outcome,
+            ),
+        )
 
 
 def test_create_run_persists_typed_state_and_event(tmp_path: Path) -> None:
@@ -133,6 +170,36 @@ def test_rejecting_approval_requires_reason_and_records_it(tmp_path: Path) -> No
     assert events[-1].payload["resolution_reason"] == resolved.resolution_reason
 
 
+def test_expiring_overdue_approval_suspends_run_and_records_timeout_evidence(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    run = store.create_run(
+        RunCreateInput(
+            project="demo",
+            goal="Let approval timeout deterministically",
+            urgency="normal",
+            risk="medium",
+        ),
+    )
+    pending_approval = store.list_approvals(status=ApprovalStatus.PENDING)[0]
+
+    expired = store.expire_overdue_approvals(now=pending_approval.expires_at + timedelta(seconds=1))
+    events = store.list_events_for_run(str(run.id))
+    fetched = store.get_run(str(run.id))
+    replay = store.build_run_replay(str(run.id))
+
+    assert len(expired) == 1
+    assert expired[0].status == ApprovalStatus.EXPIRED
+    assert expired[0].resolution_reason is not None
+    assert fetched is not None
+    assert fetched.status == RunStatus.SUSPENDED
+    assert events[-2].event_type == LedgerEventType.APPROVAL_RESOLVED
+    assert events[-2].payload["status"] == ApprovalStatus.EXPIRED.value
+    assert events[-1].event_type == LedgerEventType.OBSERVATION_RECORDED
+    assert replay.run.status == RunStatus.SUSPENDED
+    assert replay.approvals[-1].status == ApprovalStatus.EXPIRED
+    assert "timed out" in (replay.approvals[-1].resolution_reason or "").lower()
+
+
 def test_pending_approval_blocks_new_decision_and_observation_until_resolved(tmp_path: Path) -> None:
     store = make_store(tmp_path)
     run = store.create_run(
@@ -186,6 +253,38 @@ def test_pending_approval_blocks_new_decision_and_observation_until_resolved(tmp
 
     assert decision.kind == DecisionKind.FOLLOW_UP
     assert observation.kind == ObservationKind.FOLLOW_UP
+
+
+def test_mutation_guard_rechecks_current_run_status_before_writing(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    run = store.create_run(
+        RunCreateInput(
+            project="demo",
+            goal="Reject stale mutation attempts when approval reappears.",
+            urgency="normal",
+            risk="medium",
+        ),
+    )
+    approval = store.list_approvals(status=ApprovalStatus.PENDING)[0]
+    store.resolve_approval(str(approval.id), approved=True)
+    ready_view = store.get_run(str(run.id))
+    assert ready_view is not None
+    assert ready_view.status == RunStatus.READY
+
+    with store.session() as session:
+        record = session.get(RunRecord, str(run.id))
+        assert record is not None
+        record.status = RunStatus.WAITING_APPROVAL
+
+    with pytest.raises(PermissionError) as exc_info:
+        store.record_decision(
+            run_id=str(run.id),
+            kind=DecisionKind.FOLLOW_UP,
+            summary="This stale caller still thinks the run is ready.",
+            rationale="The guarded mutation should re-check current status before writing.",
+        )
+
+    assert "waiting for approval" in str(exc_info.value)
 
 
 def test_bounded_execution_persists_task_artifact_and_ledger(tmp_path: Path) -> None:
@@ -370,6 +469,7 @@ def test_run_snapshot_and_possible_actions_cover_ready_and_terminal_paths(tmp_pa
 
     waiting_snapshot = store.build_run_snapshot(str(run.id))
     waiting_actions = evaluate_possible_actions(waiting_snapshot)
+    waiting_phase_key = waiting_snapshot.planner_phase_key
     assert waiting_snapshot.pending_approval is not None
     assert waiting_snapshot.policy_version == POSSIBLE_ACTIONS_ENGINE_VERSION
     assert len(waiting_snapshot.state_hash) == 64
@@ -381,10 +481,12 @@ def test_run_snapshot_and_possible_actions_cover_ready_and_terminal_paths(tmp_pa
 
     ready_snapshot = store.build_run_snapshot(str(run.id))
     ready_actions = evaluate_possible_actions(ready_snapshot)
+    ready_phase_key = ready_snapshot.planner_phase_key
     assert ready_snapshot.pending_approval is None
     assert ready_snapshot.task_summary.created == 0
     assert ready_actions.snapshot.action_state == SnapshotActionState.AVAILABLE
     assert ready_actions.actions[0].name == PossibleActionName.EXECUTE_BOUNDED_TASK
+    assert ready_phase_key != waiting_phase_key
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -401,6 +503,7 @@ def test_run_snapshot_and_possible_actions_cover_ready_and_terminal_paths(tmp_pa
     assert completed_snapshot.latest_artifact is not None
     assert completed_actions.snapshot.action_state == SnapshotActionState.TERMINAL
     assert completed_actions.actions == []
+    assert completed_snapshot.planner_phase_key != ready_phase_key
 
 
 def test_run_snapshot_and_possible_actions_capture_rejection_feedback(tmp_path: Path) -> None:
@@ -589,16 +692,14 @@ def test_planner_phase_budget_exhausts_after_three_budget_consuming_failures(tmp
     )
     for index in range(3):
         snapshot = store.build_run_snapshot(str(run.id))
-        with pytest.raises(IllegalPlannerProposalError):
-            store.record_planner_proposal(
-                run_id=str(run.id),
-                proposal=PlannerProposalInput(
-                    snapshot_hash=snapshot.state_hash,
-                    selected_action=PossibleActionName.EXECUTE_BOUNDED_TASK,
-                    rationale=f"Illegal attempt {index + 1}",
-                    expected_outcome="Should be rejected while approval is pending.",
-                ),
-            )
+        assert_budget_consuming_proposal_rejection(
+            store,
+            run_id=str(run.id),
+            snapshot_hash=snapshot.state_hash,
+            selected_action=PossibleActionName.EXECUTE_BOUNDED_TASK,
+            rationale=f"Illegal attempt {index + 1}",
+            expected_outcome="Should be rejected while approval is pending.",
+        )
 
     attempts = store.list_planner_attempts_for_run(str(run.id))
     exhausted_snapshot = store.build_run_snapshot(str(run.id))
@@ -669,6 +770,48 @@ def test_transport_duplicate_does_not_consume_phase_budget(tmp_path: Path) -> No
     ]
 
 
+def test_semantic_duplicate_proposal_is_rejected_even_when_wording_changes(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    run = store.create_run(
+        RunCreateInput(
+            project="demo",
+            goal="Reject paraphrased planner retries that keep the same underlying move",
+            urgency="normal",
+            risk="medium",
+        ),
+    )
+
+    first_snapshot = store.build_run_snapshot(str(run.id))
+    with pytest.raises(IllegalPlannerProposalError):
+        store.record_planner_proposal(
+            run_id=str(run.id),
+            proposal=PlannerProposalInput(
+                snapshot_hash=first_snapshot.state_hash,
+                selected_action=PossibleActionName.EXECUTE_BOUNDED_TASK,
+                rationale="Review the db schema before continuing.",
+                expected_outcome="Inspect the database schema first.",
+            ),
+        )
+
+    second_snapshot = store.build_run_snapshot(str(run.id))
+    with pytest.raises(CognitiveDuplicatePlannerProposalError):
+        store.record_planner_proposal(
+            run_id=str(run.id),
+            proposal=PlannerProposalInput(
+                snapshot_hash=second_snapshot.state_hash,
+                selected_action=PossibleActionName.EXECUTE_BOUNDED_TASK,
+                rationale="Inspect the database schema before proceeding.",
+                expected_outcome="Review the db schema first.",
+            ),
+        )
+
+    attempts = store.list_planner_attempts_for_run(str(run.id))
+    assert [attempt.outcome for attempt in attempts] == [
+        PlannerAttemptOutcome.REJECTED_ILLEGAL,
+        PlannerAttemptOutcome.REJECTED_DUPLICATE_COGNITIVE,
+    ]
+
+
 def test_manual_planner_recharge_reopens_exhausted_phase(tmp_path: Path) -> None:
     store = make_store(tmp_path)
     run = store.create_run(
@@ -681,16 +824,14 @@ def test_manual_planner_recharge_reopens_exhausted_phase(tmp_path: Path) -> None
     )
     for index in range(3):
         snapshot = store.build_run_snapshot(str(run.id))
-        with pytest.raises(IllegalPlannerProposalError):
-            store.record_planner_proposal(
-                run_id=str(run.id),
-                proposal=PlannerProposalInput(
-                    snapshot_hash=snapshot.state_hash,
-                    selected_action=PossibleActionName.EXECUTE_BOUNDED_TASK,
-                    rationale=f"Illegal attempt before recharge {index + 1}",
-                    expected_outcome="Should still be blocked on approval.",
-                ),
-            )
+        assert_budget_consuming_proposal_rejection(
+            store,
+            run_id=str(run.id),
+            snapshot_hash=snapshot.state_hash,
+            selected_action=PossibleActionName.EXECUTE_BOUNDED_TASK,
+            rationale=f"Illegal attempt before recharge {index + 1}",
+            expected_outcome="Should still be blocked on approval.",
+        )
 
     recharge = store.record_planner_recharge(
         run_id=str(run.id),
@@ -717,3 +858,690 @@ def test_manual_planner_recharge_reopens_exhausted_phase(tmp_path: Path) -> None
         attempt.outcome == PlannerAttemptOutcome.MANUAL_RECHARGE
         for attempt in replay.planner_attempts
     )
+
+
+def test_planner_recharge_preflight_surfaces_deterministic_failure_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = make_store(tmp_path)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    run = store.create_run(
+        RunCreateInput(
+            project="demo",
+            goal="Explain the latest deterministic blocker before founder recharge",
+            urgency="normal",
+            risk="medium",
+        ),
+    )
+    approval = store.list_approvals(status=ApprovalStatus.PENDING)[0]
+    store.resolve_approval(str(approval.id), approved=True)
+
+    store.record_planner_proposal(
+        run_id=str(run.id),
+        proposal=PlannerProposalInput(
+            snapshot_hash=store.build_run_snapshot(str(run.id)).state_hash,
+            selected_action=PossibleActionName.EXECUTE_BOUNDED_TASK,
+            rationale="Try the bounded repository scan so the system can surface a concrete blocker.",
+            expected_outcome="Either a task succeeds or the failure report becomes explicit enough to guide replanning.",
+        ),
+    )
+
+    def fail_executor(*, workspace: Path, timeout_seconds: int, execution_context_id: str | None = None):
+        raise PermissionError("Permission denied while reading workspace/.env during the repository scan.")
+
+    monkeypatch.setattr("v2_spring.ledger.store.execute_repository_scan", fail_executor)
+
+    result = store.execute_bounded_task(
+        run_id=str(run.id),
+        workspace=workspace,
+        artifact_root=tmp_path / "artifacts",
+        timeout_seconds=1,
+    )
+    assert result.task.status == TaskStatus.FAILED
+
+    for index in range(3):
+        snapshot = store.build_run_snapshot(str(run.id))
+        assert_budget_consuming_proposal_rejection(
+            store,
+            run_id=str(run.id),
+            snapshot_hash=snapshot.state_hash,
+            selected_action=PossibleActionName.RESOLVE_PENDING_APPROVAL,
+            rationale=f"Illegal retry after failed execution {index + 1}",
+            expected_outcome="This should keep exhausting the failed-execution planner phase.",
+        )
+
+    preflight = store.build_planner_recharge_preflight(str(run.id))
+
+    assert preflight.exhausted is True
+    assert preflight.latest_failure_error_code == "permission_denied"
+    assert preflight.latest_failure_deterministic is True
+    assert preflight.requires_acknowledgement is True
+    assert PlannerRechargeCautionCode.DETERMINISTIC_FAILURE in preflight.caution_codes
+    assert any("deterministic" in item.lower() for item in preflight.guidance)
+
+    with pytest.raises(PermissionError):
+        store.record_planner_recharge(
+            run_id=str(run.id),
+            reason="Try again without changing the environment first.",
+        )
+
+
+def test_planner_recharge_preflight_surfaces_latest_rejection_reason(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    run = store.create_run(
+        RunCreateInput(
+            project="demo",
+            goal="Expose the latest founder rejection before recharge",
+            urgency="normal",
+            risk="medium",
+        ),
+    )
+    approval = store.list_approvals(status=ApprovalStatus.PENDING)[0]
+    store.resolve_approval(
+        str(approval.id),
+        approved=False,
+        reason="Do not continue until the planner narrows the repository boundary.",
+    )
+
+    for index in range(3):
+        snapshot = store.build_run_snapshot(str(run.id))
+        assert_budget_consuming_proposal_rejection(
+            store,
+            run_id=str(run.id),
+            snapshot_hash=snapshot.state_hash,
+            selected_action=PossibleActionName.RESOLVE_PENDING_APPROVAL,
+            rationale=f"Illegal retry after rejection {index + 1}",
+            expected_outcome="The rejected run should not allow unrelated moves.",
+        )
+
+    preflight = store.build_planner_recharge_preflight(str(run.id))
+
+    assert preflight.latest_rejection_reason == "Do not continue until the planner narrows the repository boundary."
+    assert preflight.requires_acknowledgement is True
+    assert PlannerRechargeCautionCode.LATEST_REJECTION_PRESENT in preflight.caution_codes
+
+
+def test_repeated_manual_recharge_requires_explicit_acknowledgement(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    run = store.create_run(
+        RunCreateInput(
+            project="demo",
+            goal="Require an explicit acknowledgement before repeated founder recharge.",
+            urgency="normal",
+            risk="medium",
+        ),
+    )
+
+    for index in range(3):
+        snapshot = store.build_run_snapshot(str(run.id))
+        assert_budget_consuming_proposal_rejection(
+            store,
+            run_id=str(run.id),
+            snapshot_hash=snapshot.state_hash,
+            selected_action=PossibleActionName.EXECUTE_BOUNDED_TASK,
+            rationale=f"Illegal attempt before first recharge {index + 1}",
+            expected_outcome="Still blocked on approval.",
+        )
+
+    store.record_planner_recharge(
+        run_id=str(run.id),
+        reason="Open one more planner pass after reviewing the current illegal attempts.",
+    )
+
+    for index in range(3):
+        snapshot = store.build_run_snapshot(str(run.id))
+        assert_budget_consuming_proposal_rejection(
+            store,
+            run_id=str(run.id),
+            snapshot_hash=snapshot.state_hash,
+            selected_action=PossibleActionName.EXECUTE_BOUNDED_TASK,
+            rationale=f"Illegal attempt before second recharge {index + 1}",
+            expected_outcome="Still blocked on approval after one recharge.",
+        )
+
+    preflight = store.build_planner_recharge_preflight(str(run.id))
+    assert preflight.recharge_count == 1
+    assert preflight.requires_acknowledgement is True
+    assert PlannerRechargeCautionCode.REPEATED_RECHARGE in preflight.caution_codes
+
+    with pytest.raises(PermissionError):
+        store.record_planner_recharge(
+            run_id=str(run.id),
+            reason="Try the same phase again without acknowledging the unchanged context.",
+        )
+
+    second_recharge = store.record_planner_recharge(
+        run_id=str(run.id),
+        reason="The founder explicitly wants one more bounded retry after reviewing the unchanged context.",
+        acknowledge_unchanged_context=True,
+    )
+    assert second_recharge.outcome == PlannerAttemptOutcome.MANUAL_RECHARGE
+
+
+def test_stale_proposals_use_separate_stale_quota(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    run = store.create_run(
+        RunCreateInput(
+            project="demo",
+            goal="Verify stale quota fairness",
+            urgency="normal",
+            risk="medium",
+        ),
+    )
+    approval = store.list_approvals(status=ApprovalStatus.PENDING)[0]
+    store.resolve_approval(str(approval.id), approved=True)
+
+    for _ in range(2):
+        with pytest.raises(StalePlannerProposalError):
+            store.record_planner_proposal(
+                run_id=str(run.id),
+                proposal=PlannerProposalInput(
+                    snapshot_hash="0" * 64,
+                    selected_action=PossibleActionName.EXECUTE_BOUNDED_TASK,
+                    rationale="This snapshot is stale on purpose.",
+                    expected_outcome="The stale quota should increase without consuming the main budget.",
+                ),
+            )
+
+    snapshot = store.build_run_snapshot(str(run.id))
+    assert snapshot.planner_budget_used == 0
+    assert snapshot.planner_stale_quota_used == 2
+    assert snapshot.planner_stale_quota_remaining == 1
+
+    with pytest.raises(PlannerStaleQuotaExhaustedError):
+        store.record_planner_proposal(
+            run_id=str(run.id),
+            proposal=PlannerProposalInput(
+                snapshot_hash="0" * 64,
+                selected_action=PossibleActionName.EXECUTE_BOUNDED_TASK,
+                rationale="One more stale attempt should exhaust the separate stale quota.",
+                expected_outcome="The system should now block repeated stale retries.",
+            ),
+        )
+
+    exhausted_snapshot = store.build_run_snapshot(str(run.id))
+    assert exhausted_snapshot.planner_budget_used == 0
+    assert exhausted_snapshot.planner_stale_quota_exhausted is True
+
+
+def test_build_planner_context_includes_structured_failure_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = make_store(tmp_path)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    run = store.create_run(
+        RunCreateInput(
+            project="demo",
+            goal="Prepare planner feedback after execution failure",
+            urgency="normal",
+            risk="medium",
+        ),
+    )
+    approval = store.list_approvals(status=ApprovalStatus.PENDING)[0]
+    store.resolve_approval(str(approval.id), approved=True)
+
+    def fail_executor(*, workspace: Path, timeout_seconds: int, execution_context_id: str | None = None):
+        raise BoundedExecutorTimeout("Executor timed out while scanning the repository.")
+
+    monkeypatch.setattr("v2_spring.ledger.store.execute_repository_scan", fail_executor)
+
+    result = store.execute_bounded_task(
+        run_id=str(run.id),
+        workspace=workspace,
+        artifact_root=tmp_path / "artifacts",
+        timeout_seconds=1,
+    )
+    context = store.build_planner_context(str(run.id))
+
+    assert result.task.status == TaskStatus.FAILED
+    assert context.failure_report is not None
+    assert context.failure_report.error_code == "timeout"
+    assert context.failure_report.previous_rationale is None
+    assert context.failure_report.repeated_failure_streak == 1
+    assert context.legal_actions[0].name == PossibleActionName.REPLAN_FROM_FAILED_EXECUTION
+
+
+def test_failure_report_preserves_error_code_trace_and_previous_rationale(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = make_store(tmp_path)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    run = store.create_run(
+        RunCreateInput(
+            project="demo",
+            goal="Keep enough signal in the failure report for planner self-correction",
+            urgency="normal",
+            risk="medium",
+        ),
+    )
+    approval = store.list_approvals(status=ApprovalStatus.PENDING)[0]
+    store.resolve_approval(str(approval.id), approved=True)
+
+    proposal = store.record_planner_proposal(
+        run_id=str(run.id),
+        proposal=PlannerProposalInput(
+            snapshot_hash=store.build_run_snapshot(str(run.id)).state_hash,
+            selected_action=PossibleActionName.EXECUTE_BOUNDED_TASK,
+            rationale="Inspect the repository structure before attempting any broader orchestration change.",
+            expected_outcome="A bounded repository scan should either succeed or explain the concrete blocker.",
+        ),
+    )
+
+    def fail_executor(*, workspace: Path, timeout_seconds: int, execution_context_id: str | None = None):
+        raise PermissionError(
+            "Permission denied while reading /Users/changhyeon/Desktop/AI AGENT/.env during the repository scan.",
+        )
+
+    monkeypatch.setattr("v2_spring.ledger.store.execute_repository_scan", fail_executor)
+
+    result = store.execute_bounded_task(
+        run_id=str(run.id),
+        workspace=workspace,
+        artifact_root=tmp_path / "artifacts",
+        timeout_seconds=1,
+    )
+    context = store.build_planner_context(str(run.id))
+
+    assert result.task.status == TaskStatus.FAILED
+    assert context.failure_report is not None
+    assert context.failure_report.failure_class.value == "deterministic_runtime"
+    assert context.failure_report.error_code == "permission_denied"
+    assert context.failure_report.previous_rationale == proposal.rationale
+    assert context.failure_report.previous_expected_outcome == proposal.expected_outcome
+    assert "Permission denied" in context.failure_report.short_traceback
+    assert "[workspace]" in context.failure_report.short_traceback
+    assert "/Users/changhyeon/Desktop/AI AGENT" not in context.failure_report.short_traceback
+    assert "Permission denied" in context.failure_report.observed_outcome
+
+
+def test_failure_report_stays_linked_to_the_failed_execution_proposal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = make_store(tmp_path)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    run = store.create_run(
+        RunCreateInput(
+            project="demo",
+            goal="Keep failure context anchored to the proposal that actually produced the failed task",
+            urgency="normal",
+            risk="medium",
+        ),
+    )
+    approval = store.list_approvals(status=ApprovalStatus.PENDING)[0]
+    store.resolve_approval(str(approval.id), approved=True)
+
+    execution_proposal = store.record_planner_proposal(
+        run_id=str(run.id),
+        proposal=PlannerProposalInput(
+            snapshot_hash=store.build_run_snapshot(str(run.id)).state_hash,
+            selected_action=PossibleActionName.EXECUTE_BOUNDED_TASK,
+            rationale="Run the bounded repository scan first so any blocker is concrete.",
+            expected_outcome="The scan should either succeed or expose the precise execution blocker.",
+        ),
+    )
+
+    def fail_executor(*, workspace: Path, timeout_seconds: int, execution_context_id: str | None = None):
+        raise PermissionError("Permission denied while reading workspace/.env during the repository scan.")
+
+    monkeypatch.setattr("v2_spring.ledger.store.execute_repository_scan", fail_executor)
+
+    result = store.execute_bounded_task(
+        run_id=str(run.id),
+        workspace=workspace,
+        artifact_root=tmp_path / "artifacts",
+        timeout_seconds=1,
+    )
+    assert result.task.status == TaskStatus.FAILED
+
+    failed_snapshot = store.build_run_snapshot(str(run.id))
+    replan_proposal = store.record_planner_proposal(
+        run_id=str(run.id),
+        proposal=PlannerProposalInput(
+            snapshot_hash=failed_snapshot.state_hash,
+            selected_action=PossibleActionName.REPLAN_FROM_FAILED_EXECUTION,
+            rationale="Use the failed execution lane to plan around the permission blocker.",
+            expected_outcome="The next planner loop should propose a safer path around the failure.",
+        ),
+    )
+
+    context = store.build_planner_context(str(run.id))
+
+    assert context.failure_report is not None
+    assert context.failure_report.previous_rationale == execution_proposal.rationale
+    assert context.failure_report.previous_expected_outcome == execution_proposal.expected_outcome
+    assert context.failure_report.previous_rationale != replan_proposal.rationale
+    assert context.failure_report.previous_expected_outcome != replan_proposal.expected_outcome
+
+
+def test_repeated_deterministic_execution_failure_opens_founder_escalation_lane(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = make_store(tmp_path)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    run = store.create_run(
+        RunCreateInput(
+            project="demo",
+            goal="Stop planner re-entry once the same deterministic execution blocker repeats",
+            urgency="normal",
+            risk="medium",
+        ),
+    )
+    approval = store.list_approvals(status=ApprovalStatus.PENDING)[0]
+    store.resolve_approval(str(approval.id), approved=True)
+
+    proposal = store.record_planner_proposal(
+        run_id=str(run.id),
+        proposal=PlannerProposalInput(
+            snapshot_hash=store.build_run_snapshot(str(run.id)).state_hash,
+            selected_action=PossibleActionName.EXECUTE_BOUNDED_TASK,
+            rationale="Try the bounded repository scan first so we can classify the blocker precisely.",
+            expected_outcome="A deterministic failure should feed back into governed replanning.",
+        ),
+    )
+
+    def fail_executor(*, workspace: Path, timeout_seconds: int, execution_context_id: str | None = None):
+        raise PermissionError("Permission denied while reading workspace/.env during the repository scan.")
+
+    monkeypatch.setattr("v2_spring.ledger.store.execute_repository_scan", fail_executor)
+
+    first_result = store.execute_bounded_task(
+        run_id=str(run.id),
+        workspace=workspace,
+        artifact_root=tmp_path / "artifacts",
+        timeout_seconds=1,
+    )
+    assert first_result.task.status == TaskStatus.FAILED
+
+    first_task = store.build_run_replay(str(run.id)).tasks[-1].task
+    with store.session() as session:
+        session.add(
+            TaskRecord(
+                run_id=str(run.id),
+                decision_id=str(proposal.decision_id),
+                kind=first_task.kind,
+                status=TaskStatus.FAILED,
+                summary=first_task.summary,
+                execution_context_id="simulated-repeat-failure",
+                command="scan_repository_tree --workspace [workspace] --max-depth 3",
+                cwd=str(workspace),
+                timeout_seconds=1,
+                stdout="",
+                stderr=first_task.stderr,
+            ),
+        )
+        session.flush()
+
+    snapshot_before = store.build_run_snapshot(str(run.id))
+    assert snapshot_before.pending_founder_escalation is None
+
+    with pytest.raises(PermissionError):
+        store.record_planner_proposal(
+            run_id=str(run.id),
+            proposal=PlannerProposalInput(
+                snapshot_hash=snapshot_before.state_hash,
+                selected_action=PossibleActionName.REPLAN_FROM_FAILED_EXECUTION,
+                rationale="Try the failed execution lane again after reading the same deterministic error.",
+                expected_outcome="This should be blocked and redirected to founder review.",
+            ),
+        )
+
+    snapshot_after = store.build_run_snapshot(str(run.id))
+    assert snapshot_after.pending_founder_escalation is not None
+    assert "repeated deterministic execution failure" in snapshot_after.pending_founder_escalation.summary.lower()
+    assert "failure_error_code=permission_denied" in snapshot_after.pending_founder_escalation.details
+    assert snapshot_after.planner_phase_key == snapshot_before.planner_phase_key
+
+
+@pytest.mark.parametrize(
+    ("failure_text", "expected_class", "expected_code"),
+    [
+        ("Permission denied while reading a private file", "deterministic_runtime", "permission_denied"),
+        ("No such file or directory: repo/missing.py", "deterministic_runtime", "path_not_found"),
+        ("Executor timed out after waiting for network storage", "transient_infrastructure", "timeout"),
+        ("429 rate limit from upstream provider", "transient_infrastructure", "service_unavailable"),
+        ("Unexpected parser failure", "unknown_runtime", "unknown_runtime_failure"),
+    ],
+)
+def test_failure_classifier_maps_common_runtime_patterns(
+    tmp_path: Path,
+    failure_text: str,
+    expected_class: str,
+    expected_code: str,
+) -> None:
+    store = make_store(tmp_path)
+
+    failure_class, error_code = store._classify_failure(failure_text)
+
+    assert failure_class.value == expected_class
+    assert error_code == expected_code
+
+
+def test_founder_hint_clears_pending_escalation_and_reopens_planner_lane(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    run = store.create_run(
+        RunCreateInput(
+            project="demo",
+            goal="Allow founder hints to unblock a planner escalation",
+            urgency="normal",
+            risk="medium",
+        ),
+    )
+    initial_snapshot = store.build_run_snapshot(str(run.id))
+    escalation = store.record_planner_escalation(
+        run_id=str(run.id),
+        snapshot_hash=initial_snapshot.state_hash,
+        analysis_summary="Approval is still pending, so a founder policy call is required.",
+        confidence="low_needs_review",
+        help_kind="policy_decision",
+        blocking_reason="A pending approval gate blocks every other legal move.",
+        requested_help="Approve or reject the run before bounded execution can continue.",
+    )
+    blocked_snapshot = store.build_run_snapshot(str(run.id))
+
+    with pytest.raises(PermissionError):
+        store.record_planner_proposal(
+            run_id=str(run.id),
+            proposal=PlannerProposalInput(
+                snapshot_hash=blocked_snapshot.state_hash,
+                selected_action=PossibleActionName.RESOLVE_PENDING_APPROVAL,
+                rationale="This should stay blocked until the founder replies to the open escalation.",
+                expected_outcome="Nothing should be accepted yet.",
+            ),
+        )
+
+    intervention = store.record_founder_reply(
+        run_id=str(run.id),
+        target_escalation_id=str(escalation.id),
+        reply=FOUNDER_REPLY_INPUT_ADAPTER.validate_python(
+            {
+                "kind": "hint",
+                "message": "Use the founder-help lane only for explicit approval guidance.",
+            },
+        ),
+    )
+    reopened_snapshot = store.build_run_snapshot(str(run.id))
+    accepted = store.record_planner_proposal(
+        run_id=str(run.id),
+        proposal=PlannerProposalInput(
+            snapshot_hash=reopened_snapshot.state_hash,
+            selected_action=PossibleActionName.RESOLVE_PENDING_APPROVAL,
+            rationale="The founder confirmed that approval resolution is still the right next step.",
+            expected_outcome="The founder should now approve or reject the intake gate explicitly.",
+        ),
+    )
+
+    assert intervention.reply_kind == FounderReplyKind.HINT
+    assert blocked_snapshot.pending_founder_escalation is not None
+    assert blocked_snapshot.planner_phase_key == initial_snapshot.planner_phase_key
+    assert reopened_snapshot.pending_founder_escalation is None
+    assert reopened_snapshot.planner_phase_exhausted is False
+    assert reopened_snapshot.planner_phase_key == initial_snapshot.planner_phase_key
+    assert reopened_snapshot.latest_founder_intervention_summary == intervention.summary
+    assert accepted.selected_action == PossibleActionName.RESOLVE_PENDING_APPROVAL
+
+
+def test_founder_reject_exhausts_current_phase_and_records_intervention(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    run = store.create_run(
+        RunCreateInput(
+            project="demo",
+            goal="Stop the founder-help lane after a reject",
+            urgency="normal",
+            risk="medium",
+        ),
+    )
+    snapshot = store.build_run_snapshot(str(run.id))
+    escalation = store.record_planner_escalation(
+        run_id=str(run.id),
+        snapshot_hash=snapshot.state_hash,
+        analysis_summary="The founder must decide whether approval should be resolved manually.",
+        confidence="low_needs_review",
+        help_kind="policy_decision",
+        blocking_reason="Approval is still pending.",
+        requested_help="Please decide whether to approve or reject the run.",
+    )
+
+    intervention = store.record_founder_reply(
+        run_id=str(run.id),
+        target_escalation_id=str(escalation.id),
+        reply=FOUNDER_REPLY_INPUT_ADAPTER.validate_python(
+            {
+                "kind": "reject",
+                "reason": "Do not escalate this again; the planner must stop here for now.",
+            },
+        ),
+    )
+    rejected_snapshot = store.build_run_snapshot(str(run.id))
+    replay = store.build_run_replay(str(run.id))
+
+    assert intervention.reply_kind == FounderReplyKind.REJECT
+    assert rejected_snapshot.pending_founder_escalation is None
+    assert rejected_snapshot.planner_phase_exhausted is True
+    assert replay.founder_interventions[-1].reply_kind == FounderReplyKind.REJECT
+    assert replay.planner_attempts[-1].outcome == PlannerAttemptOutcome.PHASE_EXHAUSTED
+
+    with pytest.raises(PlannerPhaseExhaustedError):
+        store.record_planner_proposal(
+            run_id=str(run.id),
+            proposal=PlannerProposalInput(
+                snapshot_hash=rejected_snapshot.state_hash,
+                selected_action=PossibleActionName.RESOLVE_PENDING_APPROVAL,
+                rationale="This should fail because the founder rejected more help in this phase.",
+                expected_outcome="No new planner proposal should be accepted.",
+            ),
+        )
+
+
+def test_founder_override_is_bounded_and_records_founder_override_decision(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    run = store.create_run(
+        RunCreateInput(
+            project="demo",
+            goal="Allow a bounded founder override",
+            urgency="normal",
+            risk="medium",
+        ),
+    )
+    snapshot = store.build_run_snapshot(str(run.id))
+    escalation = store.record_planner_escalation(
+        run_id=str(run.id),
+        snapshot_hash=snapshot.state_hash,
+        analysis_summary="The founder may want to force a currently legal move.",
+        confidence="medium",
+        help_kind="manual_override_request",
+        blocking_reason="Approval is pending and the founder might prefer a manual decision.",
+        requested_help="Choose the current legal action explicitly if you want to override the planner.",
+    )
+
+    with pytest.raises(ValueError):
+        store.record_founder_reply(
+            run_id=str(run.id),
+            target_escalation_id=str(escalation.id),
+            reply=FOUNDER_REPLY_INPUT_ADAPTER.validate_python(
+                {
+                    "kind": "override",
+                    "selected_action": "execute_bounded_task",
+                    "reason": "This should fail because bounded execution is not legal before approval.",
+                },
+            ),
+        )
+
+    intervention = store.record_founder_reply(
+        run_id=str(run.id),
+        target_escalation_id=str(escalation.id),
+        reply=FOUNDER_REPLY_INPUT_ADAPTER.validate_python(
+            {
+                "kind": "override",
+                "selected_action": "resolve_pending_approval",
+                "reason": "The founder wants to force the current legal approval action.",
+            },
+        ),
+    )
+    snapshot_after = store.build_run_snapshot(str(run.id))
+    decisions = store.list_decisions_for_run(str(run.id))
+
+    assert intervention.reply_kind == FounderReplyKind.OVERRIDE
+    assert intervention.override_action == PossibleActionName.RESOLVE_PENDING_APPROVAL
+    assert snapshot_after.planner_phase_exhausted is True
+    assert decisions[-1].kind == DecisionKind.FOUNDER_OVERRIDE_ACCEPTED
+
+
+def test_founder_hint_quota_exhausts_after_two_replies_in_one_phase(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    run = store.create_run(
+        RunCreateInput(
+            project="demo",
+            goal="Bound repeated founder hint ping-pong in one phase",
+            urgency="normal",
+            risk="medium",
+        ),
+    )
+    for index in range(2):
+        snapshot = store.build_run_snapshot(str(run.id))
+        escalation = store.record_planner_escalation(
+            run_id=str(run.id),
+            snapshot_hash=snapshot.state_hash,
+            analysis_summary=f"Founder help request {index + 1}",
+            confidence="low_needs_review",
+            help_kind="clarification",
+            blocking_reason="The founder keeps being asked to clarify the same policy boundary.",
+            requested_help="Confirm whether the approval lane should remain the only legal move.",
+        )
+        store.record_founder_reply(
+            run_id=str(run.id),
+            target_escalation_id=str(escalation.id),
+            reply=FOUNDER_REPLY_INPUT_ADAPTER.validate_python(
+                {
+                    "kind": "hint",
+                    "message": f"Hint {index + 1}: stay inside the current approval boundary.",
+                },
+            ),
+        )
+
+    third_snapshot = store.build_run_snapshot(str(run.id))
+    with pytest.raises(PlannerPhaseExhaustedError):
+        store.record_planner_escalation(
+            run_id=str(run.id),
+            snapshot_hash=third_snapshot.state_hash,
+            analysis_summary="A third founder escalation should exhaust the phase.",
+            confidence="low_needs_review",
+            help_kind="clarification",
+            blocking_reason="The planner should stop instead of ping-ponging forever.",
+            requested_help="This should not open a third founder-help lane in the same phase.",
+        )
+
+    exhausted_snapshot = store.build_run_snapshot(str(run.id))
+    attempts = store.list_planner_attempts_for_run(str(run.id))
+
+    assert exhausted_snapshot.planner_phase_exhausted is True
+    assert attempts[-1].outcome == PlannerAttemptOutcome.PHASE_EXHAUSTED

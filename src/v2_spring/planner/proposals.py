@@ -1,8 +1,17 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from v2_spring.domain.planner_adapter import PlannerTransportAuditView
+
 
 class StalePlannerProposalError(ValueError):
     """Raised when a proposal was created against an old snapshot hash."""
+
+
+class PlannerStaleQuotaExhaustedError(PermissionError):
+    """Raised when repeated stale attempts exhaust the separate stale quota."""
 
 
 class IllegalPlannerProposalError(PermissionError):
@@ -19,3 +28,16 @@ class CognitiveDuplicatePlannerProposalError(PermissionError):
 
 class PlannerPhaseExhaustedError(PermissionError):
     """Raised when the current phase has no planner attempt budget left."""
+
+
+class PlannerAdapterFormatError(ValueError):
+    """Raised when the planner adapter cannot parse a structured response."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        transport_audit: "PlannerTransportAuditView | None" = None,
+    ) -> None:
+        super().__init__(message)
+        self.transport_audit = transport_audit

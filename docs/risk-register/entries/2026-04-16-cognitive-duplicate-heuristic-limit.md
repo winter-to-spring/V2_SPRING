@@ -1,7 +1,7 @@
 # Risk ID: RISK-0012
-Title: Cognitive duplicate detection remains exact-fingerprint only
+Title: ~~Cognitive duplicate detection remains exact-fingerprint only~~
 Class: Before Scale
-Status: Open
+Status: Resolved
 Owner: Core / Planner governance
 Observed In: Step 9 - bounded replanning governance review
 
@@ -41,6 +41,15 @@ efficient against a stubborn planner that paraphrases itself.
   deterministic baseline proves stable
 - expose duplicate categories clearly in replay and planner analytics
 
+Current resolution:
+
+- exact proposal fingerprints remain the strict base rule
+- planner governance now also computes a deterministic normalized intent
+  signature from the selected action plus normalized rationale/outcome tokens
+- paraphrased retries for the same action can now be rejected as
+  `rejected_duplicate_cognitive` even when wording changes
+- replay and planner attempt events still expose duplicate outcomes explicitly
+
 ## Capability Gate
 - Capability: high-volume planner loops / cost-sensitive scaling
 - Gate mode: Before Scale
@@ -57,6 +66,8 @@ efficient against a stubborn planner that paraphrases itself.
 
 - duplicate detection policy is explicit about exact-match limits
 - scale planning chooses whether semantic duplicate detection is necessary
+- paraphrased near-duplicate retries are bounded by a deterministic heuristic
 
 ## Last Updated
 - 2026-04-16
+- 2026-04-17

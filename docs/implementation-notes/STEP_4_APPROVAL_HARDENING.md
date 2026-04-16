@@ -64,9 +64,47 @@ The approval barrier still blocks the first class.
 The second class is allowed so the system does not become blind while a human
 is deciding.
 
+## Approval Timeout Closure
+
+Approval wait is no longer an unbounded pause.
+
+The current tracer bullet now adds:
+
+- `expires_at` on every approval record
+- an explicit `expired` approval outcome
+- a deterministic `suspended` run state when an overdue approval is swept
+- `v2-spring approval sweep-timeouts` as the current founder/operator-facing
+  timeout mechanism
+- replay and approval list visibility for expiry state and timeout reason
+
+This keeps the current CLI flow deterministic without pretending we already
+have a background watchdog. A future worker can call the same sweep logic on a
+schedule, but the domain rule now already exists.
+
+## Current-Scope Concurrency Closure
+
+The original Step 4 approval barrier lived only in service-layer conditionals.
+
+That was enough to prove the basic semantics, but it left a race window between
+"I checked the run status" and "I started writing". The current tracer bullet
+now closes that gap for the single-node / current-DB scope by acquiring a
+guarded run mutation slot in the same transaction before stateful writes
+continue.
+
+That means:
+
+- decision and observation writes no longer rely on an earlier stale read of
+  run status
+- bounded execution start also re-checks readiness under the same guarded
+  mutation path
+- stale callers are deterministically rejected instead of slipping writes
+  through a purely in-memory barrier
+
+This closes the current-scope approval barrier race. Stronger multi-worker
+leases and distributed coordination remain a separate scaling concern.
+
 ## What We Deliberately Leave For Later
 
-- approval timeout / expires_at / suspended semantics
 - watchdog-driven cleanup for abandoned approvals
 - stronger DB-level or distributed locking for concurrent workers
 

@@ -6,7 +6,9 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from v2_spring.domain.actions import PossibleActionName
 from v2_spring.domain.approval import ApprovalView
+from v2_spring.domain.founder_intervention import FounderInterventionDigest
 from v2_spring.domain.artifact import ArtifactType
 from v2_spring.domain.run import RunView
 from v2_spring.domain.task import TaskKind, TaskStatus
@@ -17,13 +19,6 @@ class SnapshotActionState(StrEnum):
     BLOCKED = "blocked"
     TERMINAL = "terminal"
     STUCK = "stuck"
-
-
-class PossibleActionName(StrEnum):
-    RESOLVE_PENDING_APPROVAL = "resolve_pending_approval"
-    EXECUTE_BOUNDED_TASK = "execute_bounded_task"
-    REPLAN_WITH_REJECTION_FEEDBACK = "replan_with_rejection_feedback"
-    REPLAN_FROM_FAILED_EXECUTION = "replan_from_failed_execution"
 
 
 class TaskStatusSummary(BaseModel):
@@ -81,6 +76,25 @@ class ArtifactHeadlineView(BaseModel):
         return cleaned
 
 
+class PendingFounderEscalationView(BaseModel):
+    """Open planner escalation that still requires founder intervention."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    observation_id: UUID
+    summary: str = Field(min_length=1, max_length=400)
+    details: str = Field(min_length=1, max_length=1000)
+    created_at: datetime
+
+    @field_validator("summary", "details")
+    @classmethod
+    def ensure_text(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("value must not be blank")
+        return cleaned
+
+
 class RunSnapshotView(BaseModel):
     """Planner-ready, founder-readable snapshot of current run state."""
 
@@ -93,6 +107,8 @@ class RunSnapshotView(BaseModel):
     action_state: SnapshotActionState
     action_state_reason: str = Field(min_length=1, max_length=400)
     pending_approval: ApprovalView | None
+    pending_founder_escalation: PendingFounderEscalationView | None
+    latest_founder_intervention_summary: str | None
     latest_rejection_reason: str | None
     latest_decision_summary: str | None
     planner_phase_key: str = Field(min_length=64, max_length=64)
@@ -100,10 +116,15 @@ class RunSnapshotView(BaseModel):
     planner_budget_used: int = Field(ge=0)
     planner_budget_remaining: int = Field(ge=0)
     planner_phase_exhausted: bool = False
+    planner_stale_quota_limit: int = Field(ge=1)
+    planner_stale_quota_used: int = Field(ge=0)
+    planner_stale_quota_remaining: int = Field(ge=0)
+    planner_stale_quota_exhausted: bool = False
     latest_planner_attempt_summary: str | None
     task_summary: TaskStatusSummary
     latest_task: TaskHeadlineView | None
     latest_artifact: ArtifactHeadlineView | None
+    recent_founder_interventions: list[FounderInterventionDigest]
 
     @field_validator("state_hash", "planner_phase_key")
     @classmethod
@@ -116,6 +137,7 @@ class RunSnapshotView(BaseModel):
     @field_validator(
         "policy_version",
         "action_state_reason",
+        "latest_founder_intervention_summary",
         "latest_rejection_reason",
         "latest_decision_summary",
         "latest_planner_attempt_summary",
