@@ -11,6 +11,7 @@ class ObservationKind(StrEnum):
     RUN_INTAKE = "run_intake"
     FOLLOW_UP = "follow_up"
     SYSTEM_AUDIT = "system_audit"
+    TASK_EXECUTION = "task_execution"
 
 
 class ObservationView(BaseModel):

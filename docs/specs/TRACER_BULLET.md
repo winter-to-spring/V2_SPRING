@@ -91,6 +91,8 @@ Expected result:
 - a `Task` is created
 - the `Task` transitions through deterministic states
 - an `Artifact` is produced
+- the artifact records provenance such as `task_id`, `execution_context_id`,
+  `command`, `cwd`, `size_bytes`, and `sha256`
 - an `Observation` captures execution outcome
 
 ### Step 6. Request human approval
