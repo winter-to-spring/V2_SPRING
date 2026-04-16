@@ -1,4 +1,4 @@
-# [코어] Step 10 - LangGraph planner adapter with bounded stateful context
+# [코어] Step 10 Epic - LangGraph planner adapter with bounded stateful context
 
 ## 배경 / 문제
 
@@ -7,7 +7,8 @@ Step 9까지 오면서 planner slot은 bounded하게 운영할 수 있게 됐지
 
 Step 10은 단순한 LLM 연결이 아니라, **LangGraph planner adapter가 어떤
 형태의 입력을 받고 어떤 형태의 출력을 내야 하는지**를 실제 코드로
-증명하는 단계입니다.
+증명하고, 이후 founder interaction과 production transport hardening까지
+점진적으로 닫는 에픽입니다.
 
 이번 단계에서 가장 중요한 결정은 세 가지입니다.
 
@@ -16,14 +17,32 @@ Step 10은 단순한 LLM 연결이 아니라, **LangGraph planner adapter가 어
 3. output은 단일 action 강제가 아니라
    **`ActionProposal | EscalationProposal` discriminated union**
 
-## 이번 단계의 목적
+## 에픽 목표
 
 1. LangGraph planner adapter의 첫 bounded proof path를 만든다
 2. structured failure report 기반 context window를 만든다
 3. legal action과 escalation을 서로 다른 타입으로 다룬다
 4. malformed output / stale churn / planner loop drift를 bounded하게 제어한다
+5. founder reply contract와 production transport hardening을 child issue로 분리해
+   안전하게 확장한다
 
-## 구현 범위
+## Step 10 분할 구조
+
+- **10-a**
+  - planner adapter contract and scripted proof path
+  - structured failure report
+  - `ActionProposal | EscalationProposal`
+  - stale quota / format failure / scripted invoke
+- **10-b**
+  - founder reply contract
+  - hint-first / override-available
+  - escalation 이후 bounded 재진입
+- **10-c**
+  - production planner transport
+  - structured outputs hardening
+  - timeout / retry / token usage / context window / sanitization
+
+## 10-a 범위
 
 - `PlannerContextWindow` typed model
 - `StructuredFailureReport` typed model
@@ -55,6 +74,19 @@ Step 10은 단순한 LLM 연결이 아니라, **LangGraph planner adapter가 어
 - `RISK-0016` premature escalation / escalation thrash
 - `RISK-0017` founder reply contract ambiguity
 
+## 에픽 차원 공통 결정
+
+- planner는 `stateless function`이 아니라 **bounded stateful planner**로 간다
+- raw ledger 전체를 planner 입력에 직접 주지 않는다
+- planner 입력은 **Structured Failure Report**와 최근 bounded context만 사용한다
+- output은 자유 텍스트가 아니라 **structured output**을 기본 경로로 사용한다
+- output contract는 단일 action 강제가 아니라
+  **`ActionProposal | EscalationProposal` discriminated union**으로 간다
+- `analysis_summary`와 `confidence`는 필수 reasoning metadata로 남긴다
+- founder interaction은 **hint-first / override-available** 정책으로 설계한다
+- production transport는 **single-provider-first implementation + provider-agnostic seam**
+  원칙으로 확장한다
+
 ## 이번 단계에서 하지 않는 것
 
 - founder override execution
@@ -63,7 +95,7 @@ Step 10은 단순한 LLM 연결이 아니라, **LangGraph planner adapter가 어
 - semantic duplicate 고도화
 - production transport hardening 전체
 
-## Acceptance Criteria
+## 10-a Acceptance Criteria
 
 - planner adapter는 bounded context window를 입력으로 받는다
 - output은 discriminated union으로 파싱된다
@@ -72,6 +104,12 @@ Step 10은 단순한 LLM 연결이 아니라, **LangGraph planner adapter가 어
 - stale는 separate stale quota로 관리된다
 - malformed output은 explicit format failure로 기록된다
 - CLI에서 `planner invoke`로 proof 가능하다
+
+## 연결 child issue
+
+- `#21` Step 10-a - planner adapter contract and scripted proof path
+- `#22` Step 10-b - founder reply contract and hint-first escalation loop
+- `#23` Step 10-c - production transport hardening for the planner adapter
 
 ## 리스크 / 메모
 
