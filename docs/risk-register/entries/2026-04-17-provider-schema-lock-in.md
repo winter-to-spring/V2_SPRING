@@ -1,7 +1,7 @@
 # Risk ID: RISK-0019
-Title: Single-provider structured output may leak vendor semantics into the core planner transport seam
+Title: ~~Single-provider structured output may leak vendor semantics into the core planner transport seam~~
 Class: Before Scale
-Status: Mitigating
+Status: Resolved
 Owner: Core / Planner transport
 Observed In: Step 10-c production transport design review
 
@@ -48,11 +48,21 @@ Current mitigation in `10-c`:
 - provider/network failures are normalized into internal transport errors before
   they reach CLI governance paths
 
+Current resolution:
+
+- the seam now supports both OpenAI-style strict JSON schema transport and an
+  Anthropic-style tool-use transport without changing planner core types
+- CLI/provider selection and config remain adapter-edge concerns
+- provider-specific request/response translation stays inside concrete transport
+  classes
+- transport tests prove a second provider path can be exercised behind the same
+  `StructuredPlannerTransport` protocol
+
 ## Capability Gate
 - Capability: second production planner provider / multi-model rollout
 - Gate mode: Before Scale
-- Blocked until: provider-neutral guarantees are explicit and the first adapter
-  does not leak vendor types into the core
+- Blocked until: provider-neutral guarantees are explicit and concrete adapters
+  continue to translate provider behavior only at the edge
 
 ## Issue Link
 - GitHub Issue: #23
@@ -71,3 +81,4 @@ Current mitigation in `10-c`:
 
 ## Last Updated
 - 2026-04-17
+- 2026-04-17 (resolved for the current adapter seam)

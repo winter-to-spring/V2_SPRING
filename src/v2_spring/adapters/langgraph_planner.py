@@ -346,6 +346,215 @@ class OpenAIStructuredPlannerTransport:
         )
 
 
+class AnthropicStructuredPlannerTransport:
+    """Concrete Anthropic-style tool-use transport behind the same narrow seam."""
+
+    def __init__(
+        self,
+        *,
+        model: str,
+        api_key: str | None = None,
+        timeout_seconds: float = 30.0,
+        max_retries: int = 2,
+        backoff_seconds: float = 0.5,
+        client: Any | None = None,
+    ) -> None:
+        self._model = model
+        self._api_key = api_key
+        self._timeout_seconds = timeout_seconds
+        self._max_retries = max_retries
+        self._backoff_seconds = backoff_seconds
+        self._client = client
+
+    def invoke(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        output_schema: dict[str, Any],
+    ) -> StructuredTransportResponse:
+        client = self._client or self._build_client()
+        attempts = 0
+        while True:
+            try:
+                response = client.messages.create(
+                    model=self._model,
+                    system=system_prompt,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": user_prompt,
+                        },
+                    ],
+                    tools=[
+                        {
+                            "name": "planner_adapter_output",
+                            "description": "Return one schema-valid planner output.",
+                            "input_schema": output_schema,
+                        },
+                    ],
+                    tool_choice={"type": "tool", "name": "planner_adapter_output"},
+                    max_tokens=800,
+                    temperature=0,
+                    timeout=self._timeout_seconds,
+                )
+                return StructuredTransportResponse(
+                    raw_response=self._extract_raw_content(response),
+                    provider=PlannerTransportProvider.ANTHROPIC,
+                    model=getattr(response, "model", self._model) or self._model,
+                    response_id=getattr(response, "id", None),
+                    retry_count=attempts,
+                    input_tokens=self._usage_field(response, "input_tokens"),
+                    output_tokens=self._usage_field(response, "output_tokens"),
+                    total_tokens=self._total_tokens(response),
+                )
+            except KeyboardInterrupt as exc:
+                raise PlannerTransportCancelledError(
+                    "Anthropic planner transport was interrupted locally before completion.",
+                    code="cancelled",
+                    provider=PlannerTransportProvider.ANTHROPIC,
+                    model=self._model,
+                    retryable=False,
+                    retry_count=attempts,
+                ) from exc
+            except Exception as exc:  # pragma: no cover - exercised by fake client tests
+                normalized = self._normalize_error(exc, retry_count=attempts)
+                if normalized.retryable and attempts < self._max_retries:
+                    time.sleep(self._backoff_seconds * (2**attempts))
+                    attempts += 1
+                    continue
+                raise normalized from exc
+
+    def _build_client(self) -> Any:
+        try:
+            from anthropic import Anthropic
+        except ImportError as exc:  # pragma: no cover - depends on optional dependency installation
+            raise PlannerTransportProviderResponseError(
+                "The anthropic package is not installed. Install project dependencies before using --provider anthropic.",
+                code="client_not_installed",
+                provider=PlannerTransportProvider.ANTHROPIC,
+                model=self._model,
+                retryable=False,
+            ) from exc
+
+        kwargs: dict[str, Any] = {}
+        if self._api_key is not None:
+            kwargs["api_key"] = self._api_key
+        return Anthropic(**kwargs)
+
+    def _normalize_error(self, exc: Exception, *, retry_count: int) -> PlannerTransportError:
+        name = exc.__class__.__name__
+        status_code = getattr(exc, "status_code", None)
+        message = _sanitize_text(str(exc) or name, limit=400)
+
+        if name in {"APITimeoutError", "TimeoutError"}:
+            return PlannerTransportTimeoutError(
+                f"Anthropic planner transport timed out: {message}",
+                code="timeout",
+                provider=PlannerTransportProvider.ANTHROPIC,
+                model=self._model,
+                retryable=True,
+                retry_count=retry_count,
+                status_code=status_code,
+            )
+        if name == "RateLimitError" or status_code == 429:
+            return PlannerTransportRateLimitError(
+                f"Anthropic planner transport hit a rate limit: {message}",
+                code="rate_limit",
+                provider=PlannerTransportProvider.ANTHROPIC,
+                model=self._model,
+                retryable=True,
+                retry_count=retry_count,
+                status_code=status_code,
+            )
+        if name in {"APIConnectionError", "APIError"} and status_code is None:
+            return PlannerTransportNetworkError(
+                f"Anthropic planner transport could not reach the provider: {message}",
+                code="network",
+                provider=PlannerTransportProvider.ANTHROPIC,
+                model=self._model,
+                retryable=True,
+                retry_count=retry_count,
+                status_code=status_code,
+            )
+        if status_code in {401, 403} or name == "AuthenticationError":
+            return PlannerTransportAuthenticationError(
+                f"Anthropic planner transport authentication failed: {message}",
+                code="authentication",
+                provider=PlannerTransportProvider.ANTHROPIC,
+                model=self._model,
+                retryable=False,
+                retry_count=retry_count,
+                status_code=status_code,
+            )
+        if isinstance(status_code, int) and status_code >= 500:
+            return PlannerTransportUnavailableError(
+                f"Anthropic planner transport is temporarily unavailable: {message}",
+                code="provider_unavailable",
+                provider=PlannerTransportProvider.ANTHROPIC,
+                model=self._model,
+                retryable=True,
+                retry_count=retry_count,
+                status_code=status_code,
+            )
+        return PlannerTransportProviderResponseError(
+            f"Anthropic planner transport failed with an unexpected provider response: {message}",
+            code="provider_response",
+            provider=PlannerTransportProvider.ANTHROPIC,
+            model=self._model,
+            retryable=False,
+            retry_count=retry_count,
+            status_code=status_code,
+        )
+
+    @staticmethod
+    def _usage_field(response: Any, field_name: str) -> int | None:
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return None
+        return getattr(usage, field_name, None)
+
+    @classmethod
+    def _total_tokens(cls, response: Any) -> int | None:
+        input_tokens = cls._usage_field(response, "input_tokens")
+        output_tokens = cls._usage_field(response, "output_tokens")
+        if input_tokens is None and output_tokens is None:
+            return None
+        return (input_tokens or 0) + (output_tokens or 0)
+
+    @staticmethod
+    def _extract_raw_content(response: Any) -> Any:
+        content = getattr(response, "content", None) or []
+        for block in content:
+            block_type = getattr(block, "type", None) or (block.get("type") if isinstance(block, dict) else None)
+            block_name = getattr(block, "name", None) or (block.get("name") if isinstance(block, dict) else None)
+            if block_type == "tool_use" and block_name == "planner_adapter_output":
+                if isinstance(block, dict):
+                    return block.get("input")
+                return getattr(block, "input", None)
+        for block in content:
+            block_type = getattr(block, "type", None) or (block.get("type") if isinstance(block, dict) else None)
+            if block_type == "text":
+                text = getattr(block, "text", None) or (block.get("text") if isinstance(block, dict) else None)
+                if text:
+                    raise PlannerTransportProviderResponseError(
+                        f"Anthropic planner transport returned text instead of tool output: {_sanitize_text(text, limit=300)}",
+                        code="missing_tool_use",
+                        provider=PlannerTransportProvider.ANTHROPIC,
+                        model=getattr(response, "model", "unknown"),
+                        retryable=False,
+                        response_id=getattr(response, "id", None),
+                    )
+        raise PlannerTransportProviderResponseError(
+            "Anthropic planner transport returned no planner_adapter_output tool use block.",
+            code="missing_tool_use",
+            provider=PlannerTransportProvider.ANTHROPIC,
+            model=getattr(response, "model", "unknown"),
+            retryable=False,
+            response_id=getattr(response, "id", None),
+        )
+
+
 class PlannerGraphState(TypedDict, total=False):
     context: PlannerContextWindow
     transport_response: StructuredTransportResponse

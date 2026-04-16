@@ -54,8 +54,15 @@ The translation boundary lives at the adapter edge:
 
 `RISK-0020` is resolved here.
 
-`RISK-0019` is mitigated but intentionally remains open until a second provider
-is added without changing planner core types.
+`RISK-0019` is resolved for the current transport seam.
+
+The planner core now runs unchanged against:
+
+- OpenAI-style strict JSON schema transport
+- Anthropic-style tool-use transport
+
+Both providers are translated at the adapter edge into the same
+`StructuredTransportResponse` and `PlannerTransportAuditView` shapes.
 
 `RISK-0021` remains open because local CLI cancellation can still leave a remote
 provider request in flight for a bounded amount of time.

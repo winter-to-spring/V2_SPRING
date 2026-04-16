@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from v2_spring.adapters.langgraph_planner import (
+    AnthropicStructuredPlannerTransport,
     LangGraphPlannerAdapter,
     OpenAIStructuredPlannerTransport,
     ScriptedStructuredPlannerTransport,
@@ -169,3 +170,91 @@ def test_openai_transport_retries_rate_limits_and_succeeds() -> None:
     assert response.provider == PlannerTransportProvider.OPENAI
     assert response.retry_count == 1
     assert response.response_id == "resp_retry_2"
+
+
+class _FakeAnthropicUsage:
+    def __init__(self, *, input_tokens: int, output_tokens: int) -> None:
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+
+
+class _FakeAnthropicToolUseBlock:
+    def __init__(self, payload: dict[str, object]) -> None:
+        self.type = "tool_use"
+        self.name = "planner_adapter_output"
+        self.input = payload
+
+
+class _FakeAnthropicResponse:
+    def __init__(self, payload: dict[str, object], *, model: str, response_id: str) -> None:
+        self.id = response_id
+        self.model = model
+        self.usage = _FakeAnthropicUsage(input_tokens=88, output_tokens=34)
+        self.content = [_FakeAnthropicToolUseBlock(payload)]
+
+
+class _AlwaysSuccessfulAnthropicClient:
+    def __init__(self, payload: dict[str, object], *, model: str = "claude-3-5-sonnet-latest") -> None:
+        self.messages = SimpleNamespace(
+            create=lambda **kwargs: _FakeAnthropicResponse(
+                payload,
+                model=model,
+                response_id="resp_anthropic_1",
+            ),
+        )
+
+
+def test_anthropic_transport_returns_normalized_tool_use_payload() -> None:
+    payload = {
+        "kind": "action",
+        "analysis_summary": "The bounded execution move is still the clearest next step.",
+        "confidence": "medium",
+        "selected_action": "execute_bounded_task",
+        "expected_outcome": "The adapter should parse the tool-use input without core changes.",
+    }
+    transport = AnthropicStructuredPlannerTransport(
+        model="claude-3-5-sonnet-latest",
+        client=_AlwaysSuccessfulAnthropicClient(payload),
+        max_retries=0,
+    )
+
+    response = transport.invoke(
+        system_prompt="system prompt",
+        user_prompt="user prompt",
+        output_schema={"type": "object"},
+    )
+
+    assert response.provider == PlannerTransportProvider.ANTHROPIC
+    assert response.model == "claude-3-5-sonnet-latest"
+    assert response.response_id == "resp_anthropic_1"
+    assert response.retry_count == 0
+    assert response.input_tokens == 88
+    assert response.output_tokens == 34
+    assert response.total_tokens == 122
+    assert response.raw_response["kind"] == "action"
+
+
+def test_langgraph_adapter_accepts_second_provider_without_core_changes(tmp_path: Path) -> None:
+    context = _approved_planner_context(tmp_path)
+    transport = AnthropicStructuredPlannerTransport(
+        model="claude-3-5-sonnet-latest",
+        client=_AlwaysSuccessfulAnthropicClient(
+            {
+                "kind": "escalation",
+                "analysis_summary": "A bounded founder clarification is still required.",
+                "confidence": "low_needs_review",
+                "escalation_target": "founder",
+                "help_kind": "clarification",
+                "blocking_reason": "The planner needs a precise founder hint before acting safely.",
+                "requested_help": "Clarify whether the approval lane should still be prioritized.",
+            },
+        ),
+        max_retries=0,
+    )
+    adapter = LangGraphPlannerAdapter(transport=transport)
+
+    invocation = adapter.invoke(context)
+
+    assert invocation.parsed_output.kind == "escalation"
+    assert invocation.transport_audit.provider == PlannerTransportProvider.ANTHROPIC
+    assert invocation.transport_audit.model == "claude-3-5-sonnet-latest"

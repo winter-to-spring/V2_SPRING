@@ -1024,6 +1024,105 @@ def test_planner_invoke_cli_accepts_openai_provider_path_without_network(
     assert "selected_action:     execute_bounded_task" in output
 
 
+def test_planner_invoke_cli_accepts_anthropic_provider_path_without_network(
+    capsys,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    database_url = f"sqlite+pysqlite:///{tmp_path / 'cli-step10c-anthropic.db'}"
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv("PLANNER_ANTHROPIC_MODEL", "claude-3-5-test")
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "run",
+            "create",
+            "--project",
+            "demo",
+            "--goal",
+            "Exercise the anthropic transport seam without a real network call",
+            "--urgency",
+            "normal",
+            "--risk",
+            "medium",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    run_id = capsys.readouterr().out.splitlines()[0].split()[-1]
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["v2-spring", "approval", "list", "--database-url", database_url],
+    )
+    main()
+    approval_output = capsys.readouterr().out
+    approval_id = next(line.strip().replace("1. ", "") for line in approval_output.splitlines() if line.startswith("1. "))
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "approval",
+            "resolve",
+            approval_id,
+            "--approve",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    capsys.readouterr()
+
+    class FakeAnthropicTransport:
+        def __init__(self, **kwargs) -> None:
+            self.model = kwargs["model"]
+
+        def invoke(self, *, system_prompt: str, user_prompt: str, output_schema: dict[str, object]):
+            return StructuredTransportResponse(
+                raw_response={
+                    "kind": "escalation",
+                    "analysis_summary": "The anthropic seam can request bounded founder help without a network call.",
+                    "confidence": "low_needs_review",
+                    "escalation_target": "founder",
+                    "help_kind": "clarification",
+                    "blocking_reason": "A precise founder hint is still needed here.",
+                    "requested_help": "Clarify whether approval should still be resolved first.",
+                },
+                provider=PlannerTransportProvider.ANTHROPIC,
+                model=self.model,
+                response_id="resp_test_anthropic",
+                retry_count=0,
+                input_tokens=44,
+                output_tokens=16,
+                total_tokens=60,
+            )
+
+    monkeypatch.setattr("v2_spring.cli.AnthropicStructuredPlannerTransport", FakeAnthropicTransport)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "planner",
+            "invoke",
+            run_id,
+            "--provider",
+            "anthropic",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    output = capsys.readouterr().out
+    assert "provider:             anthropic" in output
+    assert "model:                claude-3-5-test" in output
+    assert "kind:                escalation" in output
+
+
 def test_founder_hint_cli_reopens_pending_escalation_and_lists_interventions(
     capsys,
     monkeypatch,

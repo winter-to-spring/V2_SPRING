@@ -25,6 +25,7 @@ class PlannerTransportProvider(StrEnum):
 
     SCRIPTED = "scripted"
     OPENAI = "openai"
+    ANTHROPIC = "anthropic"
 
 
 class FailureClass(StrEnum):

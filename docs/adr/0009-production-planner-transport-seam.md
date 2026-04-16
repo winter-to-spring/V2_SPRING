@@ -39,6 +39,8 @@ Rules:
   context window becomes too large
 - provider/network retry is handled inside the transport adapter and remains
   separate from planner phase budget accounting
+- a second provider path may be added behind the same seam without changing
+  planner core types
 
 ## Consequences
 
@@ -54,12 +56,14 @@ Rules:
 
 - the first concrete adapter still has vendor-specific behavior that must be
   watched for lock-in
+- additional providers still need their own concrete translation layers and
+  policy tuning
 - cancellation/orphan behavior is not fully solved by foreground CLI handling
 - prompt truncation may trade completeness for bounded cost and latency
 
 ## Follow-up
 
 - Step 10-c implements the first concrete OpenAI transport and telemetry path
-- a later provider addition will validate whether the seam is truly
-  provider-neutral in practice
+- the seam is now validated by both OpenAI-style JSON schema transport and an
+  Anthropic-style tool-use transport path in tests
 - cancellation/orphan semantics remain an explicit risk before scale

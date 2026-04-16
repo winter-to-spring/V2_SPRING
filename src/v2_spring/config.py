@@ -18,10 +18,12 @@ class AppConfig:
     database_url: str
     planner_provider: PlannerTransportProvider
     planner_openai_model: str
+    planner_anthropic_model: str
     planner_timeout_seconds: float
     planner_max_retries: int
     planner_max_context_chars: int
     openai_api_key: str | None
+    anthropic_api_key: str | None
 
 
 def load_config(database_url_override: str | None = None) -> AppConfig:
@@ -46,8 +48,10 @@ def load_config(database_url_override: str | None = None) -> AppConfig:
         database_url=database_url,
         planner_provider=planner_provider,
         planner_openai_model=(os.getenv("PLANNER_OPENAI_MODEL") or "gpt-4o").strip(),
+        planner_anthropic_model=(os.getenv("PLANNER_ANTHROPIC_MODEL") or "claude-3-5-sonnet-latest").strip(),
         planner_timeout_seconds=float(os.getenv("PLANNER_TIMEOUT_SECONDS") or "30"),
         planner_max_retries=int(os.getenv("PLANNER_MAX_RETRIES") or "2"),
         planner_max_context_chars=int(os.getenv("PLANNER_MAX_CONTEXT_CHARS") or "12000"),
         openai_api_key=os.getenv("OPENAI_API_KEY"),
+        anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"),
     )

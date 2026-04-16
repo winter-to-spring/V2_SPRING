@@ -8,6 +8,7 @@ from textwrap import dedent
 from pydantic import ValidationError
 
 from v2_spring.adapters.langgraph_planner import (
+    AnthropicStructuredPlannerTransport,
     LangGraphPlannerAdapter,
     OpenAIStructuredPlannerTransport,
     PlannerTransportError,
@@ -566,6 +567,18 @@ def _build_planner_transport(
         transport = OpenAIStructuredPlannerTransport(
             model=args.model or config.planner_openai_model,
             api_key=config.openai_api_key,
+            timeout_seconds=config.planner_timeout_seconds,
+            max_retries=config.planner_max_retries,
+        )
+        return transport, provider
+    if provider == PlannerTransportProvider.ANTHROPIC:
+        if not config.anthropic_api_key:
+            raise ValueError(
+                "ANTHROPIC_API_KEY is not configured. Set it in the environment before using --provider anthropic.",
+            )
+        transport = AnthropicStructuredPlannerTransport(
+            model=args.model or config.planner_anthropic_model,
+            api_key=config.anthropic_api_key,
             timeout_seconds=config.planner_timeout_seconds,
             max_retries=config.planner_max_retries,
         )
