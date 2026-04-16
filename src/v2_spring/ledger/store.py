@@ -34,6 +34,8 @@ from v2_spring.domain.planner_attempt import (
     PlannerAttemptOutcome,
     PlannerAttemptView,
     PlannerGovernanceView,
+    PlannerRechargeCautionCode,
+    PlannerRechargePreflightView,
 )
 from v2_spring.domain.proposal import PlannerProposalInput, PlannerProposalView
 from v2_spring.domain.replay import ArtifactInspectionView, RunReplayView, TaskReplayView
@@ -1100,7 +1102,124 @@ class LedgerStore:
                 records=planner_attempt_records,
             )
 
-    def record_planner_recharge(self, *, run_id: str, reason: str) -> PlannerAttemptView:
+    def build_planner_recharge_preflight(self, run_id: str) -> PlannerRechargePreflightView:
+        """Explain whether a founder should reopen the exhausted planner phase yet."""
+
+        snapshot = self.build_run_snapshot(run_id)
+        governance = self.build_planner_governance(run_id)
+        failure_report = self.build_failure_report(run_id)
+        latest_founder_intervention = (
+            snapshot.recent_founder_interventions[-1]
+            if snapshot.recent_founder_interventions
+            else None
+        )
+
+        caution_codes: list[PlannerRechargeCautionCode] = []
+        guidance: list[str] = []
+
+        if not governance.exhausted:
+            guidance.append(
+                "The current planner phase is not exhausted yet, so manual recharge is unavailable.",
+            )
+        else:
+            guidance.append(
+                "The current planner phase is exhausted, so one founder-controlled recharge is allowed if the blockage was reviewed.",
+            )
+
+        if governance.recharge_count > 0:
+            caution_codes.append(PlannerRechargeCautionCode.REPEATED_RECHARGE)
+            guidance.append(
+                f"This phase has already been manually recharged {governance.recharge_count} time(s). "
+                "Only reopen it again if the operating context changed or you intentionally want one more bounded pass.",
+            )
+
+        if failure_report is not None:
+            guidance.append(
+                f"Latest execution failure: {failure_report.error_code} - {failure_report.observed_outcome}",
+            )
+            if failure_report.deterministic:
+                caution_codes.append(PlannerRechargeCautionCode.DETERMINISTIC_FAILURE)
+                guidance.append(
+                    "That failure looks deterministic, so recharge should usually wait until the underlying blocker is fixed.",
+                )
+            else:
+                guidance.append(
+                    "That failure looks transient or infrastructure-related, so recharge may be reasonable once the environment recovers.",
+                )
+        else:
+            guidance.append(
+                "No structured execution failure is attached to the current phase.",
+            )
+
+        if snapshot.latest_rejection_reason is not None:
+            caution_codes.append(PlannerRechargeCautionCode.LATEST_REJECTION_PRESENT)
+            guidance.append(
+                f"Latest rejection reason is still active: {snapshot.latest_rejection_reason}",
+            )
+
+        if (
+            latest_founder_intervention is not None
+            and latest_founder_intervention.reply_kind == FounderReplyKind.REJECT
+        ):
+            caution_codes.append(PlannerRechargeCautionCode.PRIOR_FOUNDER_REJECT)
+            guidance.append(
+                "The most recent founder intervention rejected the previous escalation, so another recharge should only happen if genuinely new information exists.",
+            )
+
+        return PlannerRechargePreflightView(
+            run_id=snapshot.run.id,
+            phase_key=governance.phase_key,
+            policy_version=governance.policy_version,
+            exhausted=governance.exhausted,
+            budget_limit=governance.budget_limit,
+            budget_used=governance.budget_used,
+            budget_remaining=governance.budget_remaining,
+            recharge_count=governance.recharge_count,
+            latest_attempt_summary=self._sanitize_planner_text(
+                governance.latest_attempt_summary,
+                limit=4000,
+            ),
+            latest_failure_error_code=failure_report.error_code if failure_report is not None else None,
+            latest_failure_summary=(
+                self._sanitize_planner_text(
+                    failure_report.observed_outcome,
+                    limit=500,
+                )
+                if failure_report is not None
+                else None
+            ),
+            latest_failure_deterministic=(
+                failure_report.deterministic if failure_report is not None else None
+            ),
+            latest_rejection_reason=self._sanitize_planner_text(
+                snapshot.latest_rejection_reason,
+                limit=4000,
+            ),
+            latest_founder_intervention_kind=(
+                latest_founder_intervention.reply_kind
+                if latest_founder_intervention is not None
+                else None
+            ),
+            latest_founder_intervention_summary=(
+                self._sanitize_planner_text(
+                    latest_founder_intervention.summary,
+                    limit=400,
+                )
+                if latest_founder_intervention is not None
+                else None
+            ),
+            caution_codes=caution_codes,
+            requires_acknowledgement=bool(caution_codes),
+            guidance=guidance,
+        )
+
+    def record_planner_recharge(
+        self,
+        *,
+        run_id: str,
+        reason: str,
+        acknowledge_unchanged_context: bool = False,
+    ) -> PlannerAttemptView:
         """Manually reopen a planner phase after the current budget is exhausted."""
 
         normalized_reason = self._normalize_optional_text(reason)
@@ -1109,9 +1228,17 @@ class LedgerStore:
 
         snapshot = self.build_run_snapshot(run_id)
         governance = self.build_planner_governance(run_id)
+        preflight = self.build_planner_recharge_preflight(run_id)
         if not governance.exhausted:
             raise PermissionError(
                 f"Run {run_id} is not exhausted in the current planner phase; recharge is not allowed yet.",
+            )
+        if preflight.requires_acknowledgement and not acknowledge_unchanged_context:
+            caution_summary = ", ".join(code.value for code in preflight.caution_codes)
+            raise PermissionError(
+                "Planner recharge requires explicit acknowledgement because the current phase still carries caution signals "
+                f"({caution_summary}). Review `v2-spring planner recharge-check {run_id}` and rerun with "
+                "`--acknowledge-unchanged-context` if you still want to reopen this phase.",
             )
 
         attempt = self._record_planner_attempt(
@@ -1125,7 +1252,8 @@ class LedgerStore:
             outcome=PlannerAttemptOutcome.MANUAL_RECHARGE,
             outcome_reason=(
                 "Founder manually reopened the current planner phase after exhaustion. "
-                f"Reason: {normalized_reason}"
+                f"Reason: {normalized_reason}. "
+                f"Caution codes: {', '.join(code.value for code in preflight.caution_codes) if preflight.caution_codes else 'none'}."
             ),
             budget_used=governance.budget_used,
             budget_limit=governance.budget_limit,
@@ -1139,6 +1267,10 @@ class LedgerStore:
                 f"error_code={PlannerAttemptOutcome.MANUAL_RECHARGE.value}; "
                 f"phase_key={governance.phase_key}; "
                 f"budget_limit={governance.budget_limit}; "
+                f"requires_ack={preflight.requires_acknowledgement}; "
+                f"caution_codes={','.join(code.value for code in preflight.caution_codes) if preflight.caution_codes else '-'}; "
+                f"latest_failure_error_code={preflight.latest_failure_error_code if preflight.latest_failure_error_code else '-'}; "
+                f"latest_rejection_reason={preflight.latest_rejection_reason if preflight.latest_rejection_reason else '-'}; "
                 f"reason={normalized_reason}."
             ),
         )

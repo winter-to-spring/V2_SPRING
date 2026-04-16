@@ -1,7 +1,7 @@
 # Risk ID: RISK-0011
-Title: Manual recharge lacks environment preflight and misuse guardrails
+Title: ~~Manual recharge lacks environment preflight and misuse guardrails~~
 Class: Before Scale
-Status: Open
+Status: Resolved
 Owner: Core / Founder operations
 Observed In: Step 9 - bounded replanning governance review
 
@@ -43,6 +43,15 @@ good faith but still keep the system stuck.
 - consider requiring explicit acknowledgement of unchanged environment state
 - consider a future recharge cap or stronger escalation policy if recharge is used repeatedly without new evidence
 
+Current resolution:
+
+- `planner recharge-check <run-id>` now exposes a typed preflight surface
+- preflight shows the latest failure / rejection / founder-help context
+- repeated recharge, deterministic runtime failure, and active rejection context
+  now require explicit `--acknowledge-unchanged-context`
+- manual recharge audit trails now record the preflight caution codes that were
+  present when the founder reopened the phase
+
 ## Capability Gate
 - Capability: higher run volume / founder-facing UI recharge controls
 - Gate mode: Before Scale
@@ -59,6 +68,9 @@ good faith but still keep the system stuck.
 
 - recharge guidance or preflight exists
 - founders can distinguish planner failure from environmental blockage before recharging
+- manual recharge misuse requires explicit acknowledgement when the context
+  still looks unchanged
 
 ## Last Updated
 - 2026-04-16
+- 2026-04-17

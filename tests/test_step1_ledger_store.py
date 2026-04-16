@@ -10,7 +10,7 @@ from v2_spring.domain.approval import ApprovalStatus
 from v2_spring.domain.decision import DecisionKind
 from v2_spring.domain.founder_intervention import FOUNDER_REPLY_INPUT_ADAPTER, FounderReplyKind
 from v2_spring.domain.observation import ObservationKind
-from v2_spring.domain.planner_attempt import PlannerAttemptOutcome
+from v2_spring.domain.planner_attempt import PlannerAttemptOutcome, PlannerRechargeCautionCode
 from v2_spring.domain.proposal import PlannerProposalInput
 from v2_spring.domain.run import RunCreateInput, RunStatus
 from v2_spring.domain.snapshot import PossibleActionName, SnapshotActionState
@@ -719,6 +719,174 @@ def test_manual_planner_recharge_reopens_exhausted_phase(tmp_path: Path) -> None
         attempt.outcome == PlannerAttemptOutcome.MANUAL_RECHARGE
         for attempt in replay.planner_attempts
     )
+
+
+def test_planner_recharge_preflight_surfaces_deterministic_failure_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = make_store(tmp_path)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    run = store.create_run(
+        RunCreateInput(
+            project="demo",
+            goal="Explain the latest deterministic blocker before founder recharge",
+            urgency="normal",
+            risk="medium",
+        ),
+    )
+    approval = store.list_approvals(status=ApprovalStatus.PENDING)[0]
+    store.resolve_approval(str(approval.id), approved=True)
+
+    store.record_planner_proposal(
+        run_id=str(run.id),
+        proposal=PlannerProposalInput(
+            snapshot_hash=store.build_run_snapshot(str(run.id)).state_hash,
+            selected_action=PossibleActionName.EXECUTE_BOUNDED_TASK,
+            rationale="Try the bounded repository scan so the system can surface a concrete blocker.",
+            expected_outcome="Either a task succeeds or the failure report becomes explicit enough to guide replanning.",
+        ),
+    )
+
+    def fail_executor(*, workspace: Path, timeout_seconds: int, execution_context_id: str | None = None):
+        raise PermissionError("Permission denied while reading workspace/.env during the repository scan.")
+
+    monkeypatch.setattr("v2_spring.ledger.store.execute_repository_scan", fail_executor)
+
+    result = store.execute_bounded_task(
+        run_id=str(run.id),
+        workspace=workspace,
+        artifact_root=tmp_path / "artifacts",
+        timeout_seconds=1,
+    )
+    assert result.task.status == TaskStatus.FAILED
+
+    for index in range(3):
+        snapshot = store.build_run_snapshot(str(run.id))
+        with pytest.raises(IllegalPlannerProposalError):
+            store.record_planner_proposal(
+                run_id=str(run.id),
+                proposal=PlannerProposalInput(
+                    snapshot_hash=snapshot.state_hash,
+                    selected_action=PossibleActionName.RESOLVE_PENDING_APPROVAL,
+                    rationale=f"Illegal retry after failed execution {index + 1}",
+                    expected_outcome="This should keep exhausting the failed-execution planner phase.",
+                ),
+            )
+
+    preflight = store.build_planner_recharge_preflight(str(run.id))
+
+    assert preflight.exhausted is True
+    assert preflight.latest_failure_error_code == "permission_denied"
+    assert preflight.latest_failure_deterministic is True
+    assert preflight.requires_acknowledgement is True
+    assert PlannerRechargeCautionCode.DETERMINISTIC_FAILURE in preflight.caution_codes
+    assert any("deterministic" in item.lower() for item in preflight.guidance)
+
+    with pytest.raises(PermissionError):
+        store.record_planner_recharge(
+            run_id=str(run.id),
+            reason="Try again without changing the environment first.",
+        )
+
+
+def test_planner_recharge_preflight_surfaces_latest_rejection_reason(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    run = store.create_run(
+        RunCreateInput(
+            project="demo",
+            goal="Expose the latest founder rejection before recharge",
+            urgency="normal",
+            risk="medium",
+        ),
+    )
+    approval = store.list_approvals(status=ApprovalStatus.PENDING)[0]
+    store.resolve_approval(
+        str(approval.id),
+        approved=False,
+        reason="Do not continue until the planner narrows the repository boundary.",
+    )
+
+    for index in range(3):
+        snapshot = store.build_run_snapshot(str(run.id))
+        with pytest.raises(IllegalPlannerProposalError):
+            store.record_planner_proposal(
+                run_id=str(run.id),
+                proposal=PlannerProposalInput(
+                    snapshot_hash=snapshot.state_hash,
+                    selected_action=PossibleActionName.RESOLVE_PENDING_APPROVAL,
+                    rationale=f"Illegal retry after rejection {index + 1}",
+                    expected_outcome="The rejected run should not allow unrelated moves.",
+                ),
+            )
+
+    preflight = store.build_planner_recharge_preflight(str(run.id))
+
+    assert preflight.latest_rejection_reason == "Do not continue until the planner narrows the repository boundary."
+    assert preflight.requires_acknowledgement is True
+    assert PlannerRechargeCautionCode.LATEST_REJECTION_PRESENT in preflight.caution_codes
+
+
+def test_repeated_manual_recharge_requires_explicit_acknowledgement(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    run = store.create_run(
+        RunCreateInput(
+            project="demo",
+            goal="Require an explicit acknowledgement before repeated founder recharge.",
+            urgency="normal",
+            risk="medium",
+        ),
+    )
+
+    for index in range(3):
+        snapshot = store.build_run_snapshot(str(run.id))
+        with pytest.raises(IllegalPlannerProposalError):
+            store.record_planner_proposal(
+                run_id=str(run.id),
+                proposal=PlannerProposalInput(
+                    snapshot_hash=snapshot.state_hash,
+                    selected_action=PossibleActionName.EXECUTE_BOUNDED_TASK,
+                    rationale=f"Illegal attempt before first recharge {index + 1}",
+                    expected_outcome="Still blocked on approval.",
+                ),
+            )
+
+    store.record_planner_recharge(
+        run_id=str(run.id),
+        reason="Open one more planner pass after reviewing the current illegal attempts.",
+    )
+
+    for index in range(3):
+        snapshot = store.build_run_snapshot(str(run.id))
+        with pytest.raises(IllegalPlannerProposalError):
+            store.record_planner_proposal(
+                run_id=str(run.id),
+                proposal=PlannerProposalInput(
+                    snapshot_hash=snapshot.state_hash,
+                    selected_action=PossibleActionName.EXECUTE_BOUNDED_TASK,
+                    rationale=f"Illegal attempt before second recharge {index + 1}",
+                    expected_outcome="Still blocked on approval after one recharge.",
+                ),
+            )
+
+    preflight = store.build_planner_recharge_preflight(str(run.id))
+    assert preflight.recharge_count == 1
+    assert preflight.requires_acknowledgement is True
+    assert PlannerRechargeCautionCode.REPEATED_RECHARGE in preflight.caution_codes
+
+    with pytest.raises(PermissionError):
+        store.record_planner_recharge(
+            run_id=str(run.id),
+            reason="Try the same phase again without acknowledging the unchanged context.",
+        )
+
+    second_recharge = store.record_planner_recharge(
+        run_id=str(run.id),
+        reason="The founder explicitly wants one more bounded retry after reviewing the unchanged context.",
+        acknowledge_unchanged_context=True,
+    )
+    assert second_recharge.outcome == PlannerAttemptOutcome.MANUAL_RECHARGE
 
 
 def test_stale_proposals_use_separate_stale_quota(tmp_path: Path) -> None:

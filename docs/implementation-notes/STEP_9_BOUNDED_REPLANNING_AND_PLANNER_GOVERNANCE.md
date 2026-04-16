@@ -44,6 +44,10 @@ It still does **not** attach a real LangGraph planner.
 - Recharge is founder-controlled and explicit.
 - Recharge is rejected unless the current active phase is exhausted.
 - Recharge requires a non-blank human reason.
+- Recharge now exposes a founder-facing preflight surface before scale:
+  - `planner recharge-check <run-id>`
+  - latest failure / rejection / founder-help context
+  - explicit acknowledgement when the current blockage still looks unchanged
 - Recharge records both a planner attempt and a system-audit observation.
 
 ## Duplicate Detection
@@ -119,5 +123,4 @@ Still deferred after Step 9:
 
 - semantic duplicate equivalence beyond exact fingerprints
 - stronger TOCTOU protection under concurrency
-- recharge preflight / environment health checks
 - planner-facing payload hygiene and sanitization hardening

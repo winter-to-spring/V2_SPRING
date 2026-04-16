@@ -27,7 +27,7 @@ from v2_spring.domain.planner_adapter import (
     PlannerTransportAuditView,
     PlannerTransportProvider,
 )
-from v2_spring.domain.planner_attempt import PlannerAttemptView
+from v2_spring.domain.planner_attempt import PlannerAttemptView, PlannerRechargePreflightView
 from v2_spring.domain.proposal import PlannerProposalInput, PlannerProposalView
 from v2_spring.domain.replay import ArtifactInspectionView, RunReplayView, TaskReplayView
 from v2_spring.domain.snapshot import PossibleActionEvaluationView, PossibleActionName, RunSnapshotView
@@ -356,12 +356,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="Why the founder believes another planner attempt should be allowed.",
     )
     planner_recharge_parser.add_argument(
+        "--acknowledge-unchanged-context",
+        action="store_true",
+        help=(
+            "Explicitly confirm that the founder reviewed the current blockage and still wants to reopen the phase "
+            "even if the environment or rejection context appears unchanged."
+        ),
+    )
+    planner_recharge_parser.add_argument(
         "--format",
         default="pretty",
         choices=["pretty", "json"],
         help="Output format. Defaults to pretty.",
     )
     planner_recharge_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Override DATABASE_URL for this invocation.",
+    )
+
+    planner_recharge_check_parser = planner_subparsers.add_parser(
+        "recharge-check",
+        help="Show founder-facing recharge guidance before reopening an exhausted planner phase.",
+    )
+    planner_recharge_check_parser.add_argument("run_id", help="Run id to inspect.")
+    planner_recharge_check_parser.add_argument(
+        "--format",
+        default="pretty",
+        choices=["pretty", "json"],
+        help="Output format. Defaults to pretty.",
+    )
+    planner_recharge_check_parser.add_argument(
         "--database-url",
         default=None,
         help="Override DATABASE_URL for this invocation.",
@@ -1155,6 +1180,35 @@ def _render_planner_attempts(attempts: list[PlannerAttemptView], *, run_id: str)
     return "\n".join(lines)
 
 
+def _render_planner_recharge_preflight(preflight: PlannerRechargePreflightView) -> str:
+    lines = [
+        "Planner recharge preflight",
+        "-------------------------",
+        f"run_id:                     {preflight.run_id}",
+        f"phase_key:                  {preflight.phase_key}",
+        f"policy_version:             {preflight.policy_version}",
+        f"phase_exhausted:            {'yes' if preflight.exhausted else 'no'}",
+        f"budget:                     {preflight.budget_used}/{preflight.budget_limit}",
+        f"budget_remaining:           {preflight.budget_remaining}",
+        f"recharge_count:             {preflight.recharge_count}",
+        f"requires_acknowledgement:   {'yes' if preflight.requires_acknowledgement else 'no'}",
+        f"caution_codes:              {', '.join(code.value for code in preflight.caution_codes) if preflight.caution_codes else '-'}",
+        f"latest_attempt:             {preflight.latest_attempt_summary if preflight.latest_attempt_summary else '-'}",
+        f"latest_failure_error_code:  {preflight.latest_failure_error_code if preflight.latest_failure_error_code else '-'}",
+        f"latest_failure_summary:     {preflight.latest_failure_summary if preflight.latest_failure_summary else '-'}",
+        f"failure_is_deterministic:   {preflight.latest_failure_deterministic if preflight.latest_failure_deterministic is not None else '-'}",
+        f"latest_rejection_reason:    {preflight.latest_rejection_reason if preflight.latest_rejection_reason else '-'}",
+        f"latest_founder_reply_kind:  {preflight.latest_founder_intervention_kind.value if preflight.latest_founder_intervention_kind is not None else '-'}",
+        f"latest_founder_reply:       {preflight.latest_founder_intervention_summary if preflight.latest_founder_intervention_summary else '-'}",
+        "",
+        "Guidance",
+        "--------",
+    ]
+    for item in preflight.guidance:
+        lines.append(f"- {item}")
+    return "\n".join(lines)
+
+
 def _render_founder_intervention(intervention: FounderInterventionView) -> str:
     return dedent(
         f"""\
@@ -1620,10 +1674,26 @@ def main() -> None:
             print(_render_planner_attempts(attempts, run_id=args.run_id))
         return
 
+    if args.command == "planner" and args.planner_command == "recharge-check":
+        store = _build_store(args.database_url)
+        if store.get_run(args.run_id) is None:
+            print(f"Run {args.run_id} was not found.")
+            raise SystemExit(1)
+        preflight = store.build_planner_recharge_preflight(args.run_id)
+        if args.format == "json":
+            print(json.dumps(preflight.model_dump(mode="json"), indent=2, ensure_ascii=False))
+        else:
+            print(_render_planner_recharge_preflight(preflight))
+        return
+
     if args.command == "planner" and args.planner_command == "recharge":
         store = _build_store(args.database_url)
         try:
-            attempt = store.record_planner_recharge(run_id=args.run_id, reason=args.reason)
+            attempt = store.record_planner_recharge(
+                run_id=args.run_id,
+                reason=args.reason,
+                acknowledge_unchanged_context=args.acknowledge_unchanged_context,
+            )
             if args.format == "json":
                 print(json.dumps(attempt.model_dump(mode="json"), indent=2, ensure_ascii=False))
             else:

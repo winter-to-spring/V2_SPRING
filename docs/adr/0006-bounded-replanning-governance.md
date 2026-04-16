@@ -77,6 +77,11 @@ Planner duplication is handled in two layers.
 - Reopening a planner phase is a founder-controlled action.
 - `manual_recharge` is allowed only when the current active phase is exhausted.
 - Recharge requires an explicit non-blank reason.
+- The founder can inspect `planner recharge-check` before reopening the phase.
+- Recharge guidance must surface the latest failure / rejection / founder-help
+  context that still affects the current phase.
+- Repeated recharge, deterministic runtime blockage, or still-active rejection
+  context require explicit acknowledgement before the phase can be reopened.
 - Recharge resets the active-budget window for the current phase but does not
   delete past attempts.
 - Past attempts remain replayable and auditable.
@@ -144,4 +149,4 @@ budget without meaningful progress.
   manual CLI proof more verbose.
 - Exact semantic duplicate detection is still imperfect and remains a separate
   risk.
-- Recharge misuse and phase-reset abuse still require future hardening.
+- Phase-reset abuse still requires future hardening.
