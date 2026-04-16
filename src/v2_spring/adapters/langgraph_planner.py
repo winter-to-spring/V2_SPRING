@@ -781,6 +781,8 @@ class LangGraphPlannerAdapter:
             return
         if isinstance(report.get("previous_rationale"), str):
             report["previous_rationale"] = _sanitize_text(report["previous_rationale"], limit=250)
+        if isinstance(report.get("previous_expected_outcome"), str):
+            report["previous_expected_outcome"] = _sanitize_text(report["previous_expected_outcome"], limit=250)
         if isinstance(report.get("short_traceback"), str):
             report["short_traceback"] = _sanitize_text(report["short_traceback"], limit=180)
         if isinstance(report.get("observed_outcome"), str):

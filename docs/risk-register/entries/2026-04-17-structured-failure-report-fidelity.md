@@ -1,7 +1,7 @@
 # Risk ID: RISK-0015
-Title: Structured failure reports may still hide the root cause the planner needs
+Title: ~~Structured failure reports may still hide the root cause the planner needs~~
 Class: Before Next Phase
-Status: Mitigating
+Status: Resolved
 Owner: Core / Planner adapter
 Observed In: Step 10 design and implementation
 
@@ -42,13 +42,17 @@ typed contract still appears healthy.
 Current mitigation:
 
 - `FailureReportView` carries `failure_class`, `error_code`, `short_traceback`,
-  `normalized_failure_signature`, `previous_rationale`, `observed_outcome`, and
+  `normalized_failure_signature`, `previous_rationale`,
+  `previous_expected_outcome`, `observed_outcome`, and
   `repeated_failure_streak`
 - planner context now includes the structured failure report directly
 - regression tests cover stable classification for permission/path/timeout/rate
   limit style failures
 - failure-report tests prove that previous planner rationale and sanitized
   tracebacks survive into planner context
+- failure reports are now anchored to the planner proposal that actually
+  preceded the failed task, rather than the latest unrelated replanning
+  proposal in the run
 
 ## Capability Gate
 - Capability: planner-backed tracer bullet / stronger replanning loop
@@ -67,6 +71,9 @@ Current mitigation:
 - failure report preserves enough signal for planner self-correction in repeated tests
 - common execution failures map to stable error codes and useful short traces
 - planner-facing failure summaries remain sanitized and bounded
+- failure reports stay causally linked to the failed task even after later
+  replanning proposals are recorded
 
 ## Last Updated
 - 2026-04-17
+- 2026-04-17 (resolved for current bounded failure-report path)

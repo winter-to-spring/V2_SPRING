@@ -1090,10 +1090,72 @@ def test_failure_report_preserves_error_code_trace_and_previous_rationale(
     assert context.failure_report.failure_class.value == "deterministic_runtime"
     assert context.failure_report.error_code == "permission_denied"
     assert context.failure_report.previous_rationale == proposal.rationale
+    assert context.failure_report.previous_expected_outcome == proposal.expected_outcome
     assert "Permission denied" in context.failure_report.short_traceback
     assert "[workspace]" in context.failure_report.short_traceback
     assert "/Users/changhyeon/Desktop/AI AGENT" not in context.failure_report.short_traceback
     assert "Permission denied" in context.failure_report.observed_outcome
+
+
+def test_failure_report_stays_linked_to_the_failed_execution_proposal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = make_store(tmp_path)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    run = store.create_run(
+        RunCreateInput(
+            project="demo",
+            goal="Keep failure context anchored to the proposal that actually produced the failed task",
+            urgency="normal",
+            risk="medium",
+        ),
+    )
+    approval = store.list_approvals(status=ApprovalStatus.PENDING)[0]
+    store.resolve_approval(str(approval.id), approved=True)
+
+    execution_proposal = store.record_planner_proposal(
+        run_id=str(run.id),
+        proposal=PlannerProposalInput(
+            snapshot_hash=store.build_run_snapshot(str(run.id)).state_hash,
+            selected_action=PossibleActionName.EXECUTE_BOUNDED_TASK,
+            rationale="Run the bounded repository scan first so any blocker is concrete.",
+            expected_outcome="The scan should either succeed or expose the precise execution blocker.",
+        ),
+    )
+
+    def fail_executor(*, workspace: Path, timeout_seconds: int, execution_context_id: str | None = None):
+        raise PermissionError("Permission denied while reading workspace/.env during the repository scan.")
+
+    monkeypatch.setattr("v2_spring.ledger.store.execute_repository_scan", fail_executor)
+
+    result = store.execute_bounded_task(
+        run_id=str(run.id),
+        workspace=workspace,
+        artifact_root=tmp_path / "artifacts",
+        timeout_seconds=1,
+    )
+    assert result.task.status == TaskStatus.FAILED
+
+    failed_snapshot = store.build_run_snapshot(str(run.id))
+    replan_proposal = store.record_planner_proposal(
+        run_id=str(run.id),
+        proposal=PlannerProposalInput(
+            snapshot_hash=failed_snapshot.state_hash,
+            selected_action=PossibleActionName.REPLAN_FROM_FAILED_EXECUTION,
+            rationale="Use the failed execution lane to plan around the permission blocker.",
+            expected_outcome="The next planner loop should propose a safer path around the failure.",
+        ),
+    )
+
+    context = store.build_planner_context(str(run.id))
+
+    assert context.failure_report is not None
+    assert context.failure_report.previous_rationale == execution_proposal.rationale
+    assert context.failure_report.previous_expected_outcome == execution_proposal.expected_outcome
+    assert context.failure_report.previous_rationale != replan_proposal.rationale
+    assert context.failure_report.previous_expected_outcome != replan_proposal.expected_outcome
 
 
 def test_repeated_deterministic_execution_failure_opens_founder_escalation_lane(

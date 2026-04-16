@@ -1028,6 +1028,7 @@ def _render_planner_invocation(proof: PlannerInvocationProofView) -> str:
                 f"streak:              {report.repeated_failure_streak}",
                 f"deterministic:       {report.deterministic}",
                 f"observed_outcome:    {report.observed_outcome}",
+                f"previous_outcome:    {report.previous_expected_outcome if report.previous_expected_outcome else '-'}",
                 f"short_traceback:     {report.short_traceback if report.short_traceback else '-'}",
             ],
         )

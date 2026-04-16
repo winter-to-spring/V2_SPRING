@@ -121,7 +121,7 @@ Observed In:
 - ~~[RISK-0012 Cognitive duplicate detection remains exact-fingerprint only](entries/2026-04-16-cognitive-duplicate-heuristic-limit.md)~~
 - ~~[RISK-0013 Accepted legal proposals may loop through repeated execution failure without planner budget pressure](entries/2026-04-16-execution-failure-loop-escape.md)~~
 - ~~[RISK-0014 Stale planner proposals currently consume phase budget even when the fault is systemic timing drift](entries/2026-04-16-stale-budget-penalty-fairness.md)~~
-- [RISK-0015 Structured failure reports may still hide the root cause the planner needs](entries/2026-04-17-structured-failure-report-fidelity.md)
+- ~~[RISK-0015 Structured failure reports may still hide the root cause the planner needs](entries/2026-04-17-structured-failure-report-fidelity.md)~~
 - ~~[RISK-0016 Planner may escalate too early or too often once escalation becomes a legal output type](entries/2026-04-17-premature-escalation-thrash.md)~~
 - ~~[RISK-0017 Founder reply semantics are still ambiguous after planner escalation](entries/2026-04-17-founder-reply-contract-ambiguity.md)~~
 - [RISK-0018 Founder reply CLI ergonomics may cause operator error before a richer surface exists](entries/2026-04-17-founder-reply-cli-ergonomics.md)

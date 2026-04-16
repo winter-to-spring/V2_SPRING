@@ -59,8 +59,13 @@ evidence:
 - `short_traceback`
 - `normalized_failure_signature`
 - `previous_rationale`
+- `previous_expected_outcome`
 - `observed_outcome`
 - `repeated_failure_streak`
+
+The failure report now stays anchored to the planner proposal that actually
+preceded the failed task. Later replanning proposals do not overwrite that
+causal context.
 
 When the same deterministic execution blocker repeats without state
 advancement, the control plane does not keep looping silently.

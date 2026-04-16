@@ -56,6 +56,7 @@ class FailureReportView(BaseModel):
     short_traceback: str | None = Field(default=None, max_length=500)
     normalized_failure_signature: str = Field(min_length=64, max_length=64)
     previous_rationale: str | None = Field(default=None, max_length=4000)
+    previous_expected_outcome: str | None = Field(default=None, max_length=4000)
     observed_outcome: str = Field(min_length=1, max_length=500)
     repeated_failure_streak: int = Field(ge=1)
     deterministic: bool
@@ -64,6 +65,7 @@ class FailureReportView(BaseModel):
         "error_code",
         "short_traceback",
         "previous_rationale",
+        "previous_expected_outcome",
         "observed_outcome",
     )
     @classmethod

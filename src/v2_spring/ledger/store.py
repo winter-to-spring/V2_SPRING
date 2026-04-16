@@ -1373,7 +1373,17 @@ class LedgerStore:
             streak += 1
 
         proposals = self.list_planner_proposals_for_run(run_id)
-        latest_proposal = proposals[-1] if proposals else None
+        failure_anchor = latest_failed.task.started_at or latest_failed.task.created_at
+        latest_proposal = next(
+            (
+                proposal
+                for proposal in reversed(proposals)
+                if proposal.created_at <= failure_anchor
+            ),
+            None,
+        )
+        if latest_proposal is None:
+            latest_proposal = proposals[-1] if proposals else None
         return FailureReportView(
             failure_class=failure_class,
             error_code=error_code,
@@ -1381,6 +1391,11 @@ class LedgerStore:
             normalized_failure_signature=normalized_signature,
             previous_rationale=(
                 self._sanitize_planner_text(latest_proposal.rationale, limit=4000)
+                if latest_proposal is not None
+                else None
+            ),
+            previous_expected_outcome=(
+                self._sanitize_planner_text(latest_proposal.expected_outcome, limit=4000)
                 if latest_proposal is not None
                 else None
             ),
