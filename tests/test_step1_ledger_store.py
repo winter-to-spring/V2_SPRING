@@ -21,6 +21,7 @@ from v2_spring.ledger.store import LedgerStore
 from v2_spring.planner.proposals import (
     IllegalPlannerProposalError,
     PlannerPhaseExhaustedError,
+    PlannerStaleQuotaExhaustedError,
     StalePlannerProposalError,
     TransportDuplicatePlannerProposalError,
 )
@@ -717,3 +718,88 @@ def test_manual_planner_recharge_reopens_exhausted_phase(tmp_path: Path) -> None
         attempt.outcome == PlannerAttemptOutcome.MANUAL_RECHARGE
         for attempt in replay.planner_attempts
     )
+
+
+def test_stale_proposals_use_separate_stale_quota(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    run = store.create_run(
+        RunCreateInput(
+            project="demo",
+            goal="Verify stale quota fairness",
+            urgency="normal",
+            risk="medium",
+        ),
+    )
+    approval = store.list_approvals(status=ApprovalStatus.PENDING)[0]
+    store.resolve_approval(str(approval.id), approved=True)
+
+    for _ in range(2):
+        with pytest.raises(StalePlannerProposalError):
+            store.record_planner_proposal(
+                run_id=str(run.id),
+                proposal=PlannerProposalInput(
+                    snapshot_hash="0" * 64,
+                    selected_action=PossibleActionName.EXECUTE_BOUNDED_TASK,
+                    rationale="This snapshot is stale on purpose.",
+                    expected_outcome="The stale quota should increase without consuming the main budget.",
+                ),
+            )
+
+    snapshot = store.build_run_snapshot(str(run.id))
+    assert snapshot.planner_budget_used == 0
+    assert snapshot.planner_stale_quota_used == 2
+    assert snapshot.planner_stale_quota_remaining == 1
+
+    with pytest.raises(PlannerStaleQuotaExhaustedError):
+        store.record_planner_proposal(
+            run_id=str(run.id),
+            proposal=PlannerProposalInput(
+                snapshot_hash="0" * 64,
+                selected_action=PossibleActionName.EXECUTE_BOUNDED_TASK,
+                rationale="One more stale attempt should exhaust the separate stale quota.",
+                expected_outcome="The system should now block repeated stale retries.",
+            ),
+        )
+
+    exhausted_snapshot = store.build_run_snapshot(str(run.id))
+    assert exhausted_snapshot.planner_budget_used == 0
+    assert exhausted_snapshot.planner_stale_quota_exhausted is True
+
+
+def test_build_planner_context_includes_structured_failure_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = make_store(tmp_path)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    run = store.create_run(
+        RunCreateInput(
+            project="demo",
+            goal="Prepare planner feedback after execution failure",
+            urgency="normal",
+            risk="medium",
+        ),
+    )
+    approval = store.list_approvals(status=ApprovalStatus.PENDING)[0]
+    store.resolve_approval(str(approval.id), approved=True)
+
+    def fail_executor(*, workspace: Path, timeout_seconds: int, execution_context_id: str | None = None):
+        raise BoundedExecutorTimeout("Executor timed out while scanning the repository.")
+
+    monkeypatch.setattr("v2_spring.ledger.store.execute_repository_scan", fail_executor)
+
+    result = store.execute_bounded_task(
+        run_id=str(run.id),
+        workspace=workspace,
+        artifact_root=tmp_path / "artifacts",
+        timeout_seconds=1,
+    )
+    context = store.build_planner_context(str(run.id))
+
+    assert result.task.status == TaskStatus.FAILED
+    assert context.failure_report is not None
+    assert context.failure_report.error_code == "timeout"
+    assert context.failure_report.previous_rationale is None
+    assert context.failure_report.repeated_failure_streak == 1
+    assert context.legal_actions[0].name == PossibleActionName.REPLAN_FROM_FAILED_EXECUTION

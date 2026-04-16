@@ -13,6 +13,7 @@ class PlannerAttemptOutcome(StrEnum):
     ACCEPTED = "accepted"
     REJECTED_STALE = "rejected_stale"
     REJECTED_ILLEGAL = "rejected_illegal"
+    REJECTED_FORMAT = "rejected_format"
     REJECTED_DUPLICATE_TRANSPORT = "rejected_duplicate_transport"
     REJECTED_DUPLICATE_COGNITIVE = "rejected_duplicate_cognitive"
     PHASE_EXHAUSTED = "phase_exhausted"
@@ -73,6 +74,10 @@ class PlannerGovernanceView(BaseModel):
     budget_used: int = Field(ge=0)
     budget_remaining: int = Field(ge=0)
     exhausted: bool
+    stale_quota_limit: int = Field(ge=1)
+    stale_quota_used: int = Field(ge=0)
+    stale_quota_remaining: int = Field(ge=0)
+    stale_quota_exhausted: bool
     recharge_count: int = Field(ge=0)
     latest_attempt_summary: str | None = Field(default=None, max_length=4000)
     attempts: list[PlannerAttemptView]

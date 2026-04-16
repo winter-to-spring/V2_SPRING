@@ -6,3 +6,4 @@
 4. `0004-deterministic-substrate.md`
 5. `0005-founder-verification-surface.md`
 6. `0006-bounded-replanning-governance.md`
+7. `0007-planner-decision-output-contract.md`

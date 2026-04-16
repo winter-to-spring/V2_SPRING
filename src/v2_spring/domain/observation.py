@@ -12,6 +12,7 @@ class ObservationKind(StrEnum):
     FOLLOW_UP = "follow_up"
     SYSTEM_AUDIT = "system_audit"
     TASK_EXECUTION = "task_execution"
+    PLANNER_ESCALATION = "planner_escalation"
 
 
 class ObservationView(BaseModel):
