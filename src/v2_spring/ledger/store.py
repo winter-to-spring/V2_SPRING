@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from hashlib import sha256
 import json
 from pathlib import Path
+import re
 from typing import Iterator
 from uuid import uuid4
 
@@ -786,6 +787,11 @@ class LedgerStore:
             rationale=proposal.rationale,
             expected_outcome=proposal.expected_outcome,
         )
+        proposal_intent_signature = self._build_planner_proposal_intent_signature(
+            selected_action=proposal.selected_action,
+            rationale=proposal.rationale,
+            expected_outcome=proposal.expected_outcome,
+        )
 
         if governance.exhausted:
             raise PlannerPhaseExhaustedError(
@@ -819,14 +825,15 @@ class LedgerStore:
                     phase_key=governance.phase_key,
                     policy_version=governance.policy_version,
                     snapshot_hash=evaluation.snapshot.state_hash,
-                    selected_action=proposal.selected_action,
-                    submission_key=proposal.submission_key,
-                    proposal_fingerprint=proposal_fingerprint,
-                    outcome=PlannerAttemptOutcome.REJECTED_DUPLICATE_TRANSPORT,
-                    outcome_reason=(
-                        f"Submission key {proposal.submission_key} already exists for this phase; "
-                        "transport-level duplicates are rejected explicitly."
-                    ),
+                selected_action=proposal.selected_action,
+                submission_key=proposal.submission_key,
+                proposal_fingerprint=proposal_fingerprint,
+                proposal_intent_signature=proposal_intent_signature,
+                outcome=PlannerAttemptOutcome.REJECTED_DUPLICATE_TRANSPORT,
+                outcome_reason=(
+                    f"Submission key {proposal.submission_key} already exists for this phase; "
+                    "transport-level duplicates are rejected explicitly."
+                ),
                     budget_used=governance.budget_used,
                     budget_limit=governance.budget_limit,
                     consume_budget=False,
@@ -846,6 +853,7 @@ class LedgerStore:
                 selected_action=proposal.selected_action,
                 submission_key=proposal.submission_key,
                 proposal_fingerprint=proposal_fingerprint,
+                proposal_intent_signature=proposal_intent_signature,
                 outcome=PlannerAttemptOutcome.REJECTED_STALE,
                 outcome_reason=(
                     f"Provided snapshot hash {proposal.snapshot_hash} does not match current "
@@ -877,6 +885,93 @@ class LedgerStore:
                 f"Provided={proposal.snapshot_hash}, current={evaluation.snapshot.state_hash}. "
                 f"Stale quota {stale_used}/{governance.stale_quota_limit}.",
             )
+        existing_accepted = next(
+            (
+                attempt
+                for attempt in current_attempts
+                if attempt.outcome == PlannerAttemptOutcome.ACCEPTED and attempt.selected_action is not None
+            ),
+            None,
+        )
+        duplicate_cognitive = next(
+            (
+                attempt
+                for attempt in current_attempts
+                if attempt.proposal_fingerprint == proposal_fingerprint
+                and attempt.outcome
+                in {
+                    PlannerAttemptOutcome.ACCEPTED,
+                    PlannerAttemptOutcome.REJECTED_DUPLICATE_COGNITIVE,
+                }
+            ),
+            None,
+        )
+        semantic_duplicate = next(
+            (
+                event.payload
+                for event in self.list_events_for_run(run_id)
+                if event.event_type == LedgerEventType.PLANNER_ATTEMPT_RECORDED
+                and event.payload.get("phase_key") == governance.phase_key
+                and event.payload.get("selected_action") == proposal.selected_action.value
+                and event.payload.get("proposal_intent_signature") == proposal_intent_signature
+                and event.payload.get("outcome")
+                in {
+                    PlannerAttemptOutcome.ACCEPTED.value,
+                    PlannerAttemptOutcome.REJECTED_ILLEGAL.value,
+                    PlannerAttemptOutcome.REJECTED_DUPLICATE_COGNITIVE.value,
+                }
+            ),
+            None,
+        )
+        if existing_accepted is not None or duplicate_cognitive is not None or semantic_duplicate is not None:
+            duplicate_reason = (
+                "The current phase already has an accepted planner proposal and state has not advanced yet."
+                if existing_accepted is not None
+                else (
+                    "The planner repeated the same proposal fingerprint inside the current phase."
+                    if duplicate_cognitive is not None
+                    else "The planner repeated the same normalized proposal intent inside the current phase."
+                )
+            )
+            budget_used = governance.budget_used + 1
+            self._record_planner_attempt(
+                run_id=run_id,
+                phase_key=governance.phase_key,
+                policy_version=governance.policy_version,
+                snapshot_hash=evaluation.snapshot.state_hash,
+                selected_action=proposal.selected_action,
+                submission_key=proposal.submission_key,
+                proposal_fingerprint=proposal_fingerprint,
+                proposal_intent_signature=proposal_intent_signature,
+                outcome=PlannerAttemptOutcome.REJECTED_DUPLICATE_COGNITIVE,
+                outcome_reason=duplicate_reason,
+                budget_used=governance.budget_used,
+                budget_limit=governance.budget_limit,
+                consume_budget=True,
+            )
+            self.record_observation(
+                run_id=run_id,
+                kind=ObservationKind.SYSTEM_AUDIT,
+                summary="Planner proposal rejected as a cognitive duplicate.",
+                details=(
+                    f"error_code={PlannerAttemptOutcome.REJECTED_DUPLICATE_COGNITIVE.value}; "
+                    f"selected_action={proposal.selected_action.value}; "
+                    f"proposal_fingerprint={proposal_fingerprint}; "
+                    f"proposal_intent_signature={proposal_intent_signature}; "
+                    f"phase_key={governance.phase_key}."
+                ),
+            )
+            if budget_used >= governance.budget_limit:
+                self._record_phase_exhaustion(
+                    run_id=run_id,
+                    governance=governance,
+                    snapshot_hash=evaluation.snapshot.state_hash,
+                    reason="Planner phase budget was exhausted after repeated duplicate proposals.",
+                )
+            raise CognitiveDuplicatePlannerProposalError(
+                f"Planner proposal was rejected as a cognitive duplicate for phase {governance.phase_key}.",
+            )
+
         if proposal.selected_action not in legal_actions:
             budget_used = governance.budget_used + 1
             self._record_planner_attempt(
@@ -887,6 +982,7 @@ class LedgerStore:
                 selected_action=proposal.selected_action,
                 submission_key=proposal.submission_key,
                 proposal_fingerprint=proposal_fingerprint,
+                proposal_intent_signature=proposal_intent_signature,
                 outcome=PlannerAttemptOutcome.REJECTED_ILLEGAL,
                 outcome_reason=(
                     f"Selected action {proposal.selected_action.value} is not legal under "
@@ -925,70 +1021,6 @@ class LedgerStore:
                 f"Legal actions: {legal_action_summary if legal_action_summary else 'none'}.",
             )
 
-        existing_accepted = next(
-            (
-                attempt
-                for attempt in current_attempts
-                if attempt.outcome == PlannerAttemptOutcome.ACCEPTED and attempt.selected_action is not None
-            ),
-            None,
-        )
-        duplicate_cognitive = next(
-            (
-                attempt
-                for attempt in current_attempts
-                if attempt.proposal_fingerprint == proposal_fingerprint
-                and attempt.outcome
-                in {
-                    PlannerAttemptOutcome.ACCEPTED,
-                    PlannerAttemptOutcome.REJECTED_DUPLICATE_COGNITIVE,
-                }
-            ),
-            None,
-        )
-        if existing_accepted is not None or duplicate_cognitive is not None:
-            duplicate_reason = (
-                "The current phase already has an accepted planner proposal and state has not advanced yet."
-                if existing_accepted is not None
-                else "The planner repeated the same proposal fingerprint inside the current phase."
-            )
-            budget_used = governance.budget_used + 1
-            self._record_planner_attempt(
-                run_id=run_id,
-                phase_key=governance.phase_key,
-                policy_version=governance.policy_version,
-                snapshot_hash=evaluation.snapshot.state_hash,
-                selected_action=proposal.selected_action,
-                submission_key=proposal.submission_key,
-                proposal_fingerprint=proposal_fingerprint,
-                outcome=PlannerAttemptOutcome.REJECTED_DUPLICATE_COGNITIVE,
-                outcome_reason=duplicate_reason,
-                budget_used=governance.budget_used,
-                budget_limit=governance.budget_limit,
-                consume_budget=True,
-            )
-            self.record_observation(
-                run_id=run_id,
-                kind=ObservationKind.SYSTEM_AUDIT,
-                summary="Planner proposal rejected as a cognitive duplicate.",
-                details=(
-                    f"error_code={PlannerAttemptOutcome.REJECTED_DUPLICATE_COGNITIVE.value}; "
-                    f"selected_action={proposal.selected_action.value}; "
-                    f"proposal_fingerprint={proposal_fingerprint}; "
-                    f"phase_key={governance.phase_key}."
-                ),
-            )
-            if budget_used >= governance.budget_limit:
-                self._record_phase_exhaustion(
-                    run_id=run_id,
-                    governance=governance,
-                    snapshot_hash=evaluation.snapshot.state_hash,
-                    reason="Planner phase budget was exhausted after repeated duplicate proposals.",
-                )
-            raise CognitiveDuplicatePlannerProposalError(
-                f"Planner proposal was rejected as a cognitive duplicate for phase {governance.phase_key}.",
-            )
-
         self._record_planner_attempt(
             run_id=run_id,
             phase_key=governance.phase_key,
@@ -997,6 +1029,7 @@ class LedgerStore:
             selected_action=proposal.selected_action,
             submission_key=proposal.submission_key,
             proposal_fingerprint=proposal_fingerprint,
+            proposal_intent_signature=proposal_intent_signature,
             outcome=PlannerAttemptOutcome.ACCEPTED,
             outcome_reason="Planner proposal was accepted under the current legal-action guard.",
             budget_used=governance.budget_used,
@@ -1016,6 +1049,7 @@ class LedgerStore:
                 "selected_action": proposal.selected_action.value,
                 "submission_key": proposal.submission_key,
                 "proposal_fingerprint": proposal_fingerprint,
+                "proposal_intent_signature": proposal_intent_signature,
                 "expected_outcome": proposal.expected_outcome,
                 "legal_actions": [action.name.value for action in evaluation.actions],
                 "legal_action_details": legal_action_descriptions,
@@ -2545,6 +2579,77 @@ class LedgerStore:
             json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"),
         ).hexdigest()
 
+    @classmethod
+    def _build_planner_proposal_intent_signature(
+        cls,
+        *,
+        selected_action: PossibleActionName,
+        rationale: str,
+        expected_outcome: str,
+    ) -> str:
+        alias_map = {
+            "db": "database",
+            "repo": "repository",
+            "repos": "repository",
+            "review": "inspect",
+            "inspect": "inspect",
+            "check": "inspect",
+            "examine": "inspect",
+            "scan": "inspect",
+            "proceed": "continue",
+            "proceeding": "continue",
+            "continue": "continue",
+            "continuing": "continue",
+            "path": "path",
+            "paths": "path",
+            "directory": "path",
+            "directories": "path",
+            "file": "path",
+            "files": "path",
+        }
+        stopwords = {
+            "a",
+            "an",
+            "and",
+            "before",
+            "can",
+            "first",
+            "for",
+            "into",
+            "later",
+            "next",
+            "one",
+            "or",
+            "should",
+            "step",
+            "that",
+            "the",
+            "then",
+            "this",
+            "to",
+            "while",
+            "with",
+        }
+
+        normalized_source = f"{rationale} {expected_outcome}".lower()
+        tokens = re.findall(r"[a-z0-9_]+", normalized_source)
+        normalized_tokens: list[str] = []
+        for token in tokens:
+            canonical = alias_map.get(token, token)
+            if canonical in stopwords:
+                continue
+            if len(canonical) <= 2:
+                continue
+            normalized_tokens.append(canonical)
+        unique_tokens = sorted(set(normalized_tokens))
+        payload = {
+            "selected_action": selected_action.value,
+            "normalized_tokens": unique_tokens,
+        }
+        return sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        ).hexdigest()
+
     def _record_planner_attempt(
         self,
         *,
@@ -2555,6 +2660,7 @@ class LedgerStore:
         selected_action: PossibleActionName | None,
         submission_key: str | None,
         proposal_fingerprint: str | None,
+        proposal_intent_signature: str | None = None,
         outcome: PlannerAttemptOutcome,
         outcome_reason: str,
         budget_used: int,
@@ -2603,6 +2709,7 @@ class LedgerStore:
                         "selected_action": selected_action.value if selected_action is not None else None,
                         "submission_key": submission_key,
                         "proposal_fingerprint": proposal_fingerprint,
+                        "proposal_intent_signature": proposal_intent_signature,
                         "outcome": outcome.value,
                         "outcome_reason": outcome_reason,
                         "attempt_index": record.attempt_index,

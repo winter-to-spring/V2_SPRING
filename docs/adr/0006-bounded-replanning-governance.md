@@ -66,6 +66,8 @@ Planner duplication is handled in two layers.
 - Definition:
   - the same proposal fingerprint is repeated inside the current active planner
     phase, or
+  - the same normalized proposal intent signature is repeated for the same
+    action inside the current active planner phase, or
   - a proposal is submitted after one proposal has already been accepted in the
     same active planner phase and state has not advanced.
 - Result: explicit rejection with

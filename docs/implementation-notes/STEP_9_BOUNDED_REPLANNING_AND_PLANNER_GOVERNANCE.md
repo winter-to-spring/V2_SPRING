@@ -62,6 +62,8 @@ It still does **not** attach a real LangGraph planner.
 
 - Trigger:
   - same proposal fingerprint inside the current active phase, or
+  - same normalized proposal intent signature for the same selected action
+    inside the current active phase, or
   - any new proposal after one accepted proposal already exists in the same
     active phase without state advancement
 - Outcome: `rejected_duplicate_cognitive`

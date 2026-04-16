@@ -20,6 +20,7 @@ from v2_spring.executor.bounded import BoundedExecutorTimeout
 from v2_spring.ledger.models import LedgerEventType, TaskRecord
 from v2_spring.ledger.store import LedgerStore
 from v2_spring.planner.proposals import (
+    CognitiveDuplicatePlannerProposalError,
     IllegalPlannerProposalError,
     PlannerPhaseExhaustedError,
     PlannerStaleQuotaExhaustedError,
@@ -30,6 +31,39 @@ from v2_spring.planner.proposals import (
 
 def make_store(tmp_path: Path) -> LedgerStore:
     return LedgerStore(f"sqlite+pysqlite:///{tmp_path / 'step1.db'}")
+
+
+def assert_budget_consuming_proposal_rejection(
+    store: LedgerStore,
+    *,
+    run_id: str,
+    snapshot_hash: str,
+    selected_action: PossibleActionName,
+    rationale: str,
+    expected_outcome: str,
+) -> None:
+    """Accept either an initial illegal rejection or a later cognitive duplicate.
+
+    Step 9 now treats paraphrased retries of the same blocked move as
+    `rejected_duplicate_cognitive`, so repeated budget-consuming failures may
+    surface either domain error depending on where the current phase is.
+    """
+
+    with pytest.raises(
+        (
+            IllegalPlannerProposalError,
+            CognitiveDuplicatePlannerProposalError,
+        ),
+    ):
+        store.record_planner_proposal(
+            run_id=run_id,
+            proposal=PlannerProposalInput(
+                snapshot_hash=snapshot_hash,
+                selected_action=selected_action,
+                rationale=rationale,
+                expected_outcome=expected_outcome,
+            ),
+        )
 
 
 def test_create_run_persists_typed_state_and_event(tmp_path: Path) -> None:
@@ -591,16 +625,14 @@ def test_planner_phase_budget_exhausts_after_three_budget_consuming_failures(tmp
     )
     for index in range(3):
         snapshot = store.build_run_snapshot(str(run.id))
-        with pytest.raises(IllegalPlannerProposalError):
-            store.record_planner_proposal(
-                run_id=str(run.id),
-                proposal=PlannerProposalInput(
-                    snapshot_hash=snapshot.state_hash,
-                    selected_action=PossibleActionName.EXECUTE_BOUNDED_TASK,
-                    rationale=f"Illegal attempt {index + 1}",
-                    expected_outcome="Should be rejected while approval is pending.",
-                ),
-            )
+        assert_budget_consuming_proposal_rejection(
+            store,
+            run_id=str(run.id),
+            snapshot_hash=snapshot.state_hash,
+            selected_action=PossibleActionName.EXECUTE_BOUNDED_TASK,
+            rationale=f"Illegal attempt {index + 1}",
+            expected_outcome="Should be rejected while approval is pending.",
+        )
 
     attempts = store.list_planner_attempts_for_run(str(run.id))
     exhausted_snapshot = store.build_run_snapshot(str(run.id))
@@ -671,6 +703,48 @@ def test_transport_duplicate_does_not_consume_phase_budget(tmp_path: Path) -> No
     ]
 
 
+def test_semantic_duplicate_proposal_is_rejected_even_when_wording_changes(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    run = store.create_run(
+        RunCreateInput(
+            project="demo",
+            goal="Reject paraphrased planner retries that keep the same underlying move",
+            urgency="normal",
+            risk="medium",
+        ),
+    )
+
+    first_snapshot = store.build_run_snapshot(str(run.id))
+    with pytest.raises(IllegalPlannerProposalError):
+        store.record_planner_proposal(
+            run_id=str(run.id),
+            proposal=PlannerProposalInput(
+                snapshot_hash=first_snapshot.state_hash,
+                selected_action=PossibleActionName.EXECUTE_BOUNDED_TASK,
+                rationale="Review the db schema before continuing.",
+                expected_outcome="Inspect the database schema first.",
+            ),
+        )
+
+    second_snapshot = store.build_run_snapshot(str(run.id))
+    with pytest.raises(CognitiveDuplicatePlannerProposalError):
+        store.record_planner_proposal(
+            run_id=str(run.id),
+            proposal=PlannerProposalInput(
+                snapshot_hash=second_snapshot.state_hash,
+                selected_action=PossibleActionName.EXECUTE_BOUNDED_TASK,
+                rationale="Inspect the database schema before proceeding.",
+                expected_outcome="Review the db schema first.",
+            ),
+        )
+
+    attempts = store.list_planner_attempts_for_run(str(run.id))
+    assert [attempt.outcome for attempt in attempts] == [
+        PlannerAttemptOutcome.REJECTED_ILLEGAL,
+        PlannerAttemptOutcome.REJECTED_DUPLICATE_COGNITIVE,
+    ]
+
+
 def test_manual_planner_recharge_reopens_exhausted_phase(tmp_path: Path) -> None:
     store = make_store(tmp_path)
     run = store.create_run(
@@ -683,16 +757,14 @@ def test_manual_planner_recharge_reopens_exhausted_phase(tmp_path: Path) -> None
     )
     for index in range(3):
         snapshot = store.build_run_snapshot(str(run.id))
-        with pytest.raises(IllegalPlannerProposalError):
-            store.record_planner_proposal(
-                run_id=str(run.id),
-                proposal=PlannerProposalInput(
-                    snapshot_hash=snapshot.state_hash,
-                    selected_action=PossibleActionName.EXECUTE_BOUNDED_TASK,
-                    rationale=f"Illegal attempt before recharge {index + 1}",
-                    expected_outcome="Should still be blocked on approval.",
-                ),
-            )
+        assert_budget_consuming_proposal_rejection(
+            store,
+            run_id=str(run.id),
+            snapshot_hash=snapshot.state_hash,
+            selected_action=PossibleActionName.EXECUTE_BOUNDED_TASK,
+            rationale=f"Illegal attempt before recharge {index + 1}",
+            expected_outcome="Should still be blocked on approval.",
+        )
 
     recharge = store.record_planner_recharge(
         run_id=str(run.id),
@@ -764,16 +836,14 @@ def test_planner_recharge_preflight_surfaces_deterministic_failure_context(
 
     for index in range(3):
         snapshot = store.build_run_snapshot(str(run.id))
-        with pytest.raises(IllegalPlannerProposalError):
-            store.record_planner_proposal(
-                run_id=str(run.id),
-                proposal=PlannerProposalInput(
-                    snapshot_hash=snapshot.state_hash,
-                    selected_action=PossibleActionName.RESOLVE_PENDING_APPROVAL,
-                    rationale=f"Illegal retry after failed execution {index + 1}",
-                    expected_outcome="This should keep exhausting the failed-execution planner phase.",
-                ),
-            )
+        assert_budget_consuming_proposal_rejection(
+            store,
+            run_id=str(run.id),
+            snapshot_hash=snapshot.state_hash,
+            selected_action=PossibleActionName.RESOLVE_PENDING_APPROVAL,
+            rationale=f"Illegal retry after failed execution {index + 1}",
+            expected_outcome="This should keep exhausting the failed-execution planner phase.",
+        )
 
     preflight = store.build_planner_recharge_preflight(str(run.id))
 
@@ -810,16 +880,14 @@ def test_planner_recharge_preflight_surfaces_latest_rejection_reason(tmp_path: P
 
     for index in range(3):
         snapshot = store.build_run_snapshot(str(run.id))
-        with pytest.raises(IllegalPlannerProposalError):
-            store.record_planner_proposal(
-                run_id=str(run.id),
-                proposal=PlannerProposalInput(
-                    snapshot_hash=snapshot.state_hash,
-                    selected_action=PossibleActionName.RESOLVE_PENDING_APPROVAL,
-                    rationale=f"Illegal retry after rejection {index + 1}",
-                    expected_outcome="The rejected run should not allow unrelated moves.",
-                ),
-            )
+        assert_budget_consuming_proposal_rejection(
+            store,
+            run_id=str(run.id),
+            snapshot_hash=snapshot.state_hash,
+            selected_action=PossibleActionName.RESOLVE_PENDING_APPROVAL,
+            rationale=f"Illegal retry after rejection {index + 1}",
+            expected_outcome="The rejected run should not allow unrelated moves.",
+        )
 
     preflight = store.build_planner_recharge_preflight(str(run.id))
 
@@ -841,16 +909,14 @@ def test_repeated_manual_recharge_requires_explicit_acknowledgement(tmp_path: Pa
 
     for index in range(3):
         snapshot = store.build_run_snapshot(str(run.id))
-        with pytest.raises(IllegalPlannerProposalError):
-            store.record_planner_proposal(
-                run_id=str(run.id),
-                proposal=PlannerProposalInput(
-                    snapshot_hash=snapshot.state_hash,
-                    selected_action=PossibleActionName.EXECUTE_BOUNDED_TASK,
-                    rationale=f"Illegal attempt before first recharge {index + 1}",
-                    expected_outcome="Still blocked on approval.",
-                ),
-            )
+        assert_budget_consuming_proposal_rejection(
+            store,
+            run_id=str(run.id),
+            snapshot_hash=snapshot.state_hash,
+            selected_action=PossibleActionName.EXECUTE_BOUNDED_TASK,
+            rationale=f"Illegal attempt before first recharge {index + 1}",
+            expected_outcome="Still blocked on approval.",
+        )
 
     store.record_planner_recharge(
         run_id=str(run.id),
@@ -859,16 +925,14 @@ def test_repeated_manual_recharge_requires_explicit_acknowledgement(tmp_path: Pa
 
     for index in range(3):
         snapshot = store.build_run_snapshot(str(run.id))
-        with pytest.raises(IllegalPlannerProposalError):
-            store.record_planner_proposal(
-                run_id=str(run.id),
-                proposal=PlannerProposalInput(
-                    snapshot_hash=snapshot.state_hash,
-                    selected_action=PossibleActionName.EXECUTE_BOUNDED_TASK,
-                    rationale=f"Illegal attempt before second recharge {index + 1}",
-                    expected_outcome="Still blocked on approval after one recharge.",
-                ),
-            )
+        assert_budget_consuming_proposal_rejection(
+            store,
+            run_id=str(run.id),
+            snapshot_hash=snapshot.state_hash,
+            selected_action=PossibleActionName.EXECUTE_BOUNDED_TASK,
+            rationale=f"Illegal attempt before second recharge {index + 1}",
+            expected_outcome="Still blocked on approval after one recharge.",
+        )
 
     preflight = store.build_planner_recharge_preflight(str(run.id))
     assert preflight.recharge_count == 1
