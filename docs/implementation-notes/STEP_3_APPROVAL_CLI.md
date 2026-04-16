@@ -37,7 +37,17 @@ When the approval is resolved:
 
 ## What This Does Not Yet Solve
 
-- approval UI
+The approval loop now also carries two small but important hardening rules:
+
+- rejection requires structured feedback
+- pending approval blocks new non-approval writes until the gate is resolved
+
+Those protections keep the tracer bullet honest without dragging Step 3 into a
+full timeout/locking design.
+
+## What This Still Does Not Yet Solve
+
+- approval timeout / expiry / suspension
 - budget and hiring approvals
 - task execution after approval
 - replay summaries

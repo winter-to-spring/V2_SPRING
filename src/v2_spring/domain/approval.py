@@ -27,6 +27,7 @@ class ApprovalView(BaseModel):
     reject_effect: str
     requested_at: datetime
     resolved_at: datetime | None
+    resolution_reason: str | None
 
     @field_validator("requested_action", "reason", "approve_effect", "reject_effect")
     @classmethod
@@ -34,4 +35,14 @@ class ApprovalView(BaseModel):
         cleaned = value.strip()
         if not cleaned:
             raise ValueError("value must not be blank")
+        return cleaned
+
+    @field_validator("resolution_reason")
+    @classmethod
+    def ensure_optional_non_blank(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("resolution_reason must not be blank")
         return cleaned

@@ -151,6 +151,7 @@ class ApprovalRecord(Base):
         default=utc_now,
     )
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolution_reason: Mapped[str | None] = mapped_column(String(4000), nullable=True)
 
     run: Mapped[RunRecord] = relationship(back_populates="approvals")
 

@@ -201,7 +201,13 @@ class LedgerStore:
             records = list(session.scalars(statement).all())
             return [self._to_approval_view(record) for record in records]
 
-    def resolve_approval(self, approval_id: str, *, approved: bool) -> ApprovalView:
+    def resolve_approval(
+        self,
+        approval_id: str,
+        *,
+        approved: bool,
+        reason: str | None = None,
+    ) -> ApprovalView:
         self.ensure_schema()
         with self.session() as session:
             approval = session.get(ApprovalRecord, approval_id)
@@ -212,12 +218,22 @@ class LedgerStore:
                     f"Approval {approval_id} is already {approval.status.value} and cannot be resolved again.",
                 )
 
+            resolution_reason = self._normalize_optional_text(reason)
+            if not approved and resolution_reason is None:
+                raise ValueError(
+                    f"Approval {approval_id} requires --reason when rejecting a request.",
+                )
+
             approval.status = ApprovalStatus.APPROVED if approved else ApprovalStatus.REJECTED
             approval.resolved_at = utc_now()
+            approval.resolution_reason = resolution_reason
 
-            run = session.get(RunRecord, approval.run_id)
-            if run is None:
-                raise LookupError(f"Run {approval.run_id} was not found for approval {approval_id}.")
+            run = self._get_run_for_mutation(
+                session,
+                approval.run_id,
+                mutation_name="approval resolution",
+                allow_during_waiting_approval=True,
+            )
             run.status = RunStatus.READY if approved else RunStatus.REJECTED
 
             session.add(
@@ -228,11 +244,104 @@ class LedgerStore:
                         "approval_id": approval.id,
                         "status": approval.status.value,
                         "run_status": run.status.value,
+                        "resolution_reason": approval.resolution_reason,
                     },
                 ),
             )
             session.flush()
             return self._to_approval_view(approval)
+
+    def record_decision(
+        self,
+        *,
+        run_id: str,
+        kind: DecisionKind,
+        summary: str,
+        rationale: str,
+    ) -> DecisionView:
+        self.ensure_schema()
+        with self.session() as session:
+            run = self._get_run_for_mutation(
+                session,
+                run_id,
+                mutation_name="decision recording",
+            )
+            record = DecisionRecord(
+                run_id=run.id,
+                kind=kind,
+                summary=summary,
+                rationale=rationale,
+            )
+            session.add(record)
+            session.flush()
+            session.add(
+                EventLedgerRecord(
+                    run_id=run.id,
+                    event_type=LedgerEventType.DECISION_RECORDED,
+                    payload={
+                        "decision_id": record.id,
+                        "kind": record.kind.value,
+                        "summary": record.summary,
+                    },
+                ),
+            )
+            session.flush()
+            return DecisionView.model_validate(
+                {
+                    "id": record.id,
+                    "run_id": record.run_id,
+                    "kind": record.kind,
+                    "summary": record.summary,
+                    "rationale": record.rationale,
+                    "created_at": record.created_at,
+                },
+            )
+
+    def record_observation(
+        self,
+        *,
+        run_id: str,
+        kind: ObservationKind,
+        summary: str,
+        details: str,
+    ) -> ObservationView:
+        self.ensure_schema()
+        with self.session() as session:
+            run = self._get_run_for_mutation(
+                session,
+                run_id,
+                mutation_name="observation recording",
+            )
+            record = ObservationRecord(
+                run_id=run.id,
+                kind=kind,
+                summary=summary,
+                details=details,
+            )
+            session.add(record)
+            session.flush()
+            session.add(
+                EventLedgerRecord(
+                    run_id=run.id,
+                    event_type=LedgerEventType.OBSERVATION_RECORDED,
+                    payload={
+                        "observation_id": record.id,
+                        "kind": record.kind.value,
+                        "summary": record.summary,
+                    },
+                ),
+            )
+            session.flush()
+            return ObservationView.model_validate(
+                {
+                    "id": record.id,
+                    "run_id": record.run_id,
+                    "kind": record.kind,
+                    "summary": record.summary,
+                    "details": record.details,
+                    "created_at": record.created_at,
+                },
+            )
 
     def list_decisions_for_run(self, run_id: str) -> list[DecisionView]:
         self.ensure_schema()
@@ -293,5 +402,32 @@ class LedgerStore:
                 "reject_effect": record.reject_effect,
                 "requested_at": record.requested_at,
                 "resolved_at": record.resolved_at,
+                "resolution_reason": record.resolution_reason,
             },
         )
+
+    @staticmethod
+    def _normalize_optional_text(value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("Text fields must not be blank when provided.")
+        return cleaned
+
+    @staticmethod
+    def _get_run_for_mutation(
+        session: Session,
+        run_id: str,
+        *,
+        mutation_name: str,
+        allow_during_waiting_approval: bool = False,
+    ) -> RunRecord:
+        run = session.get(RunRecord, run_id)
+        if run is None:
+            raise LookupError(f"Run {run_id} was not found.")
+        if run.status == RunStatus.WAITING_APPROVAL and not allow_during_waiting_approval:
+            raise PermissionError(
+                f"Run {run_id} is waiting for approval; {mutation_name} is blocked until approval is resolved.",
+            )
+        return run

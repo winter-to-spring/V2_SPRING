@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 class DecisionKind(StrEnum):
     INTAKE_ACCEPTED = "intake_accepted"
+    FOLLOW_UP = "follow_up"
 
 
 class DecisionView(BaseModel):
