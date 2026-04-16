@@ -10,7 +10,9 @@ from v2_spring.domain.approval import ApprovalStatus
 from v2_spring.domain.decision import DecisionKind
 from v2_spring.domain.observation import ObservationKind
 from v2_spring.domain.run import RunCreateInput
+from v2_spring.domain.snapshot import PossibleActionName, SnapshotActionState
 from v2_spring.domain.task import TaskKind, TaskStatus
+from v2_spring.planner.actions import evaluate_possible_actions
 from v2_spring.executor.bounded import BoundedExecutorTimeout
 from v2_spring.ledger.models import LedgerEventType
 from v2_spring.ledger.store import LedgerStore
@@ -345,3 +347,74 @@ def test_get_artifact_reports_hash_mismatch_when_file_changes(tmp_path: Path) ->
     assert inspected.file_exists is True
     assert inspected.hash_matches is False
     assert any("no longer match the stored sha256" in warning for warning in replay.consistency_warnings)
+
+
+def test_run_snapshot_and_possible_actions_cover_ready_and_terminal_paths(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    run = store.create_run(
+        RunCreateInput(
+            project="demo",
+            goal="Analyze repository structure",
+            urgency="normal",
+            risk="medium",
+        ),
+    )
+
+    waiting_snapshot = store.build_run_snapshot(str(run.id))
+    waiting_actions = evaluate_possible_actions(waiting_snapshot)
+    assert waiting_snapshot.pending_approval is not None
+    assert len(waiting_snapshot.state_hash) == 64
+    assert waiting_actions.snapshot.action_state == SnapshotActionState.AVAILABLE
+    assert waiting_actions.actions[0].name == PossibleActionName.RESOLVE_PENDING_APPROVAL
+
+    approval = store.list_approvals(status=ApprovalStatus.PENDING)[0]
+    store.resolve_approval(str(approval.id), approved=True)
+
+    ready_snapshot = store.build_run_snapshot(str(run.id))
+    ready_actions = evaluate_possible_actions(ready_snapshot)
+    assert ready_snapshot.pending_approval is None
+    assert ready_snapshot.task_summary.created == 0
+    assert ready_actions.snapshot.action_state == SnapshotActionState.AVAILABLE
+    assert ready_actions.actions[0].name == PossibleActionName.EXECUTE_BOUNDED_TASK
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "README.md").write_text("# Demo\n", encoding="utf-8")
+    store.execute_bounded_task(
+        run_id=str(run.id),
+        workspace=workspace,
+        artifact_root=tmp_path / "artifacts",
+        timeout_seconds=5,
+    )
+
+    completed_snapshot = store.build_run_snapshot(str(run.id))
+    completed_actions = evaluate_possible_actions(completed_snapshot)
+    assert completed_snapshot.latest_artifact is not None
+    assert completed_actions.snapshot.action_state == SnapshotActionState.TERMINAL
+    assert completed_actions.actions == []
+
+
+def test_run_snapshot_and_possible_actions_capture_rejection_feedback(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    run = store.create_run(
+        RunCreateInput(
+            project="demo",
+            goal="Analyze repository structure",
+            urgency="normal",
+            risk="high",
+        ),
+    )
+    approval = store.list_approvals(status=ApprovalStatus.PENDING)[0]
+    store.resolve_approval(
+        str(approval.id),
+        approved=False,
+        reason="Tighten the repository scope before the next planner loop.",
+    )
+
+    snapshot = store.build_run_snapshot(str(run.id))
+    actions = evaluate_possible_actions(snapshot)
+
+    assert snapshot.latest_rejection_reason == "Tighten the repository scope before the next planner loop."
+    assert actions.snapshot.action_state == SnapshotActionState.AVAILABLE
+    assert actions.actions[0].name == PossibleActionName.REPLAN_WITH_REJECTION_FEEDBACK
+    assert actions.actions[0].context_hint == snapshot.latest_rejection_reason

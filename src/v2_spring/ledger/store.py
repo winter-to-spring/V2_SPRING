@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 from hashlib import sha256
+import json
 from pathlib import Path
 from typing import Iterator
 from uuid import uuid4
@@ -16,6 +17,13 @@ from v2_spring.domain.decision import DecisionKind, DecisionView
 from v2_spring.domain.observation import ObservationKind, ObservationView
 from v2_spring.domain.replay import ArtifactInspectionView, RunReplayView, TaskReplayView
 from v2_spring.domain.run import RunCreateInput, RunStatus, RunView
+from v2_spring.domain.snapshot import (
+    ArtifactHeadlineView,
+    RunSnapshotView,
+    SnapshotActionState,
+    TaskHeadlineView,
+    TaskStatusSummary,
+)
 from v2_spring.domain.task import TaskKind, TaskStatus, TaskView
 from v2_spring.executor.bounded import (
     BoundedExecutorError,
@@ -480,6 +488,94 @@ class LedgerStore:
                 ),
             )
 
+    def build_run_snapshot(self, run_id: str) -> RunSnapshotView:
+        """Build a planner-ready, bounded snapshot for one run."""
+
+        self.ensure_schema()
+        with self.session() as session:
+            run_record = session.get(RunRecord, run_id)
+            if run_record is None:
+                raise LookupError(f"Run {run_id} was not found.")
+
+            approvals = [
+                self._to_approval_view(record)
+                for record in session.scalars(
+                    select(ApprovalRecord)
+                    .where(ApprovalRecord.run_id == run_id)
+                    .order_by(ApprovalRecord.requested_at.asc(), ApprovalRecord.id.asc()),
+                ).all()
+            ]
+            decisions = [
+                self._to_decision_view(record)
+                for record in session.scalars(
+                    select(DecisionRecord)
+                    .where(DecisionRecord.run_id == run_id)
+                    .order_by(DecisionRecord.created_at.asc(), DecisionRecord.id.asc()),
+                ).all()
+            ]
+            task_records = list(
+                session.scalars(
+                    select(TaskRecord)
+                    .where(TaskRecord.run_id == run_id)
+                    .order_by(TaskRecord.created_at.asc(), TaskRecord.id.asc()),
+                ).all(),
+            )
+            artifact_records = list(
+                session.scalars(
+                    select(ArtifactRecord)
+                    .where(ArtifactRecord.run_id == run_id)
+                    .order_by(ArtifactRecord.created_at.asc(), ArtifactRecord.id.asc()),
+                ).all(),
+            )
+
+            pending_approval = next(
+                (approval for approval in reversed(approvals) if approval.status == ApprovalStatus.PENDING),
+                None,
+            )
+            latest_rejection_reason = next(
+                (
+                    approval.resolution_reason
+                    for approval in reversed(approvals)
+                    if approval.status == ApprovalStatus.REJECTED and approval.resolution_reason
+                ),
+                None,
+            )
+            latest_decision_summary = decisions[-1].summary if decisions else None
+            latest_task = self._build_task_headline(task_records[-1]) if task_records else None
+            latest_artifact = (
+                self._build_artifact_headline(self._inspect_artifact(artifact_records[-1]))
+                if artifact_records
+                else None
+            )
+            task_summary = self._build_task_status_summary(task_records)
+
+            snapshot_payload = {
+                "run": self._to_run_view(run_record).model_dump(mode="json"),
+                "pending_approval": pending_approval.model_dump(mode="json") if pending_approval else None,
+                "latest_rejection_reason": latest_rejection_reason,
+                "latest_decision_summary": latest_decision_summary,
+                "task_summary": task_summary.model_dump(mode="json"),
+                "latest_task": latest_task.model_dump(mode="json") if latest_task else None,
+                "latest_artifact": latest_artifact.model_dump(mode="json") if latest_artifact else None,
+            }
+            state_hash = sha256(
+                json.dumps(snapshot_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+            ).hexdigest()
+
+            return RunSnapshotView(
+                snapshot_timestamp=utc_now(),
+                state_hash=state_hash,
+                run=self._to_run_view(run_record),
+                action_state=SnapshotActionState.STUCK,
+                action_state_reason="Possible actions have not been evaluated yet.",
+                pending_approval=pending_approval,
+                latest_rejection_reason=latest_rejection_reason,
+                latest_decision_summary=latest_decision_summary,
+                task_summary=task_summary,
+                latest_task=latest_task,
+                latest_artifact=latest_artifact,
+            )
+
     def execute_bounded_task(
         self,
         *,
@@ -885,6 +981,51 @@ class LedgerStore:
                 "resolved_at": record.resolved_at,
                 "resolution_reason": record.resolution_reason,
             },
+        )
+
+    @staticmethod
+    def _build_task_status_summary(records: list[TaskRecord]) -> TaskStatusSummary:
+        counts = {
+            TaskStatus.CREATED: 0,
+            TaskStatus.READY: 0,
+            TaskStatus.RUNNING: 0,
+            TaskStatus.COMPLETED: 0,
+            TaskStatus.FAILED: 0,
+        }
+        for record in records:
+            counts[record.status] += 1
+        return TaskStatusSummary(
+            created=counts[TaskStatus.CREATED],
+            ready=counts[TaskStatus.READY],
+            running=counts[TaskStatus.RUNNING],
+            completed=counts[TaskStatus.COMPLETED],
+            failed=counts[TaskStatus.FAILED],
+        )
+
+    @staticmethod
+    def _build_task_headline(record: TaskRecord) -> TaskHeadlineView:
+        failure_hint = None
+        if record.stderr:
+            failure_hint = record.stderr.strip().splitlines()[0][:400]
+        return TaskHeadlineView(
+            id=record.id,
+            kind=record.kind,
+            status=record.status,
+            summary=record.summary,
+            started_at=record.started_at,
+            completed_at=record.completed_at,
+            failure_hint=failure_hint,
+        )
+
+    @staticmethod
+    def _build_artifact_headline(artifact: ArtifactInspectionView) -> ArtifactHeadlineView:
+        return ArtifactHeadlineView(
+            id=artifact.artifact.id,
+            artifact_type=artifact.artifact.artifact_type,
+            title=artifact.artifact.title,
+            size_bytes=artifact.artifact.size_bytes,
+            file_exists=artifact.file_exists,
+            hash_matches=artifact.hash_matches,
         )
 
     @staticmethod

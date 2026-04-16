@@ -100,3 +100,5 @@ Observed In:
 - [RISK-0002 Approval reject reason missing](entries/2026-04-16-approval-reject-reason.md)
 - [RISK-0003 Pending approval write barrier missing](entries/2026-04-16-pending-approval-write-barrier.md)
 - [RISK-0004 Service-level approval barrier race window](entries/2026-04-16-service-level-barrier-race-window.md)
+- [RISK-0005 RunSnapshot staleness under concurrent writes](entries/2026-04-16-run-snapshot-staleness.md)
+- [RISK-0006 Snapshot/action read-model growth](entries/2026-04-16-snapshot-read-model-growth.md)
