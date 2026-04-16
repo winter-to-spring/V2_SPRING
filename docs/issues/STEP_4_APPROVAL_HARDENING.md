@@ -24,6 +24,7 @@ Step 3에서 approval list / resolve CLI까지는 만들었지만, human-in-the-
 - optional approval resolution reason persistence
 - approval resolution ledger payload 강화
 - service-level pending approval write barrier
+- barrier 위반 시 silent drop 금지, explicit error 정책 명시
 - barrier 검증 테스트
 - risk register와 implementation note 갱신
 
@@ -39,5 +40,6 @@ Step 3에서 approval list / resolve CLI까지는 만들었지만, human-in-the-
 - rejection without `--reason` is refused
 - rejection reason is visible in approval state and ledger events
 - pending approval blocks new non-approval writes
+- blocked writes fail explicitly instead of being silently ignored
 - approval resolution remains allowed while pending
 - tests and CLI proof both pass

@@ -25,3 +25,5 @@ Human approval is mandatory for:
   from human guidance instead of repeating the same proposal.
 - Approval-gated runs must reject non-approval writes until the gate is
   resolved, even before stronger concurrency controls are added.
+- Approval barriers must fail explicitly. Silent drop is forbidden because the
+  caller must know the write was blocked by governance rather than accepted.
