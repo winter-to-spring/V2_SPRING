@@ -44,7 +44,7 @@ and finite.
 - Blocked until: retry and duplicate-submission policy are documented
 
 ## Issue Link
-- GitHub Issue: -
+- GitHub Issue: #17
 
 ## Doc Links
 - ADR: ../../adr/0004-deterministic-substrate.md
