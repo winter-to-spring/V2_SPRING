@@ -39,12 +39,21 @@ from v2_spring.domain.planner_attempt import (
     PlannerRechargeCautionCode,
     PlannerRechargePreflightView,
 )
+from v2_spring.domain.progress import (
+    ProgressActionOwner,
+    ProgressAuditItemView,
+    ProgressCommandHintView,
+    ProgressSummaryView,
+    ProgressSurfaceStatus,
+    ProgressTraceMode,
+)
 from v2_spring.domain.proposal import PlannerProposalInput, PlannerProposalView
 from v2_spring.domain.replay import ArtifactInspectionView, RunReplayView, TaskReplayView
 from v2_spring.domain.run import RunCreateInput, RunStatus, RunView
 from v2_spring.domain.snapshot import (
     ArtifactHeadlineView,
     PendingFounderEscalationView,
+    PossibleActionEvaluationView,
     PossibleActionView,
     PossibleActionName,
     RunSnapshotView,
@@ -859,6 +868,73 @@ class LedgerStore:
                 latest_artifact=latest_artifact,
                 recent_founder_interventions=recent_founder_interventions,
             )
+
+    def build_run_progress(
+        self,
+        run_id: str,
+        *,
+        trace_mode: ProgressTraceMode = ProgressTraceMode.SUMMARY,
+    ) -> ProgressSummaryView:
+        """Build the founder/operator cockpit view directly from current read models."""
+
+        evaluation = evaluate_possible_actions(self.build_run_snapshot(run_id))
+        snapshot = evaluation.snapshot
+        replay = self.build_run_replay(run_id)
+
+        recent_artifacts = self._build_recent_artifact_headlines(replay)
+        recent_audits = self._build_progress_audit_items(
+            replay.observations,
+            include_raw=False,
+            limit=3,
+        )
+        trace_entries: list[ProgressAuditItemView] = []
+        if trace_mode != ProgressTraceMode.SUMMARY:
+            trace_entries = self._build_progress_audit_items(
+                replay.observations,
+                include_raw=trace_mode == ProgressTraceMode.RAW,
+                limit=8,
+            )
+
+        surface_status, action_required_by, headline, blocker_reason, next_step_hint = self._build_progress_surface(
+            snapshot=snapshot,
+            evaluation=evaluation,
+            replay=replay,
+        )
+
+        return ProgressSummaryView(
+            generated_at=utc_now(),
+            trace_mode=trace_mode,
+            run=snapshot.run,
+            snapshot_hash=snapshot.state_hash,
+            action_state=snapshot.action_state,
+            surface_status=surface_status,
+            action_required_by=action_required_by,
+            headline=self._sanitize_planner_text(headline, limit=400) or "Progress summary unavailable.",
+            blocker_reason=self._sanitize_planner_text(blocker_reason, limit=500),
+            next_step_hint=self._sanitize_planner_text(next_step_hint, limit=500),
+            pending_approval=snapshot.pending_approval,
+            pending_founder_escalation=snapshot.pending_founder_escalation,
+            planner_budget_remaining=snapshot.planner_budget_remaining,
+            planner_phase_exhausted=snapshot.planner_phase_exhausted,
+            planner_stale_quota_remaining=snapshot.planner_stale_quota_remaining,
+            latest_planner_summary=self._sanitize_planner_text(
+                snapshot.latest_planner_attempt_summary,
+                limit=400,
+            ),
+            latest_execution_summary=self._build_progress_execution_summary(snapshot),
+            latest_artifact=snapshot.latest_artifact,
+            recent_artifacts=recent_artifacts,
+            recent_founder_interventions=snapshot.recent_founder_interventions,
+            recent_audits=recent_audits,
+            suggested_commands=self._build_progress_command_hints(
+                run_id=run_id,
+                snapshot=snapshot,
+                evaluation=evaluation,
+                surface_status=surface_status,
+            ),
+            consistency_warnings=replay.consistency_warnings,
+            trace_entries=trace_entries,
+        )
 
     def record_planner_proposal(
         self,
@@ -2066,6 +2142,295 @@ class LedgerStore:
             return None
         redacted = cleaned.replace("/Users/changhyeon/Desktop/AI AGENT", "[workspace]")
         return redacted[:limit]
+
+    @staticmethod
+    def _extract_error_code(details: str) -> str | None:
+        for segment in details.split(";"):
+            cleaned = segment.strip()
+            if cleaned.startswith("error_code="):
+                value = cleaned.split("=", 1)[1].strip()
+                return value or None
+        return None
+
+    @classmethod
+    def _build_progress_audit_items(
+        cls,
+        observations: list[ObservationView],
+        *,
+        include_raw: bool,
+        limit: int,
+    ) -> list[ProgressAuditItemView]:
+        audit_observations = [
+            observation
+            for observation in observations
+            if observation.kind == ObservationKind.SYSTEM_AUDIT
+        ]
+        items: list[ProgressAuditItemView] = []
+        for observation in audit_observations[-limit:]:
+            items.append(
+                ProgressAuditItemView(
+                    observation_id=observation.id,
+                    kind=observation.kind,
+                    created_at=observation.created_at,
+                    error_code=cls._extract_error_code(observation.details),
+                    summary=cls._sanitize_planner_text(observation.summary, limit=400)
+                    or "System audit event recorded.",
+                    detail_preview=cls._sanitize_planner_text(observation.details, limit=500),
+                    raw_detail=observation.details[:4000] if include_raw else None,
+                ),
+            )
+        return items
+
+    @classmethod
+    def _build_recent_artifact_headlines(
+        cls,
+        replay: RunReplayView,
+    ) -> list[ArtifactHeadlineView]:
+        inspections: list[ArtifactInspectionView] = []
+        for task_replay in replay.tasks:
+            inspections.extend(task_replay.artifacts)
+        inspections.extend(replay.orphan_artifacts)
+        return [cls._build_artifact_headline(item) for item in inspections[-3:]]
+
+    @staticmethod
+    def _build_progress_execution_summary(snapshot: RunSnapshotView) -> str | None:
+        latest_task = snapshot.latest_task
+        if latest_task is None:
+            return None
+        if latest_task.status == TaskStatus.FAILED:
+            return (
+                f"{latest_task.summary} failed"
+                + (
+                    f": {latest_task.failure_hint}"
+                    if latest_task.failure_hint
+                    else "."
+                )
+            )
+        if latest_task.status == TaskStatus.RUNNING:
+            return f"{latest_task.summary} is currently running."
+        if latest_task.status == TaskStatus.COMPLETED:
+            return f"{latest_task.summary} completed successfully."
+        return f"{latest_task.summary} is {latest_task.status.value}."
+
+    @classmethod
+    def _build_progress_surface(
+        cls,
+        *,
+        snapshot: RunSnapshotView,
+        evaluation: PossibleActionEvaluationView,
+        replay: RunReplayView,
+    ) -> tuple[ProgressSurfaceStatus, ProgressActionOwner, str, str | None, str | None]:
+        if snapshot.pending_founder_escalation is not None:
+            return (
+                ProgressSurfaceStatus.WAITING_ON_FOUNDER,
+                ProgressActionOwner.FOUNDER,
+                "Founder reply is blocking the next planner step.",
+                snapshot.pending_founder_escalation.summary,
+                "Respond with a hint, bounded override, or reject to close the founder-help lane.",
+            )
+        if snapshot.pending_approval is not None:
+            return (
+                ProgressSurfaceStatus.WAITING_ON_APPROVAL,
+                ProgressActionOwner.FOUNDER,
+                "Run is waiting on approval before it can advance.",
+                snapshot.pending_approval.reason,
+                "Approve or reject the pending approval gate.",
+            )
+        if snapshot.run.status == RunStatus.SUSPENDED:
+            return (
+                ProgressSurfaceStatus.SUSPENDED_ON_TIMEOUT,
+                ProgressActionOwner.FOUNDER,
+                "Run is suspended after an approval timeout.",
+                snapshot.action_state_reason,
+                "Inspect the replay and choose whether to reopen a safe next step.",
+            )
+        if snapshot.planner_phase_exhausted:
+            return (
+                ProgressSurfaceStatus.WAITING_ON_FOUNDER,
+                ProgressActionOwner.FOUNDER,
+                "Planner phase is exhausted and needs founder review.",
+                snapshot.latest_planner_attempt_summary,
+                "Run `planner recharge-check` before reopening the exhausted phase.",
+            )
+        if snapshot.task_summary.running > 0 or snapshot.run.status == RunStatus.RUNNING:
+            return (
+                ProgressSurfaceStatus.RUNNING_EXECUTION,
+                ProgressActionOwner.EXECUTOR,
+                "Bounded execution is currently running.",
+                snapshot.latest_task.summary if snapshot.latest_task is not None else None,
+                "Wait for execution to finish or inspect the current task output.",
+            )
+        if snapshot.run.status == RunStatus.COMPLETED:
+            return (
+                ProgressSurfaceStatus.COMPLETED,
+                ProgressActionOwner.NONE,
+                "Run completed and produced a bounded result.",
+                snapshot.latest_artifact.title if snapshot.latest_artifact is not None else None,
+                "Inspect artifacts or replay for the final result package.",
+            )
+        if snapshot.run.status == RunStatus.FAILED:
+            latest_failed_task = next(
+                (task for task in reversed(replay.tasks) if task.task.status == TaskStatus.FAILED),
+                None,
+            )
+            failure_hint = None
+            if latest_failed_task is not None:
+                failure_hint = latest_failed_task.task.failure_hint or latest_failed_task.task.stderr
+            return (
+                ProgressSurfaceStatus.FAILED,
+                ProgressActionOwner.FOUNDER,
+                "Run failed and needs review before more work continues.",
+                cls._sanitize_planner_text(failure_hint, limit=500) if failure_hint else snapshot.action_state_reason,
+                "Inspect replay or raw trace before reopening another lane.",
+            )
+        if evaluation.actions:
+            return (
+                ProgressSurfaceStatus.READY_FOR_NEXT_ACTION,
+                ProgressActionOwner.SYSTEM,
+                "Run is ready for the next bounded action.",
+                evaluation.actions[0].reason,
+                "Inspect legal moves or invoke the planner for the next bounded step.",
+            )
+        return (
+            ProgressSurfaceStatus.IDLE,
+            ProgressActionOwner.NONE,
+            "Run is idle and has no immediate next move.",
+            snapshot.action_state_reason,
+            "Inspect replay and recent audits before deciding how to proceed.",
+        )
+
+    @staticmethod
+    def _build_progress_command_hints(
+        *,
+        run_id: str,
+        snapshot: RunSnapshotView,
+        evaluation: PossibleActionEvaluationView,
+        surface_status: ProgressSurfaceStatus,
+    ) -> list[ProgressCommandHintView]:
+        commands = [
+            ProgressCommandHintView(
+                label="Replay",
+                command=f"v2-spring run replay {run_id}",
+                purpose="Review the full bounded execution and governance narrative.",
+            ),
+        ]
+        if surface_status == ProgressSurfaceStatus.WAITING_ON_APPROVAL and snapshot.pending_approval is not None:
+            commands.extend(
+                [
+                    ProgressCommandHintView(
+                        label="List approvals",
+                        command="v2-spring approval list",
+                        purpose="See the current approval gate and any other pending approvals.",
+                    ),
+                    ProgressCommandHintView(
+                        label="Resolve approval",
+                        command=(
+                            f"v2-spring approval resolve {snapshot.pending_approval.id} --approve"
+                        ),
+                        purpose="Approve the current gate or swap --approve for --reject --reason-file ./approval_reason.txt.",
+                    ),
+                ],
+            )
+        elif surface_status == ProgressSurfaceStatus.WAITING_ON_FOUNDER and snapshot.pending_founder_escalation is not None:
+            commands.extend(
+                [
+                    ProgressCommandHintView(
+                        label="Founder hint",
+                        command=(
+                            "v2-spring planner reply hint "
+                            f"{run_id} --escalation-id {snapshot.pending_founder_escalation.observation_id} "
+                            "--message-file ./founder_hint.txt"
+                        ),
+                        purpose="Route one bounded founder hint back into the planner lane.",
+                    ),
+                    ProgressCommandHintView(
+                        label="Founder override",
+                        command=(
+                            "v2-spring planner reply override "
+                            f"{run_id} --escalation-id {snapshot.pending_founder_escalation.observation_id} "
+                            "--action <legal-action> --reason-file ./override_reason.txt"
+                        ),
+                        purpose="Force one currently legal move without opening god mode.",
+                    ),
+                    ProgressCommandHintView(
+                        label="Founder reject",
+                        command=(
+                            "v2-spring planner reply reject "
+                            f"{run_id} --escalation-id {snapshot.pending_founder_escalation.observation_id} "
+                            "--reason-file ./reject_reason.txt"
+                        ),
+                        purpose="Close the founder-help lane when no more help should be given in this phase.",
+                    ),
+                ],
+            )
+        elif surface_status == ProgressSurfaceStatus.WAITING_ON_FOUNDER and snapshot.planner_phase_exhausted:
+            commands.extend(
+                [
+                    ProgressCommandHintView(
+                        label="Recharge preflight",
+                        command=f"v2-spring planner recharge-check {run_id}",
+                        purpose="Review caution codes before reopening an exhausted planner phase.",
+                    ),
+                    ProgressCommandHintView(
+                        label="Manual recharge",
+                        command=(
+                            f"v2-spring planner recharge {run_id} --reason "
+                            "\"Founder explicitly wants one more bounded planner pass.\""
+                        ),
+                        purpose="Reopen the exhausted phase after reviewing the blocker context.",
+                    ),
+                ],
+            )
+        elif surface_status == ProgressSurfaceStatus.READY_FOR_NEXT_ACTION:
+            commands.extend(
+                [
+                    ProgressCommandHintView(
+                        label="Legal moves",
+                        command=f"v2-spring run actions {run_id}",
+                        purpose="Inspect the current deterministic legal move set.",
+                    ),
+                    ProgressCommandHintView(
+                        label="Planner invoke",
+                        command=f"v2-spring planner invoke {run_id}",
+                        purpose="Ask the bounded planner adapter to pick the next legal move.",
+                    ),
+                ],
+            )
+        elif surface_status == ProgressSurfaceStatus.RUNNING_EXECUTION:
+            commands.append(
+                ProgressCommandHintView(
+                    label="Task list",
+                    command=f"v2-spring task list --run {run_id}",
+                    purpose="Inspect the current bounded execution lane while it is running.",
+                ),
+            )
+        elif surface_status == ProgressSurfaceStatus.COMPLETED:
+            commands.append(
+                ProgressCommandHintView(
+                    label="Artifact list",
+                    command=f"v2-spring artifact list --run {run_id}",
+                    purpose="Inspect the latest bounded output package.",
+                ),
+            )
+        elif surface_status in {ProgressSurfaceStatus.FAILED, ProgressSurfaceStatus.SUSPENDED_ON_TIMEOUT}:
+            commands.append(
+                ProgressCommandHintView(
+                    label="Detailed replay",
+                    command=f"v2-spring run replay {run_id} --verbose",
+                    purpose="Open the full trace before choosing another intervention.",
+                ),
+            )
+        if evaluation.actions and all(
+            command.command != f"v2-spring run actions {run_id}" for command in commands
+        ):
+            commands.append(
+                ProgressCommandHintView(
+                    label="Legal moves",
+                    command=f"v2-spring run actions {run_id}",
+                    purpose="Inspect the current deterministic legal move set.",
+                ),
+            )
+        return commands
 
     @classmethod
     def _classify_failure(cls, failure_text: str) -> tuple[FailureClass, str]:

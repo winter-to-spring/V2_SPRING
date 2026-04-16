@@ -20,6 +20,14 @@ from v2_spring.domain.planner_attempt import (
     PlannerRechargeCautionCode,
     PlannerRechargePreflightView,
 )
+from v2_spring.domain.progress import (
+    ProgressActionOwner,
+    ProgressAuditItemView,
+    ProgressCommandHintView,
+    ProgressSummaryView,
+    ProgressSurfaceStatus,
+    ProgressTraceMode,
+)
 from v2_spring.domain.proposal import PlannerProposalInput, PlannerProposalView
 from v2_spring.domain.replay import ArtifactInspectionView, RunReplayView, TaskReplayView
 from v2_spring.domain.run import RiskLevel, RunCreateInput, RunStatus, RunView, UrgencyLevel
@@ -59,6 +67,12 @@ __all__ = [
     "PlannerGovernanceView",
     "PlannerRechargeCautionCode",
     "PlannerRechargePreflightView",
+    "ProgressActionOwner",
+    "ProgressAuditItemView",
+    "ProgressCommandHintView",
+    "ProgressSummaryView",
+    "ProgressSurfaceStatus",
+    "ProgressTraceMode",
     "PlannerProposalInput",
     "PlannerProposalView",
     "PossibleActionEvaluationView",

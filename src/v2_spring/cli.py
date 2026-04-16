@@ -30,6 +30,7 @@ from v2_spring.domain.planner_adapter import (
     PlannerTransportProvider,
 )
 from v2_spring.domain.planner_attempt import PlannerAttemptView, PlannerRechargePreflightView
+from v2_spring.domain.progress import ProgressSummaryView, ProgressTraceMode
 from v2_spring.domain.proposal import PlannerProposalInput, PlannerProposalView
 from v2_spring.domain.replay import ArtifactInspectionView, RunReplayView, TaskReplayView
 from v2_spring.domain.snapshot import PossibleActionEvaluationView, PossibleActionName, RunSnapshotView
@@ -83,6 +84,34 @@ def build_parser() -> argparse.ArgumentParser:
     show_parser = run_subparsers.add_parser("show", help="Show a run by id.")
     show_parser.add_argument("run_id", help="Run id to show.")
     show_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Override DATABASE_URL for this invocation.",
+    )
+
+    status_parser = run_subparsers.add_parser(
+        "status",
+        help="Show a founder/operator progress summary for one run.",
+    )
+    status_parser.add_argument("run_id", help="Run id to inspect.")
+    status_parser.add_argument(
+        "--format",
+        default="pretty",
+        choices=["pretty", "json"],
+        help="Output format. Defaults to pretty.",
+    )
+    status_detail_group = status_parser.add_mutually_exclusive_group()
+    status_detail_group.add_argument(
+        "--trace",
+        action="store_true",
+        help="Include sanitized trace entries for recent audit events.",
+    )
+    status_detail_group.add_argument(
+        "--raw",
+        action="store_true",
+        help="Include explicit raw audit details for recent trace entries.",
+    )
+    status_parser.add_argument(
         "--database-url",
         default=None,
         help="Override DATABASE_URL for this invocation.",
@@ -368,9 +397,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     planner_recharge_parser.add_argument("run_id", help="Run id to recharge.")
     planner_recharge_parser.add_argument(
+        "--format",
+        default="pretty",
+        choices=["pretty", "json"],
+        help="Output format. Defaults to pretty.",
+    )
+    recharge_reason_group = planner_recharge_parser.add_mutually_exclusive_group(required=True)
+    recharge_reason_group.add_argument(
         "--reason",
-        required=True,
         help="Why the founder believes another planner attempt should be allowed.",
+    )
+    recharge_reason_group.add_argument(
+        "--reason-file",
+        help="Path to a text file containing the recharge reason.",
     )
     planner_recharge_parser.add_argument(
         "--acknowledge-unchanged-context",
@@ -379,12 +418,6 @@ def build_parser() -> argparse.ArgumentParser:
             "Explicitly confirm that the founder reviewed the current blockage and still wants to reopen the phase "
             "even if the environment or rejection context appears unchanged."
         ),
-    )
-    planner_recharge_parser.add_argument(
-        "--format",
-        default="pretty",
-        choices=["pretty", "json"],
-        help="Output format. Defaults to pretty.",
     )
     planner_recharge_parser.add_argument(
         "--database-url",
@@ -481,15 +514,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Current pending planner escalation observation id.",
     )
     planner_reply_hint_parser.add_argument(
-        "--message",
-        required=True,
-        help="Founder hint that the planner should consider on the next bounded attempt.",
-    )
-    planner_reply_hint_parser.add_argument(
         "--format",
         default="pretty",
         choices=["pretty", "json"],
         help="Output format. Defaults to pretty.",
+    )
+    hint_input_group = planner_reply_hint_parser.add_mutually_exclusive_group(required=True)
+    hint_input_group.add_argument(
+        "--message",
+        help="Founder hint that the planner should consider on the next bounded attempt.",
+    )
+    hint_input_group.add_argument(
+        "--message-file",
+        help="Path to a text file containing the founder hint.",
     )
     planner_reply_hint_parser.add_argument(
         "--database-url",
@@ -513,10 +550,14 @@ def build_parser() -> argparse.ArgumentParser:
         choices=[action.value for action in PossibleActionName],
         help="Currently legal action that the founder wants to force.",
     )
-    planner_reply_override_parser.add_argument(
+    override_reason_group = planner_reply_override_parser.add_mutually_exclusive_group(required=True)
+    override_reason_group.add_argument(
         "--reason",
-        required=True,
         help="Why the founder is manually forcing this action.",
+    )
+    override_reason_group.add_argument(
+        "--reason-file",
+        help="Path to a text file containing the override reason.",
     )
     planner_reply_override_parser.add_argument(
         "--format",
@@ -540,10 +581,14 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Current pending planner escalation observation id.",
     )
-    planner_reply_reject_parser.add_argument(
+    reject_reason_group = planner_reply_reject_parser.add_mutually_exclusive_group(required=True)
+    reject_reason_group.add_argument(
         "--reason",
-        required=True,
         help="Why the founder refuses to help further in the current phase.",
+    )
+    reject_reason_group.add_argument(
+        "--reason-file",
+        help="Path to a text file containing the reject reason.",
     )
     planner_reply_reject_parser.add_argument(
         "--format",
@@ -570,6 +615,24 @@ def _parse_cli_datetime(value: str | None) -> datetime | None:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _load_text_argument(
+    *,
+    value: str | None,
+    file_path: str | None,
+    label: str,
+) -> str:
+    if value is None and file_path is None:
+        raise ValueError(f"{label} requires either direct text or a file path.")
+    if value is not None:
+        return value
+    path = Path(file_path)  # type: ignore[arg-type]
+    if not path.exists():
+        raise FileNotFoundError(f"{label} file was not found: {path}")
+    if path.is_dir():
+        raise IsADirectoryError(f"{label} file path points to a directory: {path}")
+    return path.read_text(encoding="utf-8")
 
 
 def _build_planner_transport(
@@ -951,6 +1014,125 @@ def _render_snapshot(snapshot: RunSnapshotView) -> str:
                     else ""
                 )
             )
+    return "\n".join(lines)
+
+
+def _render_progress(progress: ProgressSummaryView) -> str:
+    lines = [
+        "Run status",
+        "----------",
+        f"run_id:              {progress.run.id}",
+        f"project:             {progress.run.project}",
+        f"run_status:          {progress.run.status.value}",
+        f"surface_status:      {progress.surface_status.value}",
+        f"action_required_by:  {progress.action_required_by.value}",
+        f"generated_at:        {progress.generated_at.isoformat()}",
+        f"snapshot_hash:       {progress.snapshot_hash}",
+        f"action_state:        {progress.action_state.value}",
+        f"headline:            {progress.headline}",
+        f"blocker_reason:      {progress.blocker_reason if progress.blocker_reason else '-'}",
+        f"next_step_hint:      {progress.next_step_hint if progress.next_step_hint else '-'}",
+        f"planner_budget:      {progress.planner_budget_remaining} remaining",
+        f"planner_exhausted:   {progress.planner_phase_exhausted}",
+        f"stale_remaining:     {progress.planner_stale_quota_remaining}",
+        f"latest_planner:      {progress.latest_planner_summary if progress.latest_planner_summary else '-'}",
+        f"latest_execution:    {progress.latest_execution_summary if progress.latest_execution_summary else '-'}",
+    ]
+
+    if progress.pending_approval is not None:
+        lines.extend(
+            [
+                "",
+                "Pending approval",
+                "----------------",
+                f"id:                  {progress.pending_approval.id}",
+                f"requested_action:    {progress.pending_approval.requested_action}",
+                f"reason:              {progress.pending_approval.reason}",
+                f"expires_at:          {progress.pending_approval.expires_at.isoformat()}",
+            ],
+        )
+
+    if progress.pending_founder_escalation is not None:
+        lines.extend(
+            [
+                "",
+                "Pending founder escalation",
+                "-------------------------",
+                f"id:                  {progress.pending_founder_escalation.observation_id}",
+                f"summary:             {progress.pending_founder_escalation.summary}",
+                f"details:             {progress.pending_founder_escalation.details}",
+            ],
+        )
+
+    if progress.latest_artifact is not None:
+        lines.extend(
+            [
+                "",
+                "Latest artifact",
+                "---------------",
+                f"title:               {progress.latest_artifact.title}",
+                f"type:                {progress.latest_artifact.artifact_type.value}",
+                f"size_bytes:          {progress.latest_artifact.size_bytes}",
+                f"file_exists:         {progress.latest_artifact.file_exists}",
+                f"hash_matches:        {progress.latest_artifact.hash_matches}",
+            ],
+        )
+
+    if progress.recent_artifacts:
+        lines.extend(["", "Recent artifacts", "----------------"])
+        for artifact in progress.recent_artifacts:
+            lines.append(
+                f"- {artifact.title} [{artifact.artifact_type.value}] "
+                f"(exists={artifact.file_exists}, hash_matches={artifact.hash_matches})",
+            )
+
+    if progress.recent_founder_interventions:
+        lines.extend(["", "Recent founder interventions", "---------------------------"])
+        for intervention in progress.recent_founder_interventions:
+            suffix = (
+                f" (override={intervention.override_action.value})"
+                if intervention.override_action is not None
+                else ""
+            )
+            lines.append(f"- {intervention.reply_kind.value}: {intervention.summary}{suffix}")
+
+    if progress.recent_audits:
+        lines.extend(["", "Recent audit highlights", "----------------------"])
+        for audit in progress.recent_audits:
+            code = audit.error_code if audit.error_code else "-"
+            lines.append(f"- {audit.summary} [error_code={code}]")
+            if audit.detail_preview is not None:
+                lines.append(f"  detail: {audit.detail_preview}")
+
+    if progress.consistency_warnings:
+        lines.extend(["", "Consistency warnings", "--------------------"])
+        for warning in progress.consistency_warnings:
+            lines.append(f"- {warning}")
+
+    if progress.suggested_commands:
+        lines.extend(["", "Suggested commands", "------------------"])
+        for command in progress.suggested_commands:
+            lines.append(f"- {command.label}: {command.command}")
+            lines.append(f"  purpose: {command.purpose}")
+
+    if progress.trace_entries:
+        lines.extend(
+            [
+                "",
+                "Trace details" if progress.trace_mode == ProgressTraceMode.TRACE else "Raw trace",
+                "-------------" if progress.trace_mode == ProgressTraceMode.TRACE else "---------",
+            ],
+        )
+        for entry in progress.trace_entries:
+            lines.append(
+                f"- {entry.created_at.isoformat()} / {entry.summary}"
+                + (f" [error_code={entry.error_code}]" if entry.error_code else ""),
+            )
+            if progress.trace_mode == ProgressTraceMode.RAW and entry.raw_detail is not None:
+                lines.append(f"  raw: {entry.raw_detail}")
+            elif entry.detail_preview is not None:
+                lines.append(f"  detail: {entry.detail_preview}")
+
     return "\n".join(lines)
 
 
@@ -1586,6 +1768,24 @@ def main() -> None:
             raise SystemExit(1) from exc
         return
 
+    if args.command == "run" and args.run_command == "status":
+        store = _build_store(args.database_url)
+        trace_mode = ProgressTraceMode.SUMMARY
+        if args.trace:
+            trace_mode = ProgressTraceMode.TRACE
+        elif args.raw:
+            trace_mode = ProgressTraceMode.RAW
+        try:
+            progress = store.build_run_progress(args.run_id, trace_mode=trace_mode)
+            if args.format == "json":
+                print(json.dumps(progress.model_dump(mode="json"), indent=2, ensure_ascii=False))
+            else:
+                print(_render_progress(progress))
+        except LookupError as exc:
+            print(str(exc))
+            raise SystemExit(1) from exc
+        return
+
     if args.command == "run" and args.run_command == "events":
         store = _build_store(args.database_url)
         try:
@@ -1799,16 +1999,21 @@ def main() -> None:
     if args.command == "planner" and args.planner_command == "recharge":
         store = _build_store(args.database_url)
         try:
+            reason = _load_text_argument(
+                value=args.reason,
+                file_path=args.reason_file,
+                label="Planner recharge reason",
+            )
             attempt = store.record_planner_recharge(
                 run_id=args.run_id,
-                reason=args.reason,
+                reason=reason,
                 acknowledge_unchanged_context=args.acknowledge_unchanged_context,
             )
             if args.format == "json":
                 print(json.dumps(attempt.model_dump(mode="json"), indent=2, ensure_ascii=False))
             else:
                 print(_render_planner_attempt(attempt))
-        except (LookupError, PermissionError, ValueError) as exc:
+        except (LookupError, PermissionError, ValueError, FileNotFoundError, IsADirectoryError) as exc:
             print(str(exc))
             raise SystemExit(1) from exc
         return
@@ -1936,31 +2141,46 @@ def main() -> None:
         store = _build_store(args.database_url)
         try:
             if args.planner_reply_kind == "hint":
+                message = _load_text_argument(
+                    value=args.message,
+                    file_path=args.message_file,
+                    label="Founder hint",
+                )
                 reply = FOUNDER_REPLY_INPUT_ADAPTER.validate_python(
                     {
                         "kind": "hint",
-                        "message": args.message,
+                        "message": message,
                     },
                 )
             elif args.planner_reply_kind == "override":
+                reason = _load_text_argument(
+                    value=args.reason,
+                    file_path=args.reason_file,
+                    label="Founder override reason",
+                )
                 reply = FOUNDER_REPLY_INPUT_ADAPTER.validate_python(
                     {
                         "kind": "override",
                         "selected_action": args.action,
-                        "reason": args.reason,
+                        "reason": reason,
                     },
                 )
             elif args.planner_reply_kind == "reject":
+                reason = _load_text_argument(
+                    value=args.reason,
+                    file_path=args.reason_file,
+                    label="Founder reject reason",
+                )
                 reply = FOUNDER_REPLY_INPUT_ADAPTER.validate_python(
                     {
                         "kind": "reject",
-                        "reason": args.reason,
+                        "reason": reason,
                     },
                 )
             else:
                 print("planner reply requires one of: hint, override, reject.")
                 raise SystemExit(2)
-        except ValidationError as exc:
+        except (ValidationError, FileNotFoundError, IsADirectoryError, ValueError) as exc:
             print("Founder reply failed validation.")
             print(exc)
             raise SystemExit(2) from exc
