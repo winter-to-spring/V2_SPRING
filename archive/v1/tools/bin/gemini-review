@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MODE="${1:-}"
+
+if [ -z "$MODE" ]; then
+  echo "Usage: bin/gemini-review <scaffold|workflow|infra>"
+  exit 1
+fi
+
+case "$MODE" in
+  scaffold)
+    PROMPT=$(cat <<'EOF'
+Review this repository as a v1 personal AI agent studio scaffold.
+
+Focus only on:
+- setup correctness
+- missing bootstrap pieces
+- risky defaults
+- operational gaps for a first runnable version
+
+Prioritize findings over praise.
+Return:
+1. the top 5 findings, ordered by severity
+2. one short section called "What is good enough for v1"
+
+Files to inspect:
+- docker-compose.yml
+- .env.example
+- pyproject.toml
+- README.md
+EOF
+)
+    ;;
+  workflow)
+    PROMPT=$(cat <<'EOF'
+Review this repository as a v1 LangGraph workflow skeleton.
+
+Focus only on:
+- state model quality
+- workflow completeness
+- missing approval or QA fields
+- issues that would block a real v1 demo
+
+Prioritize findings over praise.
+Return:
+1. the top 5 findings, ordered by severity
+2. one short section called "What is good enough for v1"
+
+Files to inspect:
+- src/agent_studio/state.py
+- src/agent_studio/graph.py
+- src/agent_studio/main.py
+- docs/V1_WORKFLOW.md
+EOF
+)
+    ;;
+  infra)
+    PROMPT=$(cat <<'EOF'
+Review this repository as a v1 local development infrastructure setup.
+
+Focus only on:
+- Docker correctness
+- Postgres bootstrap design
+- Redis and n8n role fit for v1
+- configuration risks and missing environment guidance
+
+Prioritize findings over praise.
+Return:
+1. the top 5 findings, ordered by severity
+2. one short section called "What is good enough for v1"
+
+Files to inspect:
+- docker-compose.yml
+- config/postgres/init/001_init.sql
+- .env.example
+- README.md
+EOF
+)
+    ;;
+  *)
+    echo "Unknown mode: $MODE"
+    echo "Usage: bin/gemini-review <scaffold|workflow|infra>"
+    exit 1
+    ;;
+esac
+
+exec gemini \
+  --approval-mode plan \
+  -m gemini-2.5-pro \
+  -p "$PROMPT"
+

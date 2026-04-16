@@ -1,0 +1,2 @@
+-- V2_SPRING clean-room migration placeholder.
+-- The first real schema will be introduced with the deterministic substrate slice.

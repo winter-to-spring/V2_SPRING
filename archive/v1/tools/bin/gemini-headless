@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "$#" -eq 0 ]; then
+  echo "Usage: bin/gemini-headless \"your prompt\""
+  exit 1
+fi
+
+exec gemini -m gemini-2.5-pro -p "$*"
+

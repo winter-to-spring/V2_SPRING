@@ -1,0 +1,42 @@
+AI Agent Studio TODO
+Updated: 2026-04-10 (Asia/Seoul)
+
+[1] Core design
+- 프론트/백/PM/기획 agent 구조를 LangGraph 기준으로 구체 설계
+- 1인회사용 agent 조직도를 개발회사 버전으로 구체화
+- 1인 스튜디오형 AI 개발 시스템 v1 아키텍처 상세화
+- 어디까지 자동으로 맡기고 어디서 반드시 사람 승인을 넣어야 하는지 경계선 설계
+
+[2] Workflow and docs
+- GitHub에는 뭘 두고 Notion에는 뭘 두고 n8n이 둘을 어떻게 연결할지 실무형 정리
+- 문서/산출물 규약 정의: PRD.md, ROADMAP.md, API_CONTRACT.yaml, TEST_REPORT.md, CHANGELOG.md, RELEASE_NOTES.md
+- 버전관리, 업데이트 이력, 이슈관리, 요구사항 명세 흐름 설계
+
+[3] Agent execution and prompts
+- 어떤 MCP 서버를 우선순위로 붙일지와 agent별 MCP 매핑
+- PM / Architect / FE / BE / Critic / QA 6개 agent용 프롬프트 초안
+- 개발 agent 2-AI 보완 구조 설계: Builder + Critic + Verifier
+- 개발 에이전트용 reward/score 설계
+- 자동 평가 루프 설계: 생성 -> 비평 -> 수정 -> 실행검증 -> 점수기록
+
+[4] Quality gates
+- 개인형 개발 에이전트 v1 품질 게이트 설계도
+- 모듈별 구동 확인 규칙 정의
+- 통합 시 구동 확인 규칙 정의
+- 테스트 전략 정의: lint, typecheck, unit, smoke, integration, Playwright E2E
+
+[5] Runtime and environment
+- 개인형 개발 에이전트 스튜디오를 VM/WSL2에 띄우는 최소 구성 설계
+- WSL2 Ubuntu + Docker Compose 기준 실행 환경 상세화
+- 최소 컨테이너 구성 정리: LangGraph app, n8n, Redis, Postgres, Playwright runner
+- 상태/heartbeat/event 저장 구조 설계
+
+[6] Visualization and monitoring
+- AI 에이전트 상태 시각화 구조 설계
+- agent들을 캐릭터라이징하는 UI 콘셉트 설계
+- agent 상호작용 애니메이션 구조 설계
+- 1인 스튜디오형 agent 관제 대시보드 위젯 설계
+
+[7] Expansion
+- 멀티모달로 확장할 때 어떤 입력 채널을 어떤 순서로 붙일지 정리
+- 개인형 -> 팀형 -> 엔터프라이즈형 확장 로드맵 정리
