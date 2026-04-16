@@ -13,11 +13,16 @@ control plane has already marked the task as dispatched.
 Without a hard timeout and reclaim path, the control plane may wait forever for
 a receipt that will never arrive.
 
+The same slice can also deadlock if stdout/stderr is captured through bounded
+OS pipes while the worker floods logs faster than the parent process drains
+them.
+
 ## Impact
 
 - tasks can remain `running` indefinitely
 - founders see stale execution state with no useful intervention path
 - retry and replay semantics become muddy because the failure never resolves
+- control-plane subprocess handling can deadlock on log pipe backpressure
 
 ## Why This Matters
 
@@ -30,6 +35,8 @@ execution runtime even if the control plane remains alive.
 - attach a hard timeout to every isolated worker dispatch
 - for the initial proof, reclaim stuck workers synchronously at the subprocess
   boundary instead of relying on a background watchdog
+- redirect stdout/stderr to task-local temp files instead of live pipe capture
+- only read bounded tail/preview bytes after process exit or timeout reclaim
 - synthesize a `TimeoutReceipt` or equivalent failure receipt when reclaiming
 - surface reclaim outcomes in founder/operator progress views
 
@@ -50,6 +57,7 @@ execution runtime even if the control plane remains alive.
 
 - every isolated worker dispatch has a hard timeout
 - timed-out or crashed workers produce a typed receipt
+- stdout/stderr capture cannot deadlock the control plane through pipe buffer saturation
 - replay and progress views can explain reclaim outcomes
 
 ## Last Updated

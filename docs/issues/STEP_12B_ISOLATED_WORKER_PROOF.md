@@ -34,6 +34,8 @@ proof를 만드는 것입니다.
   - patch/diff
   - artifacts
   - execution receipt
+  - stdout/stderr는 파이프 실시간 캡처 대신 task-local temp file로 리다이렉션
+  - 종료 후 bounded tail read / truncation만 수행
 - timeout / cancellation / orphan-risk visibility
 - synchronous hard timeout reclaim + timeout receipt
 - CLI proof
@@ -69,6 +71,14 @@ proof를 만드는 것입니다.
 - 비동기 watchdog은 proof 이후 단계에서 필요해질 수 있지만,
   첫 proof에서는 blocking reclaim이 더 단순하고 결정론적입니다
 
+6. **stdout/stderr는 temp file capture를 기본으로 한다**
+- 첫 proof에서는 `subprocess.PIPE` 기반 실시간 스트림 리더를 쓰지 않습니다
+- worker stdout/stderr는 sandbox 내부 temp file로 리다이렉션합니다
+- 프로세스 종료 또는 timeout reclaim 뒤, control plane은 파일 크기를 확인하고
+  bounded tail/preview만 읽어 receipt와 founder/operator surface에 반영합니다
+- 이렇게 해야 파이프 버퍼 포화로 인한 deadlock 위험을 피하면서도
+  로그 가시성을 유지할 수 있습니다
+
 ## 이번 단계에서 하지 않는 것
 
 - multi-worker orchestration
@@ -95,6 +105,8 @@ proof를 만드는 것입니다.
 - worker output이 patch/artifact/receipt로 회수된다
 - cancel/timeout 시 founder/operator가 orphan risk를 볼 수 있다
 - worker crash / hard timeout이 silent failure가 아니라 timeout receipt로 회수된다
+- stdout/stderr 폭주가 control plane deadlock으로 이어지지 않는다
+- receipt/log summary는 bounded tail read로 founder/operator surface에 노출된다
 - worker는 task-local working directory와 env allowlist 경계 안에서만 실행된다
 - `.env`와 local secret surface는 worker scope에 복사되지 않는다
 - 12-b가 container isolation proof는 아니라는 점과, 그 결손이 별도 리스크로 남아 있다는 점이 문서에 명시된다
