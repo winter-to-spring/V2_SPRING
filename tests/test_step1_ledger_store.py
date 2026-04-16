@@ -423,6 +423,42 @@ def test_run_snapshot_and_possible_actions_capture_rejection_feedback(tmp_path: 
     assert actions.actions[0].context_hint == snapshot.latest_rejection_reason
 
 
+def test_possible_actions_engine_is_side_effect_free_under_repeated_evaluation(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    run = store.create_run(
+        RunCreateInput(
+            project="demo",
+            goal="Prove possible-actions purity",
+            urgency="normal",
+            risk="medium",
+        ),
+    )
+
+    initial_run = store.get_run(str(run.id))
+    initial_events = store.list_events_for_run(str(run.id))
+    initial_decisions = store.list_decisions_for_run(str(run.id))
+    initial_observations = store.list_observations_for_run(str(run.id))
+
+    snapshot_one = store.build_run_snapshot(str(run.id))
+    evaluation_one = evaluate_possible_actions(snapshot_one)
+    snapshot_two = store.build_run_snapshot(str(run.id))
+    evaluation_two = evaluate_possible_actions(snapshot_two)
+
+    final_run = store.get_run(str(run.id))
+    final_events = store.list_events_for_run(str(run.id))
+    final_decisions = store.list_decisions_for_run(str(run.id))
+    final_observations = store.list_observations_for_run(str(run.id))
+
+    assert initial_run is not None
+    assert final_run is not None
+    assert final_run.status == initial_run.status
+    assert snapshot_one.state_hash == snapshot_two.state_hash
+    assert evaluation_one.actions == evaluation_two.actions
+    assert len(final_events) == len(initial_events)
+    assert len(final_decisions) == len(initial_decisions)
+    assert len(final_observations) == len(initial_observations)
+
+
 def test_planner_proposal_accepts_only_current_legal_moves(tmp_path: Path) -> None:
     store = make_store(tmp_path)
     run = store.create_run(

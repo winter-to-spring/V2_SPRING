@@ -1,7 +1,7 @@
 # Risk ID: RISK-0007
 Title: Possible-actions engine purity may drift as planner logic grows
 Class: Before Next Phase
-Status: Open
+Status: Resolved
 Owner: Core / Planner boundary
 Observed In: Step 8 - Planner proposal contract review
 
@@ -47,7 +47,7 @@ substrate bugs.
 - Blocked until: the action engine purity contract is documented and verified
 
 ## Issue Link
-- GitHub Issue: -
+- GitHub Issue: #15
 
 ## Doc Links
 - ADR: ../../adr/0004-deterministic-substrate.md
@@ -57,6 +57,7 @@ substrate bugs.
 
 - repeated action evaluation is proven side-effect free
 - planner legality checks and founder-visible action menus share one pure rule path
+- ADR-0004 explicitly treats the possible-actions engine as a pure read-side rule engine
 
 ## Last Updated
 - 2026-04-16
