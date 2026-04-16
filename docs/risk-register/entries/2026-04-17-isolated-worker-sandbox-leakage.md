@@ -36,8 +36,8 @@ proof.
 - run workers inside a dedicated task directory or stronger jail boundary
 - do not copy `.env` or local secret files into worker scope
 - restrict worker-visible environment to an explicit allowlist
-- prefer stronger OS/container isolation when the proof moves beyond local
-  bounded execution
+- split stronger OS/container isolation into a separate tracked risk so the
+  Step 12-b proof can stay small without hiding the remaining exposure
 
 ## Capability Gate
 - Capability: isolated worker proof (Step 12-b)
@@ -50,7 +50,7 @@ proof.
 
 ## Doc Links
 - ADR:
-- Design note: ../../issues/STEP_12B_ISOLATED_WORKER_PROOF.md
+- Design note: docs/issues/STEP_12B_ISOLATED_WORKER_PROOF.md
 
 ## Exit Criteria
 

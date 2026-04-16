@@ -28,7 +28,8 @@ execution runtime even if the control plane remains alive.
 ## Suggested Mitigation
 
 - attach a hard timeout to every isolated worker dispatch
-- reclaim stuck workers with an explicit watchdog path
+- for the initial proof, reclaim stuck workers synchronously at the subprocess
+  boundary instead of relying on a background watchdog
 - synthesize a `TimeoutReceipt` or equivalent failure receipt when reclaiming
 - surface reclaim outcomes in founder/operator progress views
 
@@ -43,7 +44,7 @@ execution runtime even if the control plane remains alive.
 
 ## Doc Links
 - ADR:
-- Design note: ../../issues/STEP_12B_ISOLATED_WORKER_PROOF.md
+- Design note: docs/issues/STEP_12B_ISOLATED_WORKER_PROOF.md
 
 ## Exit Criteria
 
