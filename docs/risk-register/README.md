@@ -99,3 +99,4 @@ Observed In:
 - [RISK-0001 Approval timeout / deadlock](entries/2026-04-16-approval-timeout.md)
 - [RISK-0002 Approval reject reason missing](entries/2026-04-16-approval-reject-reason.md)
 - [RISK-0003 Pending approval write barrier missing](entries/2026-04-16-pending-approval-write-barrier.md)
+- [RISK-0004 Service-level approval barrier race window](entries/2026-04-16-service-level-barrier-race-window.md)

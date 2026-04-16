@@ -1,15 +1,15 @@
 # Risk ID: RISK-0003
 Title: Pending approval lacks a write barrier for non-approval state changes
 Class: Before Next Phase
-Status: Mitigating
+Status: Resolved
 Owner: Core orchestration
 Observed In: Step 3 approval CLI review
 
 ## Description
 
 If a run is waiting for approval but other service entrypoints can still write
-new decisions or observations, the approval gate becomes advisory instead of
-authoritative.
+new decisions or stateful observations, the approval gate becomes advisory
+instead of authoritative.
 
 ## Impact
 
@@ -29,6 +29,8 @@ approval gate.
 - add a service-level invariant that blocks non-approval writes while a run is
   `waiting_approval`
 - keep approval resolution as the only allowed mutation during that state
+- allow passive audit observations so the system can remain observable while it
+  is paused
 - later strengthen this with DB/lease-aware concurrency controls
 
 ## Capability Gate
@@ -45,7 +47,8 @@ approval gate.
 
 ## Exit Criteria
 
-- new non-approval writes fail while approval is pending
+- stateful non-approval writes fail while approval is pending
+- passive audit observations remain allowed
 - approval resolution remains allowed
 - the CLI and tests prove the barrier exists
 

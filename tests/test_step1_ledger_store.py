@@ -147,6 +147,14 @@ def test_pending_approval_blocks_new_decision_and_observation_until_resolved(tmp
             details="This observation should be prevented until approval resolves.",
         )
 
+    audit_observation = store.record_observation(
+        run_id=str(run.id),
+        kind=ObservationKind.SYSTEM_AUDIT,
+        summary="Approval is still pending and the run remains paused.",
+        details="This passive audit note preserves visibility without advancing the run.",
+    )
+    assert audit_observation.kind == ObservationKind.SYSTEM_AUDIT
+
     approval = store.list_approvals(status=ApprovalStatus.PENDING)[0]
     store.resolve_approval(str(approval.id), approved=True)
 

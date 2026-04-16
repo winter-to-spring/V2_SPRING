@@ -27,3 +27,5 @@ Human approval is mandatory for:
   resolved, even before stronger concurrency controls are added.
 - Approval barriers must fail explicitly. Silent drop is forbidden because the
   caller must know the write was blocked by governance rather than accepted.
+- Passive audit observations may still be recorded while approval is pending,
+  but they must never advance state or act as planner-driving follow-up work.

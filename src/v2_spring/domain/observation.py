@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 class ObservationKind(StrEnum):
     RUN_INTAKE = "run_intake"
     FOLLOW_UP = "follow_up"
+    SYSTEM_AUDIT = "system_audit"
 
 
 class ObservationView(BaseModel):
