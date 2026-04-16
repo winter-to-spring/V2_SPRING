@@ -96,6 +96,13 @@ Planner proposal governance is separate from executor/runtime failure.
   problems, or provider outages do **not** consume planner proposal budget.
 - Those failures must be tracked through task / observation / artifact state and
   can create a new planning phase later.
+- Repeated **deterministic** execution failure is a special case:
+  - it still does not consume planner proposal budget directly
+  - but once the same deterministic execution blocker repeats without state
+    advancement, the system must open a founder-help escalation lane before it
+    accepts another planner proposal
+  - this keeps the planner/executor boundary honest without blaming the planner
+    for one-off runtime noise
 
 ## Structured Outcome Contract
 

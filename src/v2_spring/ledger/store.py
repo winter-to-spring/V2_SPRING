@@ -797,6 +797,12 @@ class LedgerStore:
                 "Founder reply is still required for the current planner escalation before new proposals are allowed. "
                 f"Pending escalation={snapshot.pending_founder_escalation.observation_id}.",
             )
+        repeated_failure_escalation = self.open_repeated_failure_founder_escalation_if_needed(run_id)
+        if repeated_failure_escalation is not None:
+            raise PermissionError(
+                "Founder review is now required because deterministic execution failure repeated without state advancement. "
+                f"Pending escalation={repeated_failure_escalation.observation_id}.",
+            )
 
         if proposal.submission_key is not None:
             duplicate_transport = next(
@@ -1391,6 +1397,48 @@ class LedgerStore:
             stale_quota_used=governance.stale_quota_used,
             stale_quota_remaining=governance.stale_quota_remaining,
         )
+
+    def open_repeated_failure_founder_escalation_if_needed(
+        self,
+        run_id: str,
+    ) -> PendingFounderEscalationView | None:
+        """Open a founder-help lane when deterministic execution failure repeats."""
+
+        snapshot = self.build_run_snapshot(run_id)
+        if snapshot.pending_founder_escalation is not None:
+            return None
+
+        failure_report = self.build_failure_report(run_id)
+        if failure_report is None:
+            return None
+        if not failure_report.deterministic:
+            return None
+        if failure_report.repeated_failure_streak < 2:
+            return None
+
+        observation = self.record_observation(
+            run_id=run_id,
+            kind=ObservationKind.PLANNER_ESCALATION,
+            summary="System requires founder review after repeated deterministic execution failure.",
+            details=(
+                "escalation_target=founder; "
+                "help_kind=manual_override_request; "
+                "error_code=execution_failure_loop_detected; "
+                f"failure_error_code={failure_report.error_code}; "
+                f"repeated_failure_streak={failure_report.repeated_failure_streak}; "
+                f"normalized_failure_signature={failure_report.normalized_failure_signature}; "
+                f"blocking_reason={self._sanitize_planner_text(failure_report.observed_outcome, limit=500)}; "
+                f"analysis_summary={self._sanitize_planner_text(failure_report.previous_rationale, limit=500) or '-'}; "
+                "requested_help=Review whether the same bounded execution path should be redirected, overridden, or stopped before another planner attempt."
+            ),
+        )
+        refreshed_snapshot = self.build_run_snapshot(run_id)
+        pending = refreshed_snapshot.pending_founder_escalation
+        if pending is None or str(pending.observation_id) != str(observation.id):
+            raise RuntimeError(
+                "Repeated execution failure escalation was recorded, but the founder-help lane did not become visible in the refreshed snapshot.",
+            )
+        return pending
 
     def record_planner_escalation(
         self,

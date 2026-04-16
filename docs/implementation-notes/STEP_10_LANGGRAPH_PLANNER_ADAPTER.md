@@ -62,6 +62,12 @@ evidence:
 - `observed_outcome`
 - `repeated_failure_streak`
 
+When the same deterministic execution blocker repeats without state
+advancement, the control plane does not keep looping silently.
+
+Instead it opens a founder-help escalation lane before another planner proposal
+is accepted, so the planner must either receive human guidance or stay blocked.
+
 ## Stale Fairness
 
 Step 10 removes stale proposals from the main phase budget.

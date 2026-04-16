@@ -1707,6 +1707,12 @@ def main() -> None:
         config = load_config(args.database_url)
         store = LedgerStore(config.database_url)
         try:
+            repeated_failure_escalation = store.open_repeated_failure_founder_escalation_if_needed(args.run_id)
+            if repeated_failure_escalation is not None:
+                raise PermissionError(
+                    "Founder review is now required because deterministic execution failure repeated without state advancement. "
+                    f"Pending escalation={repeated_failure_escalation.observation_id}.",
+                )
             context = store.build_planner_context(args.run_id)
             if context.snapshot.pending_founder_escalation is not None:
                 raise PermissionError(

@@ -17,7 +17,7 @@ from v2_spring.domain.snapshot import PossibleActionName, SnapshotActionState
 from v2_spring.domain.task import TaskKind, TaskStatus
 from v2_spring.planner.actions import POSSIBLE_ACTIONS_ENGINE_VERSION, evaluate_possible_actions
 from v2_spring.executor.bounded import BoundedExecutorTimeout
-from v2_spring.ledger.models import LedgerEventType
+from v2_spring.ledger.models import LedgerEventType, TaskRecord
 from v2_spring.ledger.store import LedgerStore
 from v2_spring.planner.proposals import (
     IllegalPlannerProposalError,
@@ -1026,6 +1026,86 @@ def test_failure_report_preserves_error_code_trace_and_previous_rationale(
     assert "[workspace]" in context.failure_report.short_traceback
     assert "/Users/changhyeon/Desktop/AI AGENT" not in context.failure_report.short_traceback
     assert "Permission denied" in context.failure_report.observed_outcome
+
+
+def test_repeated_deterministic_execution_failure_opens_founder_escalation_lane(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = make_store(tmp_path)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    run = store.create_run(
+        RunCreateInput(
+            project="demo",
+            goal="Stop planner re-entry once the same deterministic execution blocker repeats",
+            urgency="normal",
+            risk="medium",
+        ),
+    )
+    approval = store.list_approvals(status=ApprovalStatus.PENDING)[0]
+    store.resolve_approval(str(approval.id), approved=True)
+
+    proposal = store.record_planner_proposal(
+        run_id=str(run.id),
+        proposal=PlannerProposalInput(
+            snapshot_hash=store.build_run_snapshot(str(run.id)).state_hash,
+            selected_action=PossibleActionName.EXECUTE_BOUNDED_TASK,
+            rationale="Try the bounded repository scan first so we can classify the blocker precisely.",
+            expected_outcome="A deterministic failure should feed back into governed replanning.",
+        ),
+    )
+
+    def fail_executor(*, workspace: Path, timeout_seconds: int, execution_context_id: str | None = None):
+        raise PermissionError("Permission denied while reading workspace/.env during the repository scan.")
+
+    monkeypatch.setattr("v2_spring.ledger.store.execute_repository_scan", fail_executor)
+
+    first_result = store.execute_bounded_task(
+        run_id=str(run.id),
+        workspace=workspace,
+        artifact_root=tmp_path / "artifacts",
+        timeout_seconds=1,
+    )
+    assert first_result.task.status == TaskStatus.FAILED
+
+    first_task = store.build_run_replay(str(run.id)).tasks[-1].task
+    with store.session() as session:
+        session.add(
+            TaskRecord(
+                run_id=str(run.id),
+                decision_id=str(proposal.decision_id),
+                kind=first_task.kind,
+                status=TaskStatus.FAILED,
+                summary=first_task.summary,
+                execution_context_id="simulated-repeat-failure",
+                command="scan_repository_tree --workspace [workspace] --max-depth 3",
+                cwd=str(workspace),
+                timeout_seconds=1,
+                stdout="",
+                stderr=first_task.stderr,
+            ),
+        )
+        session.flush()
+
+    snapshot_before = store.build_run_snapshot(str(run.id))
+    assert snapshot_before.pending_founder_escalation is None
+
+    with pytest.raises(PermissionError):
+        store.record_planner_proposal(
+            run_id=str(run.id),
+            proposal=PlannerProposalInput(
+                snapshot_hash=snapshot_before.state_hash,
+                selected_action=PossibleActionName.REPLAN_FROM_FAILED_EXECUTION,
+                rationale="Try the failed execution lane again after reading the same deterministic error.",
+                expected_outcome="This should be blocked and redirected to founder review.",
+            ),
+        )
+
+    snapshot_after = store.build_run_snapshot(str(run.id))
+    assert snapshot_after.pending_founder_escalation is not None
+    assert "repeated deterministic execution failure" in snapshot_after.pending_founder_escalation.summary.lower()
+    assert "failure_error_code=permission_denied" in snapshot_after.pending_founder_escalation.details
 
 
 @pytest.mark.parametrize(
