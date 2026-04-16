@@ -5,10 +5,13 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from v2_spring.domain.artifact import ArtifactStorageKind, ArtifactType
 from v2_spring.domain.approval import ApprovalStatus
 from v2_spring.domain.decision import DecisionKind
 from v2_spring.domain.observation import ObservationKind
 from v2_spring.domain.run import RunCreateInput
+from v2_spring.domain.task import TaskKind, TaskStatus
+from v2_spring.executor.bounded import BoundedExecutorTimeout
 from v2_spring.ledger.models import LedgerEventType
 from v2_spring.ledger.store import LedgerStore
 
@@ -173,3 +176,99 @@ def test_pending_approval_blocks_new_decision_and_observation_until_resolved(tmp
 
     assert decision.kind == DecisionKind.FOLLOW_UP
     assert observation.kind == ObservationKind.FOLLOW_UP
+
+
+def test_bounded_execution_persists_task_artifact_and_ledger(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "README.md").write_text("# Demo\n", encoding="utf-8")
+    (workspace / "src").mkdir()
+    (workspace / "src" / "app.py").write_text("print('hello')\n", encoding="utf-8")
+    (workspace / ".env").write_text("SECRET=1\n", encoding="utf-8")
+    (workspace / ".git").mkdir()
+    run = store.create_run(
+        RunCreateInput(
+            project="demo",
+            goal="Analyze repository structure",
+            urgency="normal",
+            risk="medium",
+        ),
+    )
+    approval = store.list_approvals(status=ApprovalStatus.PENDING)[0]
+    store.resolve_approval(str(approval.id), approved=True)
+
+    result = store.execute_bounded_task(
+        run_id=str(run.id),
+        workspace=workspace,
+        artifact_root=tmp_path / "artifacts",
+        timeout_seconds=5,
+    )
+    tasks = store.list_tasks_for_run(str(run.id))
+    artifacts = store.list_artifacts_for_run(str(run.id))
+    events = store.list_events_for_run(str(run.id))
+    fetched = store.get_run(str(run.id))
+
+    assert fetched is not None
+    assert fetched.status == fetched.status.COMPLETED
+    assert result.task.kind == TaskKind.REPOSITORY_SCAN
+    assert result.task.status == TaskStatus.COMPLETED
+    assert result.artifact is not None
+    assert result.artifact.artifact_type == ArtifactType.TEXT_REPORT
+    assert result.artifact.storage_kind == ArtifactStorageKind.FILESYSTEM_PATH
+    assert len(result.artifact.sha256) == 64
+    assert Path(result.artifact.path).exists()
+    assert len(tasks) == 1
+    assert len(artifacts) == 1
+    assert {event.event_type for event in events}.issuperset(
+        {
+            LedgerEventType.TASK_CREATED,
+            LedgerEventType.TASK_STARTED,
+            LedgerEventType.TASK_COMPLETED,
+            LedgerEventType.ARTIFACT_RECORDED,
+        },
+    )
+    artifact_body = Path(result.artifact.path).read_text(encoding="utf-8")
+    assert "Repository Scan Report" in artifact_body
+    assert "- .env" not in artifact_body
+    assert "- .git/" not in artifact_body
+    assert str(result.task.id) in result.observation.details
+    assert str(result.artifact.id) in result.observation.details
+
+
+def test_bounded_execution_failure_records_failed_task(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = make_store(tmp_path)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    run = store.create_run(
+        RunCreateInput(
+            project="demo",
+            goal="Analyze repository structure",
+            urgency="normal",
+            risk="medium",
+        ),
+    )
+    approval = store.list_approvals(status=ApprovalStatus.PENDING)[0]
+    store.resolve_approval(str(approval.id), approved=True)
+
+    def fail_executor(*, workspace: Path, timeout_seconds: int, execution_context_id: str | None = None):
+        raise BoundedExecutorTimeout("Executor timed out while scanning the repository.")
+
+    monkeypatch.setattr("v2_spring.ledger.store.execute_repository_scan", fail_executor)
+
+    result = store.execute_bounded_task(
+        run_id=str(run.id),
+        workspace=workspace,
+        artifact_root=tmp_path / "artifacts",
+        timeout_seconds=1,
+    )
+    events = store.list_events_for_run(str(run.id))
+    fetched = store.get_run(str(run.id))
+
+    assert fetched is not None
+    assert fetched.status == fetched.status.FAILED
+    assert result.task.status == TaskStatus.FAILED
+    assert result.artifact is None
+    assert "timed out" in (result.task.stderr or "").lower()
+    assert events[-2].event_type == LedgerEventType.TASK_FAILED
+    assert events[-1].event_type == LedgerEventType.OBSERVATION_RECORDED

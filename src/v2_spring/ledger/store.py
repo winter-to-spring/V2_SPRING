@@ -1,29 +1,52 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import dataclass
+from hashlib import sha256
+from pathlib import Path
 from typing import Iterator
+from uuid import uuid4
 
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from v2_spring.domain.approval import ApprovalStatus, ApprovalView
+from v2_spring.domain.artifact import ArtifactStorageKind, ArtifactType, ArtifactView
 from v2_spring.domain.decision import DecisionKind, DecisionView
 from v2_spring.domain.observation import ObservationKind, ObservationView
 from v2_spring.domain.run import RunCreateInput, RunStatus, RunView
+from v2_spring.domain.task import TaskKind, TaskStatus, TaskView
+from v2_spring.executor.bounded import (
+    BoundedExecutorError,
+    BoundedExecutorTimeout,
+    TaskExecutionReceipt,
+    execute_repository_scan,
+)
 from v2_spring.ledger.models import (
     ApprovalRecord,
+    ArtifactRecord,
     Base,
     DecisionRecord,
     EventLedgerRecord,
     LedgerEventType,
     ObservationRecord,
     RunRecord,
+    TaskRecord,
     utc_now,
 )
 
 
+@dataclass(frozen=True)
+class BoundedExecutionResult:
+    """Return the first execution proof in a single typed bundle."""
+
+    task: TaskView
+    artifact: ArtifactView | None
+    observation: ObservationView
+
+
 class LedgerStore:
-    """Typed persistence boundary for Step 1 state and events."""
+    """Typed persistence boundary for V2_SPRING tracer-bullet state and events."""
 
     # Approval should pause stateful progression, not blind the system.
     _APPROVAL_SAFE_OBSERVATION_KINDS = frozenset({ObservationKind.SYSTEM_AUDIT})
@@ -138,33 +161,7 @@ class LedgerStore:
                 ),
             )
             session.flush()
-
-            return RunView.model_validate(
-                {
-                    "id": record.id,
-                    "project": record.project,
-                    "goal": record.goal,
-                    "status": record.status,
-                    "urgency": record.urgency,
-                    "risk": record.risk,
-                    "created_at": record.created_at,
-                    "updated_at": record.updated_at,
-                },
-            )
-
-    @staticmethod
-    def _build_run_created_event(record: RunRecord) -> EventLedgerRecord:
-        return EventLedgerRecord(
-            run_id=record.id,
-            event_type=LedgerEventType.RUN_CREATED,
-            payload={
-                "project": record.project,
-                "goal": record.goal,
-                "urgency": record.urgency.value,
-                "risk": record.risk.value,
-                "status": record.status.value,
-            },
-        )
+            return self._to_run_view(record)
 
     def get_run(self, run_id: str) -> RunView | None:
         self.ensure_schema()
@@ -172,18 +169,7 @@ class LedgerStore:
             record = session.get(RunRecord, run_id)
             if record is None:
                 return None
-            return RunView.model_validate(
-                {
-                    "id": record.id,
-                    "project": record.project,
-                    "goal": record.goal,
-                    "status": record.status,
-                    "urgency": record.urgency,
-                    "risk": record.risk,
-                    "created_at": record.created_at,
-                    "updated_at": record.updated_at,
-                },
-            )
+            return self._to_run_view(record)
 
     def list_events_for_run(self, run_id: str) -> list[EventLedgerRecord]:
         self.ensure_schema()
@@ -289,16 +275,7 @@ class LedgerStore:
                 ),
             )
             session.flush()
-            return DecisionView.model_validate(
-                {
-                    "id": record.id,
-                    "run_id": record.run_id,
-                    "kind": record.kind,
-                    "summary": record.summary,
-                    "rationale": record.rationale,
-                    "created_at": record.created_at,
-                },
-            )
+            return self._to_decision_view(record)
 
     def record_observation(
         self,
@@ -336,16 +313,7 @@ class LedgerStore:
                 ),
             )
             session.flush()
-            return ObservationView.model_validate(
-                {
-                    "id": record.id,
-                    "run_id": record.run_id,
-                    "kind": record.kind,
-                    "summary": record.summary,
-                    "details": record.details,
-                    "created_at": record.created_at,
-                },
-            )
+            return self._to_observation_view(record)
 
     def list_decisions_for_run(self, run_id: str) -> list[DecisionView]:
         self.ensure_schema()
@@ -356,19 +324,7 @@ class LedgerStore:
                 .order_by(DecisionRecord.created_at.asc())
             )
             records = list(session.scalars(statement).all())
-            return [
-                DecisionView.model_validate(
-                    {
-                        "id": record.id,
-                        "run_id": record.run_id,
-                        "kind": record.kind,
-                        "summary": record.summary,
-                        "rationale": record.rationale,
-                        "created_at": record.created_at,
-                    },
-                )
-                for record in records
-            ]
+            return [self._to_decision_view(record) for record in records]
 
     def list_observations_for_run(self, run_id: str) -> list[ObservationView]:
         self.ensure_schema()
@@ -379,19 +335,419 @@ class LedgerStore:
                 .order_by(ObservationRecord.created_at.asc())
             )
             records = list(session.scalars(statement).all())
-            return [
-                ObservationView.model_validate(
-                    {
-                        "id": record.id,
-                        "run_id": record.run_id,
-                        "kind": record.kind,
-                        "summary": record.summary,
-                        "details": record.details,
-                        "created_at": record.created_at,
-                    },
+            return [self._to_observation_view(record) for record in records]
+
+    def list_tasks_for_run(self, run_id: str) -> list[TaskView]:
+        self.ensure_schema()
+        with self.session() as session:
+            statement = (
+                select(TaskRecord)
+                .where(TaskRecord.run_id == run_id)
+                .order_by(TaskRecord.created_at.asc())
+            )
+            records = list(session.scalars(statement).all())
+            return [self._to_task_view(record) for record in records]
+
+    def list_artifacts_for_run(self, run_id: str) -> list[ArtifactView]:
+        self.ensure_schema()
+        with self.session() as session:
+            statement = (
+                select(ArtifactRecord)
+                .where(ArtifactRecord.run_id == run_id)
+                .order_by(ArtifactRecord.created_at.asc())
+            )
+            records = list(session.scalars(statement).all())
+            return [self._to_artifact_view(record) for record in records]
+
+    def execute_bounded_task(
+        self,
+        *,
+        run_id: str,
+        workspace: Path,
+        artifact_root: Path,
+        timeout_seconds: int = 5,
+    ) -> BoundedExecutionResult:
+        """Execute the first bounded task and persist its task/artifact trail."""
+
+        self.ensure_schema()
+        workspace = workspace.expanduser().resolve()
+        artifact_root = artifact_root.expanduser().resolve()
+
+        with self.session() as session:
+            run = self._get_run_for_execution(session, run_id)
+            existing_task_count = session.scalar(
+                select(TaskRecord).where(TaskRecord.run_id == run.id).limit(1),
+            )
+            if existing_task_count is not None:
+                raise PermissionError(
+                    f"Run {run_id} already has bounded execution evidence and cannot execute again in Step 5.",
                 )
-                for record in records
-            ]
+
+            decision = DecisionRecord(
+                run_id=run.id,
+                kind=DecisionKind.BOUNDED_TASK_SELECTED,
+                summary="A bounded repository scan was selected for execution.",
+                rationale=(
+                    "Step 5 intentionally executes one safe, read-only task so the tracer bullet can "
+                    "prove task, artifact, and ledger linkage before broader orchestration is introduced."
+                ),
+            )
+            session.add(decision)
+            session.flush()
+            session.add(
+                EventLedgerRecord(
+                    run_id=run.id,
+                    event_type=LedgerEventType.DECISION_RECORDED,
+                    payload={
+                        "decision_id": decision.id,
+                        "kind": decision.kind.value,
+                        "summary": decision.summary,
+                    },
+                ),
+            )
+
+            execution_context_id = str(uuid4())
+            task = TaskRecord(
+                run_id=run.id,
+                decision_id=decision.id,
+                kind=TaskKind.REPOSITORY_SCAN,
+                status=TaskStatus.READY,
+                summary="Scan the repository tree and produce a short structural report.",
+                execution_context_id=execution_context_id,
+                command=f"scan_repository_tree --workspace {workspace} --max-depth 3",
+                cwd=str(workspace),
+                timeout_seconds=timeout_seconds,
+            )
+            session.add(task)
+            session.flush()
+            session.add(
+                EventLedgerRecord(
+                    run_id=run.id,
+                    event_type=LedgerEventType.TASK_CREATED,
+                    payload={
+                        "task_id": task.id,
+                        "decision_id": decision.id,
+                        "kind": task.kind.value,
+                        "summary": task.summary,
+                        "status": task.status.value,
+                    },
+                ),
+            )
+
+            task.status = TaskStatus.RUNNING
+            task.started_at = utc_now()
+            run.status = RunStatus.RUNNING
+            session.add(
+                EventLedgerRecord(
+                    run_id=run.id,
+                    event_type=LedgerEventType.TASK_STARTED,
+                    payload={
+                        "task_id": task.id,
+                        "decision_id": decision.id,
+                        "kind": task.kind.value,
+                        "status": task.status.value,
+                        "workspace": str(workspace),
+                    },
+                ),
+            )
+            session.flush()
+            task_id = task.id
+
+        try:
+            receipt = execute_repository_scan(
+                workspace=workspace,
+                timeout_seconds=timeout_seconds,
+                execution_context_id=execution_context_id,
+            )
+        except (BoundedExecutorTimeout, BoundedExecutorError, FileNotFoundError, NotADirectoryError) as exc:
+            return self._finalize_failed_task(
+                run_id=run_id,
+                task_id=task_id,
+                stderr=str(exc),
+            )
+        except Exception as exc:  # pragma: no cover - defensive final guard
+            return self._finalize_failed_task(
+                run_id=run_id,
+                task_id=task_id,
+                stderr=f"Unexpected bounded executor failure: {exc}",
+            )
+
+        try:
+            return self._finalize_completed_task(
+                run_id=run_id,
+                task_id=task_id,
+                artifact_root=artifact_root,
+                receipt=receipt,
+            )
+        except Exception as exc:
+            return self._finalize_failed_task(
+                run_id=run_id,
+                task_id=task_id,
+                stderr=f"Artifact persistence failed after execution: {exc}",
+            )
+
+    @staticmethod
+    def _build_run_created_event(record: RunRecord) -> EventLedgerRecord:
+        return EventLedgerRecord(
+            run_id=record.id,
+            event_type=LedgerEventType.RUN_CREATED,
+            payload={
+                "project": record.project,
+                "goal": record.goal,
+                "urgency": record.urgency.value,
+                "risk": record.risk.value,
+                "status": record.status.value,
+            },
+        )
+
+    @staticmethod
+    def _normalize_optional_text(value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("Text fields must not be blank when provided.")
+        return cleaned
+
+    @staticmethod
+    def _get_run_for_execution(session: Session, run_id: str) -> RunRecord:
+        run = session.get(RunRecord, run_id)
+        if run is None:
+            raise LookupError(f"Run {run_id} was not found.")
+        if run.status != RunStatus.READY:
+            raise PermissionError(
+                f"Run {run_id} is {run.status.value}; bounded execution requires the run to be ready.",
+            )
+        return run
+
+    @staticmethod
+    def _get_run_for_mutation(
+        session: Session,
+        run_id: str,
+        *,
+        mutation_name: str,
+        allow_during_waiting_approval: bool = False,
+    ) -> RunRecord:
+        run = session.get(RunRecord, run_id)
+        if run is None:
+            raise LookupError(f"Run {run_id} was not found.")
+        if run.status == RunStatus.WAITING_APPROVAL and not allow_during_waiting_approval:
+            raise PermissionError(
+                f"Run {run_id} is waiting for approval; {mutation_name} is blocked until approval is resolved.",
+            )
+        return run
+
+    def _finalize_failed_task(
+        self,
+        *,
+        run_id: str,
+        task_id: str,
+        stderr: str,
+    ) -> BoundedExecutionResult:
+        with self.session() as session:
+            run = session.get(RunRecord, run_id)
+            task = session.get(TaskRecord, task_id)
+            if run is None or task is None:
+                raise LookupError("Task finalization failed because the run or task no longer exists.")
+
+            task.status = TaskStatus.FAILED
+            task.completed_at = utc_now()
+            task.stdout = task.stdout or ""
+            task.stderr = stderr
+            run.status = RunStatus.FAILED
+
+            observation = ObservationRecord(
+                run_id=run.id,
+                kind=ObservationKind.TASK_EXECUTION,
+                summary="Bounded task failed before producing an artifact.",
+                details=stderr,
+            )
+            session.add(observation)
+            session.flush()
+            session.add(
+                EventLedgerRecord(
+                    run_id=run.id,
+                    event_type=LedgerEventType.TASK_FAILED,
+                    payload={
+                        "task_id": task.id,
+                        "decision_id": task.decision_id,
+                        "execution_context_id": task.execution_context_id,
+                        "status": task.status.value,
+                        "error": stderr,
+                    },
+                ),
+            )
+            session.add(
+                EventLedgerRecord(
+                    run_id=run.id,
+                    event_type=LedgerEventType.OBSERVATION_RECORDED,
+                    payload={
+                        "observation_id": observation.id,
+                        "kind": observation.kind.value,
+                        "summary": observation.summary,
+                    },
+                ),
+            )
+            session.flush()
+            return BoundedExecutionResult(
+                task=self._to_task_view(task),
+                artifact=None,
+                observation=self._to_observation_view(observation),
+            )
+
+    def _finalize_completed_task(
+        self,
+        *,
+        run_id: str,
+        task_id: str,
+        artifact_root: Path,
+        receipt: TaskExecutionReceipt,
+    ) -> BoundedExecutionResult:
+        artifact_directory = artifact_root / run_id / task_id
+        artifact_directory.mkdir(parents=True, exist_ok=True)
+        artifact_path = artifact_directory / "repository-scan-report.md"
+        artifact_path.write_text(receipt.artifact_body, encoding="utf-8")
+        artifact_bytes = artifact_path.read_bytes()
+        artifact_hash = sha256(artifact_bytes).hexdigest()
+
+        try:
+            # Keep filesystem output and ledger state as close as possible: if the DB write
+            # fails after the artifact file is written, we delete the file rather than leave
+            # behind an untracked "successful" result.
+            with self.session() as session:
+                run = session.get(RunRecord, run_id)
+                task = session.get(TaskRecord, task_id)
+                if run is None or task is None:
+                    raise LookupError("Task finalization failed because the run or task no longer exists.")
+
+                task.execution_context_id = receipt.execution_context_id
+                task.command = receipt.command
+                task.cwd = receipt.cwd
+                task.timeout_seconds = receipt.timeout_seconds
+                task.stdout = receipt.stdout
+                task.stderr = receipt.stderr
+                task.completed_at = receipt.finished_at
+                task.status = TaskStatus.COMPLETED
+                run.status = RunStatus.COMPLETED
+
+                artifact = ArtifactRecord(
+                    run_id=run.id,
+                    task_id=task.id,
+                    decision_id=task.decision_id,
+                    artifact_type=ArtifactType.TEXT_REPORT,
+                    title=receipt.artifact_title,
+                    storage_kind=ArtifactStorageKind.FILESYSTEM_PATH,
+                    path=str(artifact_path),
+                    size_bytes=len(artifact_bytes),
+                    sha256=artifact_hash,
+                    execution_context_id=receipt.execution_context_id,
+                    command=receipt.command,
+                    cwd=receipt.cwd,
+                )
+                session.add(artifact)
+                session.flush()
+
+                observation = ObservationRecord(
+                    run_id=run.id,
+                    kind=ObservationKind.TASK_EXECUTION,
+                    summary="Bounded task completed and recorded an artifact.",
+                    details=(
+                        f"Task {task.id} finished with artifact {artifact.id} at {artifact.path} "
+                        f"and sha256 {artifact.sha256}."
+                    ),
+                )
+                session.add(observation)
+                session.flush()
+
+                session.add(
+                    EventLedgerRecord(
+                        run_id=run.id,
+                        event_type=LedgerEventType.ARTIFACT_RECORDED,
+                        payload={
+                            "artifact_id": artifact.id,
+                            "task_id": task.id,
+                            "decision_id": task.decision_id,
+                            "execution_context_id": artifact.execution_context_id,
+                            "path": artifact.path,
+                            "sha256": artifact.sha256,
+                        },
+                    ),
+                )
+                session.add(
+                    EventLedgerRecord(
+                        run_id=run.id,
+                        event_type=LedgerEventType.TASK_COMPLETED,
+                        payload={
+                            "task_id": task.id,
+                            "decision_id": task.decision_id,
+                            "execution_context_id": task.execution_context_id,
+                            "artifact_id": artifact.id,
+                            "status": task.status.value,
+                        },
+                    ),
+                )
+                session.add(
+                    EventLedgerRecord(
+                        run_id=run.id,
+                        event_type=LedgerEventType.OBSERVATION_RECORDED,
+                        payload={
+                            "observation_id": observation.id,
+                            "kind": observation.kind.value,
+                            "summary": observation.summary,
+                        },
+                    ),
+                )
+                session.flush()
+                return BoundedExecutionResult(
+                    task=self._to_task_view(task),
+                    artifact=self._to_artifact_view(artifact),
+                    observation=self._to_observation_view(observation),
+                )
+        except Exception:
+            if artifact_path.exists():
+                artifact_path.unlink()
+            raise
+
+    @staticmethod
+    def _to_run_view(record: RunRecord) -> RunView:
+        return RunView.model_validate(
+            {
+                "id": record.id,
+                "project": record.project,
+                "goal": record.goal,
+                "status": record.status,
+                "urgency": record.urgency,
+                "risk": record.risk,
+                "created_at": record.created_at,
+                "updated_at": record.updated_at,
+            },
+        )
+
+    @staticmethod
+    def _to_decision_view(record: DecisionRecord) -> DecisionView:
+        return DecisionView.model_validate(
+            {
+                "id": record.id,
+                "run_id": record.run_id,
+                "kind": record.kind,
+                "summary": record.summary,
+                "rationale": record.rationale,
+                "created_at": record.created_at,
+            },
+        )
+
+    @staticmethod
+    def _to_observation_view(record: ObservationRecord) -> ObservationView:
+        return ObservationView.model_validate(
+            {
+                "id": record.id,
+                "run_id": record.run_id,
+                "kind": record.kind,
+                "summary": record.summary,
+                "details": record.details,
+                "created_at": record.created_at,
+            },
+        )
 
     @staticmethod
     def _to_approval_view(record: ApprovalRecord) -> ApprovalView:
@@ -411,27 +767,45 @@ class LedgerStore:
         )
 
     @staticmethod
-    def _normalize_optional_text(value: str | None) -> str | None:
-        if value is None:
-            return None
-        cleaned = value.strip()
-        if not cleaned:
-            raise ValueError("Text fields must not be blank when provided.")
-        return cleaned
+    def _to_task_view(record: TaskRecord) -> TaskView:
+        return TaskView.model_validate(
+            {
+                "id": record.id,
+                "run_id": record.run_id,
+                "decision_id": record.decision_id,
+                "kind": record.kind,
+                "status": record.status,
+                "summary": record.summary,
+                "execution_context_id": record.execution_context_id,
+                "command": record.command,
+                "cwd": record.cwd,
+                "timeout_seconds": record.timeout_seconds,
+                "stdout": record.stdout,
+                "stderr": record.stderr,
+                "created_at": record.created_at,
+                "updated_at": record.updated_at,
+                "started_at": record.started_at,
+                "completed_at": record.completed_at,
+            },
+        )
 
     @staticmethod
-    def _get_run_for_mutation(
-        session: Session,
-        run_id: str,
-        *,
-        mutation_name: str,
-        allow_during_waiting_approval: bool = False,
-    ) -> RunRecord:
-        run = session.get(RunRecord, run_id)
-        if run is None:
-            raise LookupError(f"Run {run_id} was not found.")
-        if run.status == RunStatus.WAITING_APPROVAL and not allow_during_waiting_approval:
-            raise PermissionError(
-                f"Run {run_id} is waiting for approval; {mutation_name} is blocked until approval is resolved.",
-            )
-        return run
+    def _to_artifact_view(record: ArtifactRecord) -> ArtifactView:
+        return ArtifactView.model_validate(
+            {
+                "id": record.id,
+                "run_id": record.run_id,
+                "task_id": record.task_id,
+                "decision_id": record.decision_id,
+                "artifact_type": record.artifact_type,
+                "title": record.title,
+                "storage_kind": record.storage_kind,
+                "path": record.path,
+                "size_bytes": record.size_bytes,
+                "sha256": record.sha256,
+                "execution_context_id": record.execution_context_id,
+                "command": record.command,
+                "cwd": record.cwd,
+                "created_at": record.created_at,
+            },
+        )

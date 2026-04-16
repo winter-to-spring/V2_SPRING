@@ -9,9 +9,11 @@ from sqlalchemy import DateTime, Enum, ForeignKey, JSON, String, event
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from v2_spring.domain.approval import ApprovalStatus
+from v2_spring.domain.artifact import ArtifactStorageKind, ArtifactType
 from v2_spring.domain.decision import DecisionKind
 from v2_spring.domain.observation import ObservationKind
 from v2_spring.domain.run import RiskLevel, RunStatus, UrgencyLevel
+from v2_spring.domain.task import TaskKind, TaskStatus
 
 
 def utc_now() -> datetime:
@@ -28,6 +30,11 @@ class LedgerEventType(StrEnum):
     DECISION_RECORDED = "DECISION_RECORDED"
     APPROVAL_REQUESTED = "APPROVAL_REQUESTED"
     APPROVAL_RESOLVED = "APPROVAL_RESOLVED"
+    TASK_CREATED = "TASK_CREATED"
+    TASK_STARTED = "TASK_STARTED"
+    TASK_COMPLETED = "TASK_COMPLETED"
+    TASK_FAILED = "TASK_FAILED"
+    ARTIFACT_RECORDED = "ARTIFACT_RECORDED"
 
 
 class RunRecord(Base):
@@ -74,6 +81,14 @@ class RunRecord(Base):
         cascade="all, delete-orphan",
     )
     approvals: Mapped[list["ApprovalRecord"]] = relationship(
+        back_populates="run",
+        cascade="all, delete-orphan",
+    )
+    tasks: Mapped[list["TaskRecord"]] = relationship(
+        back_populates="run",
+        cascade="all, delete-orphan",
+    )
+    artifacts: Mapped[list["ArtifactRecord"]] = relationship(
         back_populates="run",
         cascade="all, delete-orphan",
     )
@@ -156,6 +171,103 @@ class ApprovalRecord(Base):
     run: Mapped[RunRecord] = relationship(back_populates="approvals")
 
 
+class TaskRecord(Base):
+    __tablename__ = "tasks"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("runs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    decision_id: Mapped[str | None] = mapped_column(
+        ForeignKey("decisions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    kind: Mapped[TaskKind] = mapped_column(
+        Enum(TaskKind, native_enum=False),
+        nullable=False,
+    )
+    status: Mapped[TaskStatus] = mapped_column(
+        Enum(TaskStatus, native_enum=False),
+        nullable=False,
+        default=TaskStatus.CREATED,
+    )
+    summary: Mapped[str] = mapped_column(String(400), nullable=False)
+    execution_context_id: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    command: Mapped[str] = mapped_column(String(400), nullable=False)
+    cwd: Mapped[str] = mapped_column(String(4000), nullable=False)
+    timeout_seconds: Mapped[int] = mapped_column(nullable=False)
+    stdout: Mapped[str | None] = mapped_column(String(4000), nullable=True)
+    stderr: Mapped[str | None] = mapped_column(String(4000), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=utc_now,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=utc_now,
+        onupdate=utc_now,
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    run: Mapped[RunRecord] = relationship(back_populates="tasks")
+    decision: Mapped["DecisionRecord | None"] = relationship()
+    artifacts: Mapped[list["ArtifactRecord"]] = relationship(
+        back_populates="task",
+        cascade="all, delete-orphan",
+    )
+
+
+class ArtifactRecord(Base):
+    __tablename__ = "artifacts"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("runs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    task_id: Mapped[str] = mapped_column(
+        ForeignKey("tasks.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    decision_id: Mapped[str | None] = mapped_column(
+        ForeignKey("decisions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    artifact_type: Mapped[ArtifactType] = mapped_column(
+        Enum(ArtifactType, native_enum=False),
+        nullable=False,
+    )
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    storage_kind: Mapped[ArtifactStorageKind] = mapped_column(
+        Enum(ArtifactStorageKind, native_enum=False),
+        nullable=False,
+    )
+    path: Mapped[str] = mapped_column(String(4000), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    execution_context_id: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    command: Mapped[str] = mapped_column(String(400), nullable=False)
+    cwd: Mapped[str] = mapped_column(String(4000), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=utc_now,
+    )
+
+    run: Mapped[RunRecord] = relationship(back_populates="artifacts")
+    task: Mapped[TaskRecord] = relationship(back_populates="artifacts")
+    decision: Mapped["DecisionRecord | None"] = relationship()
+
+
 class EventLedgerRecord(Base):
     __tablename__ = "event_ledger"
 
@@ -191,3 +303,5 @@ event.listen(DecisionRecord, "before_update", _prevent_mutation)
 event.listen(DecisionRecord, "before_delete", _prevent_mutation)
 event.listen(ObservationRecord, "before_update", _prevent_mutation)
 event.listen(ObservationRecord, "before_delete", _prevent_mutation)
+event.listen(ArtifactRecord, "before_update", _prevent_mutation)
+event.listen(ArtifactRecord, "before_delete", _prevent_mutation)

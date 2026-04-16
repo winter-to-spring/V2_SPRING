@@ -225,3 +225,168 @@ def test_reject_requires_reason_and_is_visible_in_cli(capsys, monkeypatch, tmp_p
     show_output = capsys.readouterr().out
 
     assert "status:     rejected" in show_output
+
+
+def test_bounded_execution_cli_flow(capsys, monkeypatch, tmp_path: Path) -> None:
+    database_url = f"sqlite+pysqlite:///{tmp_path / 'cli-step5.db'}"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "README.md").write_text("# Demo\n", encoding="utf-8")
+    (workspace / "src").mkdir()
+    (workspace / "src" / "app.py").write_text("print('hello')\n", encoding="utf-8")
+    artifact_root = tmp_path / "artifacts"
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "run",
+            "create",
+            "--project",
+            "demo",
+            "--goal",
+            "Execute a bounded repository scan",
+            "--urgency",
+            "normal",
+            "--risk",
+            "medium",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    create_output = capsys.readouterr().out
+    run_id = create_output.splitlines()[0].split()[-1]
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["v2-spring", "approval", "list", "--database-url", database_url],
+    )
+    main()
+    approval_output = capsys.readouterr().out
+    approval_id = next(
+        line.strip().replace("1. ", "")
+        for line in approval_output.splitlines()
+        if line.startswith("1. ")
+    )
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "approval",
+            "resolve",
+            approval_id,
+            "--approve",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    capsys.readouterr()
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "run",
+            "execute",
+            run_id,
+            "--workspace",
+            str(workspace),
+            "--artifact-root",
+            str(artifact_root),
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    execute_output = capsys.readouterr().out
+
+    assert "Bounded execution finished" in execute_output
+    assert "artifact_sha256:" in execute_output
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "task",
+            "list",
+            "--run",
+            run_id,
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    task_output = capsys.readouterr().out
+    assert "repository_scan" in task_output
+    assert "completed" in task_output
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "artifact",
+            "list",
+            "--run",
+            run_id,
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    artifact_output = capsys.readouterr().out
+    assert "Repository scan report" in artifact_output
+    assert "filesystem_path" in artifact_output
+
+
+def test_run_execute_requires_approved_run(capsys, monkeypatch, tmp_path: Path) -> None:
+    database_url = f"sqlite+pysqlite:///{tmp_path / 'cli-step5-guard.db'}"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "run",
+            "create",
+            "--project",
+            "demo",
+            "--goal",
+            "Fail execution without approval",
+            "--urgency",
+            "normal",
+            "--risk",
+            "medium",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    create_output = capsys.readouterr().out
+    run_id = create_output.splitlines()[0].split()[-1]
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "run",
+            "execute",
+            run_id,
+            "--workspace",
+            str(workspace),
+            "--database-url",
+            database_url,
+        ],
+    )
+    try:
+        main()
+    except SystemExit as exc:
+        assert exc.code == 1
+    else:
+        raise AssertionError("run execute should fail while approval is still pending.")
+
+    execute_output = capsys.readouterr().out
+    assert "requires the run to be ready" in execute_output

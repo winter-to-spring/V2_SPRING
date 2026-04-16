@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 from textwrap import dedent
 
 from pydantic import ValidationError
 
 from v2_spring.config import load_config
 from v2_spring.domain.approval import ApprovalStatus
-from v2_spring.domain.run import RunCreateInput
-from v2_spring.ledger.store import LedgerStore
+from v2_spring.ledger.store import BoundedExecutionResult, LedgerStore
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -56,6 +56,55 @@ def build_parser() -> argparse.ArgumentParser:
     events_parser = run_subparsers.add_parser("events", help="Show ledger events for a run.")
     events_parser.add_argument("run_id", help="Run id to inspect.")
     events_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Override DATABASE_URL for this invocation.",
+    )
+
+    execute_parser = run_subparsers.add_parser(
+        "execute",
+        help="Execute the first bounded task for an approved run.",
+    )
+    execute_parser.add_argument("run_id", help="Run id to execute.")
+    execute_parser.add_argument(
+        "--workspace",
+        default=".",
+        help="Read-only workspace path to scan. Defaults to the current directory.",
+    )
+    execute_parser.add_argument(
+        "--artifact-root",
+        default=".local/artifacts",
+        help="Root directory where bounded execution artifacts should be written.",
+    )
+    execute_parser.add_argument(
+        "--timeout-seconds",
+        default=5,
+        type=int,
+        help="Execution timeout in seconds. Defaults to 5.",
+    )
+    execute_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Override DATABASE_URL for this invocation.",
+    )
+
+    task_parser = subparsers.add_parser("task", help="Inspect bounded execution tasks.")
+    task_subparsers = task_parser.add_subparsers(dest="task_command")
+
+    task_list_parser = task_subparsers.add_parser("list", help="List tasks for a run.")
+    task_list_parser.add_argument("--run", required=True, help="Run id to inspect.")
+    task_list_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Override DATABASE_URL for this invocation.",
+    )
+
+    artifact_parser = subparsers.add_parser("artifact", help="Inspect produced artifacts.")
+    artifact_subparsers = artifact_parser.add_subparsers(dest="artifact_command")
+
+    artifact_list_parser = artifact_subparsers.add_parser("list", help="List artifacts for a run.")
+    artifact_list_parser.add_argument("--run", required=True, help="Run id to inspect.")
+    artifact_list_parser.add_argument(
         "--database-url",
         default=None,
         help="Override DATABASE_URL for this invocation.",
@@ -133,6 +182,8 @@ def _render_events(run_id: str, store: LedgerStore) -> str:
     ledger_events = store.list_events_for_run(run_id)
     decisions = {str(item.id): item for item in store.list_decisions_for_run(run_id)}
     observations = {str(item.id): item for item in store.list_observations_for_run(run_id)}
+    tasks = {str(item.id): item for item in store.list_tasks_for_run(run_id)}
+    artifacts = {str(item.id): item for item in store.list_artifacts_for_run(run_id)}
 
     lines = [
         "Run events",
@@ -161,6 +212,24 @@ def _render_events(run_id: str, store: LedgerStore) -> str:
             if observation is not None:
                 lines.append(f"   summary:     {observation.summary}")
                 lines.append(f"   details:     {observation.details}")
+                continue
+
+        if event.event_type.value in {"TASK_CREATED", "TASK_STARTED", "TASK_COMPLETED", "TASK_FAILED"}:
+            task = tasks.get(event.payload.get("task_id", ""))
+            if task is not None:
+                lines.append(f"   task:        {task.summary}")
+                lines.append(
+                    f"   status:      {event.payload.get('status', task.status.value)}",
+                )
+            lines.append(f"   payload:     {event.payload}")
+            continue
+
+        if event.event_type.value == "ARTIFACT_RECORDED":
+            artifact = artifacts.get(event.payload.get("artifact_id", ""))
+            if artifact is not None:
+                lines.append(f"   artifact:    {artifact.title}")
+                lines.append(f"   path:        {artifact.path}")
+                lines.append(f"   sha256:      {artifact.sha256}")
                 continue
 
         if event.event_type.value in {"APPROVAL_REQUESTED", "APPROVAL_RESOLVED"}:
@@ -225,6 +294,81 @@ def _render_resolved_approval(
     ).strip()
 
 
+def _render_tasks(run_id: str, store: LedgerStore) -> str:
+    tasks = store.list_tasks_for_run(run_id)
+    lines = ["Tasks", "-----", f"run_id: {run_id}"]
+    if not tasks:
+        lines.append("No tasks have been recorded for this run yet.")
+        return "\n".join(lines)
+
+    for index, task in enumerate(tasks, start=1):
+        lines.extend(
+            [
+                "",
+                f"{index}. {task.id}",
+                f"   status:              {task.status.value}",
+                f"   kind:                {task.kind.value}",
+                f"   summary:             {task.summary}",
+                f"   decision_id:         {task.decision_id if task.decision_id else '-'}",
+                f"   execution_context:   {task.execution_context_id}",
+                f"   command:             {task.command}",
+                f"   cwd:                 {task.cwd}",
+                f"   timeout_seconds:     {task.timeout_seconds}",
+                f"   started_at:          {task.started_at.isoformat() if task.started_at else '-'}",
+                f"   completed_at:        {task.completed_at.isoformat() if task.completed_at else '-'}",
+                f"   stdout:              {task.stdout if task.stdout else '-'}",
+                f"   stderr:              {task.stderr if task.stderr else '-'}",
+            ],
+        )
+    return "\n".join(lines)
+
+
+def _render_artifacts(run_id: str, store: LedgerStore) -> str:
+    artifacts = store.list_artifacts_for_run(run_id)
+    lines = ["Artifacts", "---------", f"run_id: {run_id}"]
+    if not artifacts:
+        lines.append("No artifacts have been recorded for this run yet.")
+        return "\n".join(lines)
+
+    for index, artifact in enumerate(artifacts, start=1):
+        lines.extend(
+            [
+                "",
+                f"{index}. {artifact.id}",
+                f"   task_id:             {artifact.task_id}",
+                f"   decision_id:         {artifact.decision_id if artifact.decision_id else '-'}",
+                f"   type:                {artifact.artifact_type.value}",
+                f"   title:               {artifact.title}",
+                f"   storage_kind:        {artifact.storage_kind.value}",
+                f"   path:                {artifact.path}",
+                f"   size_bytes:          {artifact.size_bytes}",
+                f"   sha256:              {artifact.sha256}",
+                f"   execution_context:   {artifact.execution_context_id}",
+                f"   command:             {artifact.command}",
+                f"   cwd:                 {artifact.cwd}",
+                f"   created_at:          {artifact.created_at.isoformat()}",
+            ],
+        )
+    return "\n".join(lines)
+
+
+def _render_execution_result(result: BoundedExecutionResult) -> str:
+    artifact_line = result.artifact.path if result.artifact is not None else "-"
+    hash_line = result.artifact.sha256 if result.artifact is not None else "-"
+    return dedent(
+        f"""\
+        Bounded execution finished
+        --------------------------
+        task_id:             {result.task.id}
+        task_status:         {result.task.status.value}
+        execution_context:   {result.task.execution_context_id}
+        observation:         {result.observation.summary}
+        artifact_path:       {artifact_line}
+        artifact_sha256:     {hash_line}
+        """,
+    ).strip()
+
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
@@ -239,6 +383,8 @@ def main() -> None:
         return
 
     if args.command == "run" and args.run_command == "create":
+        from v2_spring.domain.run import RunCreateInput
+
         try:
             run_input = RunCreateInput(
                 project=args.project,
@@ -275,6 +421,31 @@ def main() -> None:
             raise SystemExit(1) from exc
         return
 
+    if args.command == "run" and args.run_command == "execute":
+        store = _build_store(args.database_url)
+        try:
+            result = store.execute_bounded_task(
+                run_id=args.run_id,
+                workspace=Path(args.workspace),
+                artifact_root=Path(args.artifact_root),
+                timeout_seconds=args.timeout_seconds,
+            )
+            print(_render_execution_result(result))
+        except (LookupError, PermissionError, ValueError, FileNotFoundError, NotADirectoryError) as exc:
+            print(str(exc))
+            raise SystemExit(1) from exc
+        return
+
+    if args.command == "task" and args.task_command == "list":
+        store = _build_store(args.database_url)
+        print(_render_tasks(args.run, store))
+        return
+
+    if args.command == "artifact" and args.artifact_command == "list":
+        store = _build_store(args.database_url)
+        print(_render_artifacts(args.run, store))
+        return
+
     if args.command == "approval" and args.approval_command == "list":
         store = _build_store(args.database_url)
         print(_render_approvals(store, args.status))
@@ -295,26 +466,6 @@ def main() -> None:
                 ),
             )
         except (LookupError, PermissionError, ValueError) as exc:
-            print(str(exc))
-            raise SystemExit(1) from exc
-        return
-
-    if args.command == "approval" and args.approval_command == "list":
-        store = _build_store(args.database_url)
-        print(_render_approvals(store, args.status))
-        return
-
-    if args.command == "approval" and args.approval_command == "resolve":
-        store = _build_store(args.database_url)
-        try:
-            print(
-                _render_resolved_approval(
-                    args.approval_id,
-                    store,
-                    approved=args.approve,
-                ),
-            )
-        except (LookupError, ValueError) as exc:
             print(str(exc))
             raise SystemExit(1) from exc
         return

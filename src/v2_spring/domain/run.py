@@ -30,6 +30,9 @@ class RunStatus(StrEnum):
     WAITING_APPROVAL = "waiting_approval"
     READY = "ready"
     REJECTED = "rejected"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
 
 
 class RunCreateInput(BaseModel):
