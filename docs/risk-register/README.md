@@ -110,7 +110,7 @@ Observed In:
 - ~~[RISK-0001 Approval timeout / deadlock](entries/2026-04-16-approval-timeout.md)~~
 - ~~[RISK-0002 Approval reject reason missing](entries/2026-04-16-approval-reject-reason.md)~~
 - ~~[RISK-0003 Pending approval write barrier missing](entries/2026-04-16-pending-approval-write-barrier.md)~~
-- [RISK-0004 Service-level approval barrier race window](entries/2026-04-16-service-level-barrier-race-window.md)
+- ~~[RISK-0004 Service-level approval barrier race window](entries/2026-04-16-service-level-barrier-race-window.md)~~
 - [RISK-0005 RunSnapshot staleness under concurrent writes](entries/2026-04-16-run-snapshot-staleness.md)
 - [RISK-0006 Snapshot/action read-model growth](entries/2026-04-16-snapshot-read-model-growth.md)
 - ~~[RISK-0007 Possible-actions engine purity drift](entries/2026-04-16-possible-actions-engine-purity.md)~~
@@ -128,3 +128,4 @@ Observed In:
 - ~~[RISK-0019 Single-provider structured output may leak vendor semantics into the core planner transport seam](entries/2026-04-17-provider-schema-lock-in.md)~~
 - ~~[RISK-0020 Provider/network errors may bypass planner governance if they are not normalized at the adapter edge](entries/2026-04-17-provider-error-normalization-leak.md)~~
 - [RISK-0021 Local CLI cancellation may leave an in-flight provider call orphaned after the terminal exits](entries/2026-04-17-provider-cancellation-orphan.md)
+- [RISK-0022 Multi-worker approval gating still needs lease-aware concurrency controls](entries/2026-04-17-multi-worker-approval-concurrency.md)

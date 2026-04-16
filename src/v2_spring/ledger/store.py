@@ -10,7 +10,7 @@ import re
 from typing import Iterator
 from uuid import uuid4
 
-from sqlalchemy import create_engine, inspect, select, text
+from sqlalchemy import create_engine, inspect, select, text, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from v2_spring.domain.approval import ApprovalStatus, ApprovalView
@@ -2125,28 +2125,34 @@ class LedgerStore:
         return masked
 
     @staticmethod
-    def _get_run_for_execution(session: Session, run_id: str) -> RunRecord:
-        run = session.get(RunRecord, run_id)
-        if run is None:
-            raise LookupError(f"Run {run_id} was not found.")
-        if run.status != RunStatus.READY:
-            raise PermissionError(
-                f"Run {run_id} is {run.status.value}; bounded execution requires the run to be ready.",
-            )
-        return run
-
-    @staticmethod
-    def _get_run_for_mutation(
+    def _acquire_run_status_guard(
         session: Session,
         run_id: str,
         *,
         mutation_name: str,
         allow_during_waiting_approval: bool = False,
         allow_during_suspended: bool = False,
+        required_status: RunStatus | None = None,
     ) -> RunRecord:
+        statement = update(RunRecord).where(RunRecord.id == run_id).values(updated_at=RunRecord.updated_at)
+        if required_status is not None:
+            statement = statement.where(RunRecord.status == required_status)
+        else:
+            if not allow_during_waiting_approval:
+                statement = statement.where(RunRecord.status != RunStatus.WAITING_APPROVAL)
+            if not allow_during_suspended:
+                statement = statement.where(RunRecord.status != RunStatus.SUSPENDED)
+
+        rowcount = session.execute(statement).rowcount
         run = session.get(RunRecord, run_id)
         if run is None:
             raise LookupError(f"Run {run_id} was not found.")
+        if rowcount:
+            return run
+        if required_status is not None:
+            raise PermissionError(
+                f"Run {run_id} is {run.status.value}; {mutation_name} requires the run to be {required_status.value}.",
+            )
         if run.status == RunStatus.WAITING_APPROVAL and not allow_during_waiting_approval:
             raise PermissionError(
                 f"Run {run_id} is waiting for approval; {mutation_name} is blocked until approval is resolved.",
@@ -2155,7 +2161,36 @@ class LedgerStore:
             raise PermissionError(
                 f"Run {run_id} is suspended; {mutation_name} is blocked until the timed-out approval is explicitly recovered.",
             )
-        return run
+        raise PermissionError(
+            f"Run {run_id} changed while attempting {mutation_name}; refresh the current state and retry deterministically.",
+        )
+
+    @classmethod
+    def _get_run_for_execution(cls, session: Session, run_id: str) -> RunRecord:
+        return cls._acquire_run_status_guard(
+            session,
+            run_id,
+            mutation_name="bounded execution",
+            required_status=RunStatus.READY,
+        )
+
+    @classmethod
+    def _get_run_for_mutation(
+        cls,
+        session: Session,
+        run_id: str,
+        *,
+        mutation_name: str,
+        allow_during_waiting_approval: bool = False,
+        allow_during_suspended: bool = False,
+    ) -> RunRecord:
+        return cls._acquire_run_status_guard(
+            session,
+            run_id,
+            mutation_name=mutation_name,
+            allow_during_waiting_approval=allow_during_waiting_approval,
+            allow_during_suspended=allow_during_suspended,
+        )
 
     def _finalize_failed_task(
         self,

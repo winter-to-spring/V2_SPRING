@@ -18,7 +18,7 @@ from v2_spring.domain.snapshot import PossibleActionName, SnapshotActionState
 from v2_spring.domain.task import TaskKind, TaskStatus
 from v2_spring.planner.actions import POSSIBLE_ACTIONS_ENGINE_VERSION, evaluate_possible_actions
 from v2_spring.executor.bounded import BoundedExecutorTimeout
-from v2_spring.ledger.models import LedgerEventType, TaskRecord
+from v2_spring.ledger.models import LedgerEventType, RunRecord, TaskRecord
 from v2_spring.ledger.store import LedgerStore
 from v2_spring.planner.proposals import (
     CognitiveDuplicatePlannerProposalError,
@@ -253,6 +253,38 @@ def test_pending_approval_blocks_new_decision_and_observation_until_resolved(tmp
 
     assert decision.kind == DecisionKind.FOLLOW_UP
     assert observation.kind == ObservationKind.FOLLOW_UP
+
+
+def test_mutation_guard_rechecks_current_run_status_before_writing(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    run = store.create_run(
+        RunCreateInput(
+            project="demo",
+            goal="Reject stale mutation attempts when approval reappears.",
+            urgency="normal",
+            risk="medium",
+        ),
+    )
+    approval = store.list_approvals(status=ApprovalStatus.PENDING)[0]
+    store.resolve_approval(str(approval.id), approved=True)
+    ready_view = store.get_run(str(run.id))
+    assert ready_view is not None
+    assert ready_view.status == RunStatus.READY
+
+    with store.session() as session:
+        record = session.get(RunRecord, str(run.id))
+        assert record is not None
+        record.status = RunStatus.WAITING_APPROVAL
+
+    with pytest.raises(PermissionError) as exc_info:
+        store.record_decision(
+            run_id=str(run.id),
+            kind=DecisionKind.FOLLOW_UP,
+            summary="This stale caller still thinks the run is ready.",
+            rationale="The guarded mutation should re-check current status before writing.",
+        )
+
+    assert "waiting for approval" in str(exc_info.value)
 
 
 def test_bounded_execution_persists_task_artifact_and_ledger(tmp_path: Path) -> None:
