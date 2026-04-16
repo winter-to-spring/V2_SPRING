@@ -7,8 +7,17 @@ from textwrap import dedent
 
 from pydantic import ValidationError
 
+from v2_spring.adapters.langgraph_planner import (
+    LangGraphPlannerAdapter,
+    ScriptedStructuredPlannerTransport,
+)
 from v2_spring.config import load_config
 from v2_spring.domain.approval import ApprovalStatus
+from v2_spring.domain.planner_adapter import (
+    ActionProposal,
+    EscalationProposal,
+    PlannerInvocationProofView,
+)
 from v2_spring.domain.planner_attempt import PlannerAttemptView
 from v2_spring.domain.proposal import PlannerProposalInput, PlannerProposalView
 from v2_spring.domain.replay import ArtifactInspectionView, RunReplayView, TaskReplayView
@@ -19,6 +28,8 @@ from v2_spring.planner.proposals import (
     CognitiveDuplicatePlannerProposalError,
     IllegalPlannerProposalError,
     PlannerPhaseExhaustedError,
+    PlannerAdapterFormatError,
+    PlannerStaleQuotaExhaustedError,
     StalePlannerProposalError,
     TransportDuplicatePlannerProposalError,
 )
@@ -346,6 +357,33 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override DATABASE_URL for this invocation.",
     )
+
+    planner_invoke_parser = planner_subparsers.add_parser(
+        "invoke",
+        help="Invoke the bounded LangGraph planner adapter and validate the result.",
+    )
+    planner_invoke_parser.add_argument("run_id", help="Run id to target.")
+    planner_invoke_parser.add_argument(
+        "--scripted-response-json",
+        default=None,
+        help="Single structured planner response payload as JSON for CLI proofing.",
+    )
+    planner_invoke_parser.add_argument(
+        "--scripted-response-file",
+        default=None,
+        help="Path to a JSON file containing one object or a list of objects for scripted planner responses.",
+    )
+    planner_invoke_parser.add_argument(
+        "--format",
+        default="pretty",
+        choices=["pretty", "json"],
+        help="Output format. Defaults to pretty.",
+    )
+    planner_invoke_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Override DATABASE_URL for this invocation.",
+    )
     return parser
 
 
@@ -584,6 +622,12 @@ def _render_snapshot(snapshot: RunSnapshotView) -> str:
         f"action_state_reason: {snapshot.action_state_reason}",
         f"latest_decision:     {snapshot.latest_decision_summary if snapshot.latest_decision_summary else '-'}",
         f"latest_rejection:    {snapshot.latest_rejection_reason if snapshot.latest_rejection_reason else '-'}",
+        f"planner_budget:      {snapshot.planner_budget_used}/{snapshot.planner_budget_limit}",
+        f"planner_remaining:   {snapshot.planner_budget_remaining}",
+        f"planner_exhausted:   {snapshot.planner_phase_exhausted}",
+        f"stale_quota:         {snapshot.planner_stale_quota_used}/{snapshot.planner_stale_quota_limit}",
+        f"stale_remaining:     {snapshot.planner_stale_quota_remaining}",
+        f"stale_exhausted:     {snapshot.planner_stale_quota_exhausted}",
         "",
         "Task summary",
         "------------",
@@ -644,6 +688,8 @@ def _render_actions(evaluation: PossibleActionEvaluationView) -> str:
         f"state_hash:          {evaluation.snapshot.state_hash}",
         f"action_state:        {evaluation.snapshot.action_state.value}",
         f"action_state_reason: {evaluation.snapshot.action_state_reason}",
+        f"planner_budget:      {evaluation.snapshot.planner_budget_used}/{evaluation.snapshot.planner_budget_limit}",
+        f"stale_quota:         {evaluation.snapshot.planner_stale_quota_used}/{evaluation.snapshot.planner_stale_quota_limit}",
     ]
     if not evaluation.actions:
         lines.extend(["", "No legal next actions are available."])
@@ -697,6 +743,84 @@ def _render_planner_proposals(proposals: list[PlannerProposalView], *, run_id: s
                 f"   rationale:         {proposal.rationale}",
                 f"   expected_outcome:  {proposal.expected_outcome}",
                 f"   created_at:        {proposal.created_at.isoformat()}",
+            ],
+        )
+    return "\n".join(lines)
+
+
+def _load_scripted_planner_responses(*, inline_json: str | None, file_path: str | None) -> list[object]:
+    responses: list[object] = []
+    if inline_json is not None:
+        responses.append(json.loads(inline_json))
+    if file_path is not None:
+        payload = json.loads(Path(file_path).read_text(encoding="utf-8"))
+        if isinstance(payload, list):
+            responses.extend(payload)
+        else:
+            responses.append(payload)
+    if not responses:
+        raise ValueError(
+            "planner invoke currently requires --scripted-response-json or --scripted-response-file for proofing.",
+        )
+    return responses
+
+
+def _render_planner_invocation(proof: PlannerInvocationProofView) -> str:
+    lines = [
+        "Planner invocation",
+        "------------------",
+        f"run_id:               {proof.run_id}",
+        f"policy_version:       {proof.policy_version}",
+        f"snapshot_hash:        {proof.snapshot_hash}",
+        f"format_failures:      {proof.format_failures}",
+        f"stale_quota_exhausted:{proof.stale_quota_exhausted}",
+        "",
+        "Context window",
+        "--------------",
+        f"legal_actions:        {', '.join(action.name.value for action in proof.context_window.legal_actions) or '-'}",
+        f"masked_actions:       {', '.join(action.name.value for action in proof.context_window.masked_actions) or '-'}",
+        f"recent_attempts:      {len(proof.context_window.recent_attempts)}",
+        f"latest_rejection:     {proof.context_window.latest_rejection_reason if proof.context_window.latest_rejection_reason else '-'}",
+    ]
+    if proof.context_window.failure_report is not None:
+        report = proof.context_window.failure_report
+        lines.extend(
+            [
+                "",
+                "Failure report",
+                "--------------",
+                f"failure_class:       {report.failure_class.value}",
+                f"error_code:          {report.error_code}",
+                f"streak:              {report.repeated_failure_streak}",
+                f"deterministic:       {report.deterministic}",
+                f"observed_outcome:    {report.observed_outcome}",
+                f"short_traceback:     {report.short_traceback if report.short_traceback else '-'}",
+            ],
+        )
+
+    lines.extend(["", "Adapter output", "--------------"])
+    output = proof.parsed_output
+    if isinstance(output, ActionProposal):
+        lines.extend(
+            [
+                f"kind:                {output.kind}",
+                f"confidence:          {output.confidence.value}",
+                f"selected_action:     {output.selected_action.value}",
+                f"analysis_summary:    {output.analysis_summary}",
+                f"expected_outcome:    {output.expected_outcome}",
+                f"accepted_decision_id:{proof.accepted_decision_id if proof.accepted_decision_id else '-'}",
+            ],
+        )
+    elif isinstance(output, EscalationProposal):
+        lines.extend(
+            [
+                f"kind:                {output.kind}",
+                f"confidence:          {output.confidence.value}",
+                f"help_kind:           {output.help_kind.value}",
+                f"analysis_summary:    {output.analysis_summary}",
+                f"blocking_reason:     {output.blocking_reason}",
+                f"requested_help:      {output.requested_help}",
+                f"escalation_obs_id:   {proof.escalation_observation_id if proof.escalation_observation_id else '-'}",
             ],
         )
     return "\n".join(lines)
@@ -1116,6 +1240,7 @@ def main() -> None:
             LookupError,
             IllegalPlannerProposalError,
             StalePlannerProposalError,
+            PlannerStaleQuotaExhaustedError,
             TransportDuplicatePlannerProposalError,
             CognitiveDuplicatePlannerProposalError,
             PlannerPhaseExhaustedError,
@@ -1159,6 +1284,83 @@ def main() -> None:
             else:
                 print(_render_planner_attempt(attempt))
         except (LookupError, PermissionError, ValueError) as exc:
+            print(str(exc))
+            raise SystemExit(1) from exc
+        return
+
+    if args.command == "planner" and args.planner_command == "invoke":
+        store = _build_store(args.database_url)
+        try:
+            context = store.build_planner_context(args.run_id)
+            scripted_responses = _load_scripted_planner_responses(
+                inline_json=args.scripted_response_json,
+                file_path=args.scripted_response_file,
+            )
+            adapter = LangGraphPlannerAdapter(
+                transport=ScriptedStructuredPlannerTransport(scripted_responses),
+            )
+            try:
+                parsed_output, format_failures = adapter.invoke(context)
+            except PlannerAdapterFormatError as exc:
+                store.record_planner_format_failure(
+                    run_id=args.run_id,
+                    snapshot_hash=context.snapshot.state_hash,
+                    reason=str(exc),
+                )
+                raise
+
+            accepted_decision_id = None
+            escalation_observation_id = None
+            if isinstance(parsed_output, ActionProposal):
+                recorded = store.record_planner_proposal(
+                    run_id=args.run_id,
+                    proposal=PlannerProposalInput(
+                        snapshot_hash=context.snapshot.state_hash,
+                        selected_action=parsed_output.selected_action,
+                        rationale=parsed_output.analysis_summary,
+                        expected_outcome=parsed_output.expected_outcome,
+                    ),
+                )
+                accepted_decision_id = recorded.decision_id
+            elif isinstance(parsed_output, EscalationProposal):
+                observation = store.record_planner_escalation(
+                    run_id=args.run_id,
+                    snapshot_hash=context.snapshot.state_hash,
+                    analysis_summary=parsed_output.analysis_summary,
+                    confidence=parsed_output.confidence.value,
+                    help_kind=parsed_output.help_kind.value,
+                    blocking_reason=parsed_output.blocking_reason,
+                    requested_help=parsed_output.requested_help,
+                )
+                escalation_observation_id = observation.id
+
+            proof = PlannerInvocationProofView(
+                run_id=context.snapshot.run.id,
+                policy_version=context.snapshot.policy_version,
+                snapshot_hash=context.snapshot.state_hash,
+                context_window=context,
+                parsed_output=parsed_output,
+                format_failures=format_failures,
+                accepted_decision_id=accepted_decision_id,
+                escalation_observation_id=escalation_observation_id,
+                stale_quota_exhausted=context.snapshot.planner_stale_quota_exhausted,
+            )
+            if args.format == "json":
+                print(json.dumps(proof.model_dump(mode="json"), indent=2, ensure_ascii=False))
+            else:
+                print(_render_planner_invocation(proof))
+        except (
+            LookupError,
+            ValueError,
+            PlannerAdapterFormatError,
+            IllegalPlannerProposalError,
+            StalePlannerProposalError,
+            PlannerStaleQuotaExhaustedError,
+            TransportDuplicatePlannerProposalError,
+            CognitiveDuplicatePlannerProposalError,
+            PlannerPhaseExhaustedError,
+            PermissionError,
+        ) as exc:
             print(str(exc))
             raise SystemExit(1) from exc
         return

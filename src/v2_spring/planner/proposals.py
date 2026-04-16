@@ -5,6 +5,10 @@ class StalePlannerProposalError(ValueError):
     """Raised when a proposal was created against an old snapshot hash."""
 
 
+class PlannerStaleQuotaExhaustedError(PermissionError):
+    """Raised when repeated stale attempts exhaust the separate stale quota."""
+
+
 class IllegalPlannerProposalError(PermissionError):
     """Raised when the selected action is not currently legal for the run."""
 
@@ -19,3 +23,7 @@ class CognitiveDuplicatePlannerProposalError(PermissionError):
 
 class PlannerPhaseExhaustedError(PermissionError):
     """Raised when the current phase has no planner attempt budget left."""
+
+
+class PlannerAdapterFormatError(ValueError):
+    """Raised when the planner adapter cannot parse a structured response."""

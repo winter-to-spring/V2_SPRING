@@ -100,6 +100,10 @@ class RunSnapshotView(BaseModel):
     planner_budget_used: int = Field(ge=0)
     planner_budget_remaining: int = Field(ge=0)
     planner_phase_exhausted: bool = False
+    planner_stale_quota_limit: int = Field(ge=1)
+    planner_stale_quota_used: int = Field(ge=0)
+    planner_stale_quota_remaining: int = Field(ge=0)
+    planner_stale_quota_exhausted: bool = False
     latest_planner_attempt_summary: str | None
     task_summary: TaskStatusSummary
     latest_task: TaskHeadlineView | None

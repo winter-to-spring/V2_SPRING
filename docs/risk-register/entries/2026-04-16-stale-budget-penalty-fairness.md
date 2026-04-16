@@ -1,13 +1,13 @@
 # Risk ID: RISK-0014
-Title: Stale planner proposals currently consume phase budget even when the fault is systemic timing drift
+Title: ~~Stale planner proposals currently consume phase budget even when the fault is systemic timing drift~~
 Class: Before Next Phase
-Status: Open
+Status: Resolved
 Owner: Core / Planner governance
 Observed In: Step 9 post-implementation review
 
 ## Description
 
-Step 9 currently counts `rejected_stale` as a budget-consuming planner failure.
+Step 9 initially counted `rejected_stale` as a budget-consuming planner failure.
 
 That is a simple deterministic rule, but it may be unfair in the cases where
 the stale hash was caused by:
@@ -36,10 +36,9 @@ can become a concurrency penalty instead of a planning safeguard.
 
 ## Suggested Mitigation
 
-- reconsider whether `rejected_stale` should consume planner budget
-- or split stale into a separate freshness counter / backoff policy
+- split stale into a separate freshness counter / backoff policy
 - include stale-rate diagnostics in replay and planner analytics
-- revisit this before real planner attachment or asynchronous state mutation
+- keep stale fairness explicit before real planner attachment
 
 ## Capability Gate
 - Capability: real planner adapter / asynchronous proposal submission
@@ -57,6 +56,7 @@ can become a concurrency penalty instead of a planning safeguard.
 
 - stale handling policy is explicit and justified
 - planner budget cannot be exhausted accidentally by timing churn alone
+- `stale` attempts use a separate stale quota rather than the main phase budget
 
 ## Last Updated
-- 2026-04-16
+- 2026-04-17

@@ -15,6 +15,14 @@ from v2_spring.domain.approval import ApprovalStatus, ApprovalView
 from v2_spring.domain.artifact import ArtifactStorageKind, ArtifactType, ArtifactView
 from v2_spring.domain.decision import DecisionKind, DecisionView
 from v2_spring.domain.observation import ObservationKind, ObservationView
+from v2_spring.domain.planner_adapter import (
+    EscalationProposal,
+    FailureClass,
+    FailureReportView,
+    MaskedActionView,
+    PlannerAttemptDigest,
+    PlannerContextWindow,
+)
 from v2_spring.domain.planner_attempt import (
     PlannerAttemptOutcome,
     PlannerAttemptView,
@@ -25,6 +33,7 @@ from v2_spring.domain.replay import ArtifactInspectionView, RunReplayView, TaskR
 from v2_spring.domain.run import RunCreateInput, RunStatus, RunView
 from v2_spring.domain.snapshot import (
     ArtifactHeadlineView,
+    PossibleActionView,
     PossibleActionName,
     RunSnapshotView,
     SnapshotActionState,
@@ -53,9 +62,11 @@ from v2_spring.ledger.models import (
 )
 from v2_spring.planner.actions import POSSIBLE_ACTIONS_ENGINE_VERSION, evaluate_possible_actions
 from v2_spring.planner.proposals import (
+    PlannerAdapterFormatError,
     CognitiveDuplicatePlannerProposalError,
     IllegalPlannerProposalError,
     PlannerPhaseExhaustedError,
+    PlannerStaleQuotaExhaustedError,
     StalePlannerProposalError,
     TransportDuplicatePlannerProposalError,
 )
@@ -74,12 +85,18 @@ class LedgerStore:
     """Typed persistence boundary for V2_SPRING tracer-bullet state and events."""
 
     # Approval should pause stateful progression, not blind the system.
-    _APPROVAL_SAFE_OBSERVATION_KINDS = frozenset({ObservationKind.SYSTEM_AUDIT})
+    _APPROVAL_SAFE_OBSERVATION_KINDS = frozenset(
+        {
+            ObservationKind.SYSTEM_AUDIT,
+            ObservationKind.PLANNER_ESCALATION,
+        },
+    )
     _PLANNER_PHASE_BUDGET_LIMIT = 3
+    _PLANNER_STALE_QUOTA_LIMIT = 3
     _PLANNER_BUDGET_CONSUMING_OUTCOMES = frozenset(
         {
-            PlannerAttemptOutcome.REJECTED_STALE,
             PlannerAttemptOutcome.REJECTED_ILLEGAL,
+            PlannerAttemptOutcome.REJECTED_FORMAT,
             PlannerAttemptOutcome.REJECTED_DUPLICATE_COGNITIVE,
         },
     )
@@ -629,6 +646,10 @@ class LedgerStore:
                 "planner_budget_used": planner_governance.budget_used,
                 "planner_budget_remaining": planner_governance.budget_remaining,
                 "planner_phase_exhausted": planner_governance.exhausted,
+                "planner_stale_quota_limit": planner_governance.stale_quota_limit,
+                "planner_stale_quota_used": planner_governance.stale_quota_used,
+                "planner_stale_quota_remaining": planner_governance.stale_quota_remaining,
+                "planner_stale_quota_exhausted": planner_governance.stale_quota_exhausted,
                 "latest_planner_attempt_summary": planner_governance.latest_attempt_summary,
                 "task_summary": task_summary.model_dump(mode="json"),
                 "latest_task": latest_task.model_dump(mode="json") if latest_task else None,
@@ -653,6 +674,10 @@ class LedgerStore:
                 planner_budget_used=planner_governance.budget_used,
                 planner_budget_remaining=planner_governance.budget_remaining,
                 planner_phase_exhausted=planner_governance.exhausted,
+                planner_stale_quota_limit=planner_governance.stale_quota_limit,
+                planner_stale_quota_used=planner_governance.stale_quota_used,
+                planner_stale_quota_remaining=planner_governance.stale_quota_remaining,
+                planner_stale_quota_exhausted=planner_governance.stale_quota_exhausted,
                 latest_planner_attempt_summary=planner_governance.latest_attempt_summary,
                 task_summary=task_summary,
                 latest_task=latest_task,
@@ -726,7 +751,7 @@ class LedgerStore:
                 )
 
         if proposal.snapshot_hash != evaluation.snapshot.state_hash:
-            budget_used = governance.budget_used + 1
+            stale_used = governance.stale_quota_used + 1
             self._record_planner_attempt(
                 run_id=run_id,
                 phase_key=governance.phase_key,
@@ -742,7 +767,7 @@ class LedgerStore:
                 ),
                 budget_used=governance.budget_used,
                 budget_limit=governance.budget_limit,
-                consume_budget=True,
+                consume_budget=False,
             )
             self.record_observation(
                 run_id=run_id,
@@ -756,16 +781,15 @@ class LedgerStore:
                     f"current_hash={evaluation.snapshot.state_hash}."
                 ),
             )
-            if budget_used >= governance.budget_limit:
-                self._record_phase_exhaustion(
-                    run_id=run_id,
-                    governance=governance,
-                    snapshot_hash=evaluation.snapshot.state_hash,
-                    reason="Planner phase budget was exhausted after a stale proposal attempt.",
+            if stale_used >= governance.stale_quota_limit:
+                raise PlannerStaleQuotaExhaustedError(
+                    "Planner proposal snapshot hash is stale and the separate stale quota is exhausted. "
+                    "Wait for state to stabilize or ask the founder to inspect the run before proposing again.",
                 )
             raise StalePlannerProposalError(
                 "Planner proposal snapshot hash is stale; refresh the run snapshot before proposing again. "
-                f"Provided={proposal.snapshot_hash}, current={evaluation.snapshot.state_hash}.",
+                f"Provided={proposal.snapshot_hash}, current={evaluation.snapshot.state_hash}. "
+                f"Stale quota {stale_used}/{governance.stale_quota_limit}.",
             )
         if proposal.selected_action not in legal_actions:
             budget_used = governance.budget_used + 1
@@ -1068,6 +1092,230 @@ class LedgerStore:
             )
         return proposals
 
+    def build_failure_report(self, run_id: str) -> FailureReportView | None:
+        """Return the latest sanitized execution failure summary for planner context."""
+
+        replay = self.build_run_replay(run_id)
+        failed_tasks = [task for task in replay.tasks if task.task.status == TaskStatus.FAILED]
+        if not failed_tasks:
+            return None
+
+        latest_failed = failed_tasks[-1]
+        failure_text = latest_failed.task.stderr or latest_failed.task.failure_hint or latest_failed.task.summary
+        failure_class, error_code = self._classify_failure(failure_text)
+        deterministic = failure_class == FailureClass.DETERMINISTIC_RUNTIME
+        normalized_signature = self._build_failure_signature(
+            error_code=error_code,
+            task_kind=latest_failed.task.kind.value,
+            failure_text=failure_text,
+        )
+        streak = 0
+        for task_replay in reversed(failed_tasks):
+            comparison_text = task_replay.task.stderr or task_replay.task.failure_hint or task_replay.task.summary
+            comparison_class, comparison_error_code = self._classify_failure(comparison_text)
+            comparison_signature = self._build_failure_signature(
+                error_code=comparison_error_code,
+                task_kind=task_replay.task.kind.value,
+                failure_text=comparison_text,
+            )
+            if comparison_signature != normalized_signature:
+                break
+            streak += 1
+
+        proposals = self.list_planner_proposals_for_run(run_id)
+        latest_proposal = proposals[-1] if proposals else None
+        return FailureReportView(
+            failure_class=failure_class,
+            error_code=error_code,
+            short_traceback=self._sanitize_planner_text(failure_text, limit=500),
+            normalized_failure_signature=normalized_signature,
+            previous_rationale=(
+                self._sanitize_planner_text(latest_proposal.rationale, limit=4000)
+                if latest_proposal is not None
+                else None
+            ),
+            observed_outcome=self._sanitize_planner_text(
+                latest_failed.task.stderr or latest_failed.task.summary,
+                limit=500,
+            )
+            or "Task failed without a normalized failure hint.",
+            repeated_failure_streak=max(streak, 1),
+            deterministic=deterministic,
+        )
+
+    def build_planner_context(self, run_id: str) -> PlannerContextWindow:
+        """Assemble the bounded, sanitized planner context window for one run."""
+
+        snapshot = self.build_run_snapshot(run_id)
+        evaluation = evaluate_possible_actions(snapshot)
+        governance = self.build_planner_governance(run_id)
+        recent_attempts = [
+            PlannerAttemptDigest(
+                outcome=attempt.outcome,
+                selected_action=attempt.selected_action,
+                outcome_reason=self._sanitize_planner_text(attempt.outcome_reason, limit=600)
+                or "Planner attempt ended without a normalized reason.",
+                created_at=attempt.created_at,
+            )
+            for attempt in governance.attempts[-3:]
+        ]
+        failure_report = self.build_failure_report(run_id)
+        masked_actions = self._build_masked_actions(
+            actions=evaluation.actions,
+            failure_report=failure_report,
+        )
+        masked_action_names = {item.name for item in masked_actions}
+        legal_actions = [action for action in evaluation.actions if action.name not in masked_action_names]
+        return PlannerContextWindow(
+            snapshot=evaluation.snapshot,
+            legal_actions=legal_actions,
+            masked_actions=masked_actions,
+            recent_attempts=recent_attempts,
+            latest_rejection_reason=self._sanitize_planner_text(
+                evaluation.snapshot.latest_rejection_reason,
+                limit=4000,
+            ),
+            failure_report=failure_report,
+            stale_quota_limit=governance.stale_quota_limit,
+            stale_quota_used=governance.stale_quota_used,
+            stale_quota_remaining=governance.stale_quota_remaining,
+        )
+
+    def record_planner_escalation(
+        self,
+        *,
+        run_id: str,
+        snapshot_hash: str,
+        analysis_summary: str,
+        confidence: str,
+        help_kind: str,
+        blocking_reason: str,
+        requested_help: str,
+    ) -> ObservationView:
+        """Persist one accepted planner escalation request as a governed observation."""
+
+        snapshot = self.build_run_snapshot(run_id)
+        governance = self.build_planner_governance(run_id)
+        proposal_fingerprint = sha256(
+            json.dumps(
+                {
+                    "snapshot_hash": snapshot_hash,
+                    "analysis_summary": analysis_summary.strip(),
+                    "help_kind": help_kind,
+                    "blocking_reason": blocking_reason.strip(),
+                    "requested_help": requested_help.strip(),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8"),
+        ).hexdigest()
+
+        existing_duplicate = next(
+            (
+                attempt
+                for attempt in governance.attempts
+                if attempt.proposal_fingerprint == proposal_fingerprint
+                and attempt.outcome
+                in {
+                    PlannerAttemptOutcome.ACCEPTED,
+                    PlannerAttemptOutcome.REJECTED_DUPLICATE_COGNITIVE,
+                }
+            ),
+            None,
+        )
+        if existing_duplicate is not None:
+            self._record_planner_attempt(
+                run_id=run_id,
+                phase_key=governance.phase_key,
+                policy_version=governance.policy_version,
+                snapshot_hash=snapshot.state_hash,
+                selected_action=None,
+                submission_key=None,
+                proposal_fingerprint=proposal_fingerprint,
+                outcome=PlannerAttemptOutcome.REJECTED_DUPLICATE_COGNITIVE,
+                outcome_reason="The planner repeated the same escalation request inside the current phase.",
+                budget_used=governance.budget_used,
+                budget_limit=governance.budget_limit,
+                consume_budget=True,
+            )
+            raise CognitiveDuplicatePlannerProposalError(
+                f"Planner escalation was rejected as a cognitive duplicate for phase {governance.phase_key}.",
+            )
+
+        self._record_planner_attempt(
+            run_id=run_id,
+            phase_key=governance.phase_key,
+            policy_version=governance.policy_version,
+            snapshot_hash=snapshot_hash,
+            selected_action=None,
+            submission_key=None,
+            proposal_fingerprint=proposal_fingerprint,
+            outcome=PlannerAttemptOutcome.ACCEPTED,
+            outcome_reason="Planner escalation request was accepted and routed to the founder.",
+            budget_used=governance.budget_used,
+            budget_limit=governance.budget_limit,
+            consume_budget=False,
+        )
+        return self.record_observation(
+            run_id=run_id,
+            kind=ObservationKind.PLANNER_ESCALATION,
+            summary="Planner requested founder help instead of selecting a legal action.",
+            details=(
+                f"escalation_target=founder; "
+                f"confidence={confidence}; "
+                f"help_kind={help_kind}; "
+                f"analysis_summary={self._sanitize_planner_text(analysis_summary, limit=500)}; "
+                f"blocking_reason={self._sanitize_planner_text(blocking_reason, limit=500)}; "
+                f"requested_help={self._sanitize_planner_text(requested_help, limit=500)}."
+            ),
+        )
+
+    def record_planner_format_failure(
+        self,
+        *,
+        run_id: str,
+        snapshot_hash: str,
+        reason: str,
+    ) -> PlannerAttemptView:
+        """Persist one planner adapter format failure without mutating legal state."""
+
+        governance = self.build_planner_governance(run_id)
+        attempt = self._record_planner_attempt(
+            run_id=run_id,
+            phase_key=governance.phase_key,
+            policy_version=governance.policy_version,
+            snapshot_hash=snapshot_hash,
+            selected_action=None,
+            submission_key=None,
+            proposal_fingerprint=None,
+            outcome=PlannerAttemptOutcome.REJECTED_FORMAT,
+            outcome_reason=reason,
+            budget_used=governance.budget_used,
+            budget_limit=governance.budget_limit,
+            consume_budget=True,
+        )
+        self.record_observation(
+            run_id=run_id,
+            kind=ObservationKind.SYSTEM_AUDIT,
+            summary="Planner adapter rejected a malformed structured response.",
+            details=(
+                f"error_code={PlannerAttemptOutcome.REJECTED_FORMAT.value}; "
+                f"snapshot_hash={snapshot_hash}; "
+                f"reason={self._sanitize_planner_text(reason, limit=500)}."
+            ),
+        )
+        if attempt.budget_remaining == 0:
+            snapshot = self.build_run_snapshot(run_id)
+            refreshed_governance = self.build_planner_governance(run_id)
+            self._record_phase_exhaustion(
+                run_id=run_id,
+                governance=refreshed_governance,
+                snapshot_hash=snapshot.state_hash,
+                reason="Planner phase budget was exhausted after repeated adapter format failures.",
+            )
+        return attempt
+
     def execute_bounded_task(
         self,
         *,
@@ -1217,6 +1465,73 @@ class LedgerStore:
         if not cleaned:
             raise ValueError("Text fields must not be blank when provided.")
         return cleaned
+
+    @staticmethod
+    def _sanitize_planner_text(value: str | None, *, limit: int) -> str | None:
+        if value is None:
+            return None
+        cleaned = " ".join(value.replace("\r", "\n").split())
+        if not cleaned:
+            return None
+        redacted = cleaned.replace("/Users/changhyeon/Desktop/AI AGENT", "[workspace]")
+        return redacted[:limit]
+
+    @classmethod
+    def _classify_failure(cls, failure_text: str) -> tuple[FailureClass, str]:
+        normalized = failure_text.lower()
+        if any(token in normalized for token in ("permission denied", "forbidden", "403")):
+            return FailureClass.DETERMINISTIC_RUNTIME, "permission_denied"
+        if any(token in normalized for token in ("no such file", "not found", "enoent")):
+            return FailureClass.DETERMINISTIC_RUNTIME, "path_not_found"
+        if any(token in normalized for token in ("timed out", "timeout", "deadline exceeded")):
+            return FailureClass.TRANSIENT_INFRASTRUCTURE, "timeout"
+        if any(token in normalized for token in ("service unavailable", "502", "503", "504", "rate limit", "429")):
+            return FailureClass.TRANSIENT_INFRASTRUCTURE, "service_unavailable"
+        return FailureClass.UNKNOWN_RUNTIME, "unknown_runtime_failure"
+
+    @classmethod
+    def _build_failure_signature(
+        cls,
+        *,
+        error_code: str,
+        task_kind: str,
+        failure_text: str,
+    ) -> str:
+        payload = {
+            "error_code": error_code,
+            "task_kind": task_kind,
+            "failure_excerpt": cls._sanitize_planner_text(failure_text, limit=200),
+        }
+        return sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        ).hexdigest()
+
+    @classmethod
+    def _build_masked_actions(
+        cls,
+        *,
+        actions: list[PossibleActionView],
+        failure_report: FailureReportView | None,
+    ) -> list[MaskedActionView]:
+        if failure_report is None:
+            return []
+        if not failure_report.deterministic:
+            return []
+        if failure_report.repeated_failure_streak < 2:
+            return []
+        masked: list[MaskedActionView] = []
+        for action in actions:
+            if action.name == PossibleActionName.EXECUTE_BOUNDED_TASK:
+                masked.append(
+                    MaskedActionView(
+                        name=action.name,
+                        reason=(
+                            "The latest deterministic execution failure repeated without state advancement. "
+                            "Use replanning or founder escalation before trying the same execution again."
+                        ),
+                    ),
+                )
+        return masked
 
     @staticmethod
     def _get_run_for_execution(session: Session, run_id: str) -> RunRecord:
@@ -1703,6 +2018,11 @@ class LedgerStore:
             for record in active_records
             if record.outcome in self._PLANNER_BUDGET_CONSUMING_OUTCOMES
         )
+        stale_quota_used = sum(
+            1
+            for record in active_records
+            if record.outcome == PlannerAttemptOutcome.REJECTED_STALE
+        )
         exhausted = any(
             record.outcome == PlannerAttemptOutcome.PHASE_EXHAUSTED
             for record in active_records
@@ -1722,6 +2042,10 @@ class LedgerStore:
             budget_used=budget_used,
             budget_remaining=max(self._PLANNER_PHASE_BUDGET_LIMIT - budget_used, 0),
             exhausted=exhausted,
+            stale_quota_limit=self._PLANNER_STALE_QUOTA_LIMIT,
+            stale_quota_used=stale_quota_used,
+            stale_quota_remaining=max(self._PLANNER_STALE_QUOTA_LIMIT - stale_quota_used, 0),
+            stale_quota_exhausted=stale_quota_used >= self._PLANNER_STALE_QUOTA_LIMIT,
             recharge_count=len(recharge_indices),
             latest_attempt_summary=latest_attempt_summary,
             attempts=[self._to_planner_attempt_view(record) for record in active_records],
