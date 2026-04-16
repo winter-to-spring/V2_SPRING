@@ -806,6 +806,84 @@ def test_build_planner_context_includes_structured_failure_report(
     assert context.legal_actions[0].name == PossibleActionName.REPLAN_FROM_FAILED_EXECUTION
 
 
+def test_failure_report_preserves_error_code_trace_and_previous_rationale(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = make_store(tmp_path)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    run = store.create_run(
+        RunCreateInput(
+            project="demo",
+            goal="Keep enough signal in the failure report for planner self-correction",
+            urgency="normal",
+            risk="medium",
+        ),
+    )
+    approval = store.list_approvals(status=ApprovalStatus.PENDING)[0]
+    store.resolve_approval(str(approval.id), approved=True)
+
+    proposal = store.record_planner_proposal(
+        run_id=str(run.id),
+        proposal=PlannerProposalInput(
+            snapshot_hash=store.build_run_snapshot(str(run.id)).state_hash,
+            selected_action=PossibleActionName.EXECUTE_BOUNDED_TASK,
+            rationale="Inspect the repository structure before attempting any broader orchestration change.",
+            expected_outcome="A bounded repository scan should either succeed or explain the concrete blocker.",
+        ),
+    )
+
+    def fail_executor(*, workspace: Path, timeout_seconds: int, execution_context_id: str | None = None):
+        raise PermissionError(
+            "Permission denied while reading /Users/changhyeon/Desktop/AI AGENT/.env during the repository scan.",
+        )
+
+    monkeypatch.setattr("v2_spring.ledger.store.execute_repository_scan", fail_executor)
+
+    result = store.execute_bounded_task(
+        run_id=str(run.id),
+        workspace=workspace,
+        artifact_root=tmp_path / "artifacts",
+        timeout_seconds=1,
+    )
+    context = store.build_planner_context(str(run.id))
+
+    assert result.task.status == TaskStatus.FAILED
+    assert context.failure_report is not None
+    assert context.failure_report.failure_class.value == "deterministic_runtime"
+    assert context.failure_report.error_code == "permission_denied"
+    assert context.failure_report.previous_rationale == proposal.rationale
+    assert "Permission denied" in context.failure_report.short_traceback
+    assert "[workspace]" in context.failure_report.short_traceback
+    assert "/Users/changhyeon/Desktop/AI AGENT" not in context.failure_report.short_traceback
+    assert "Permission denied" in context.failure_report.observed_outcome
+
+
+@pytest.mark.parametrize(
+    ("failure_text", "expected_class", "expected_code"),
+    [
+        ("Permission denied while reading a private file", "deterministic_runtime", "permission_denied"),
+        ("No such file or directory: repo/missing.py", "deterministic_runtime", "path_not_found"),
+        ("Executor timed out after waiting for network storage", "transient_infrastructure", "timeout"),
+        ("429 rate limit from upstream provider", "transient_infrastructure", "service_unavailable"),
+        ("Unexpected parser failure", "unknown_runtime", "unknown_runtime_failure"),
+    ],
+)
+def test_failure_classifier_maps_common_runtime_patterns(
+    tmp_path: Path,
+    failure_text: str,
+    expected_class: str,
+    expected_code: str,
+) -> None:
+    store = make_store(tmp_path)
+
+    failure_class, error_code = store._classify_failure(failure_text)
+
+    assert failure_class.value == expected_class
+    assert error_code == expected_code
+
+
 def test_founder_hint_clears_pending_escalation_and_reopens_planner_lane(tmp_path: Path) -> None:
     store = make_store(tmp_path)
     run = store.create_run(

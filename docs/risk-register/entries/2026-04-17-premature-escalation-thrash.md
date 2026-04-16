@@ -1,7 +1,7 @@
 # Risk ID: RISK-0016
-Title: Planner may escalate too early or too often once escalation becomes a legal output type
+Title: ~~Planner may escalate too early or too often once escalation becomes a legal output type~~
 Class: Before Next Phase
-Status: Mitigating
+Status: Resolved
 Owner: Core / Planner governance
 Observed In: Step 10 design review
 
@@ -39,6 +39,14 @@ actions) for another (constant escalation).
   current loop into a bounded exhausted state instead of allowing endless ping-pong
 - block planner reinvocation while a founder escalation is still pending
 
+This risk is resolved for the current bounded planner flow because:
+
+- the planner system prompt explicitly treats escalation as a last-resort path
+- planner reinvocation is blocked while a founder escalation is still pending
+- founder hints are bounded per phase and the third founder-help request
+  exhausts the phase instead of reopening the loop forever
+- founder `reject` closes the founder-help lane with bounded exhaustion
+
 ## Capability Gate
 - Capability: planner-backed tracer bullet / founder hint loop
 - Gate mode: Before Next Phase
@@ -56,6 +64,7 @@ actions) for another (constant escalation).
 - repeated escalations cannot silently stall the system
 - planner prompt and governance make escalation a last-resort path rather than a default move
 - founder hint / escalation ping-pong is bounded per phase
+- current CLI and ledger tests prove the bounded founder-help loop
 
 ## Last Updated
 - 2026-04-17
