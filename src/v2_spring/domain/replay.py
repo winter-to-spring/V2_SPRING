@@ -6,6 +6,7 @@ from v2_spring.domain.approval import ApprovalView
 from v2_spring.domain.artifact import ArtifactView
 from v2_spring.domain.decision import DecisionView
 from v2_spring.domain.observation import ObservationView
+from v2_spring.domain.planner_attempt import PlannerAttemptView
 from v2_spring.domain.run import RunView
 from v2_spring.domain.task import TaskView
 
@@ -40,6 +41,7 @@ class RunReplayView(BaseModel):
     approvals: list[ApprovalView]
     decisions: list[DecisionView]
     tasks: list[TaskReplayView]
+    planner_attempts: list[PlannerAttemptView]
     observations: list[ObservationView]
     orphan_artifacts: list[ArtifactInspectionView]
     consistency_warnings: list[str]

@@ -9,12 +9,19 @@ from pydantic import ValidationError
 
 from v2_spring.config import load_config
 from v2_spring.domain.approval import ApprovalStatus
+from v2_spring.domain.planner_attempt import PlannerAttemptView
 from v2_spring.domain.proposal import PlannerProposalInput, PlannerProposalView
 from v2_spring.domain.replay import ArtifactInspectionView, RunReplayView, TaskReplayView
 from v2_spring.domain.snapshot import PossibleActionEvaluationView, PossibleActionName, RunSnapshotView
 from v2_spring.ledger.store import BoundedExecutionResult, LedgerStore
 from v2_spring.planner.actions import evaluate_possible_actions
-from v2_spring.planner.proposals import IllegalPlannerProposalError, StalePlannerProposalError
+from v2_spring.planner.proposals import (
+    CognitiveDuplicatePlannerProposalError,
+    IllegalPlannerProposalError,
+    PlannerPhaseExhaustedError,
+    StalePlannerProposalError,
+    TransportDuplicatePlannerProposalError,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -268,6 +275,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="What the planner expects to happen if this action is executed.",
     )
     planner_propose_parser.add_argument(
+        "--submission-key",
+        default=None,
+        help="Optional caller-supplied idempotency key for transport-level deduplication.",
+    )
+    planner_propose_parser.add_argument(
         "--format",
         default="pretty",
         choices=["pretty", "json"],
@@ -291,6 +303,45 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output format. Defaults to pretty.",
     )
     planner_show_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Override DATABASE_URL for this invocation.",
+    )
+
+    planner_attempts_parser = planner_subparsers.add_parser(
+        "attempts",
+        help="Show planner governance attempts for one run.",
+    )
+    planner_attempts_parser.add_argument("run_id", help="Run id to inspect.")
+    planner_attempts_parser.add_argument(
+        "--format",
+        default="pretty",
+        choices=["pretty", "json"],
+        help="Output format. Defaults to pretty.",
+    )
+    planner_attempts_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Override DATABASE_URL for this invocation.",
+    )
+
+    planner_recharge_parser = planner_subparsers.add_parser(
+        "recharge",
+        help="Reopen an exhausted planner phase with an explicit founder reason.",
+    )
+    planner_recharge_parser.add_argument("run_id", help="Run id to recharge.")
+    planner_recharge_parser.add_argument(
+        "--reason",
+        required=True,
+        help="Why the founder believes another planner attempt should be allowed.",
+    )
+    planner_recharge_parser.add_argument(
+        "--format",
+        default="pretty",
+        choices=["pretty", "json"],
+        help="Output format. Defaults to pretty.",
+    )
+    planner_recharge_parser.add_argument(
         "--database-url",
         default=None,
         help="Override DATABASE_URL for this invocation.",
@@ -620,6 +671,7 @@ def _render_planner_proposal(proposal: PlannerProposalView) -> str:
         policy_version:     {proposal.policy_version}
         snapshot_hash:      {proposal.snapshot_hash}
         selected_action:    {proposal.selected_action.value}
+        submission_key:     {proposal.submission_key if proposal.submission_key else '-'}
         rationale:          {proposal.rationale}
         expected_outcome:   {proposal.expected_outcome}
         created_at:         {proposal.created_at.isoformat()}
@@ -641,9 +693,56 @@ def _render_planner_proposals(proposals: list[PlannerProposalView], *, run_id: s
                 f"   action:            {proposal.selected_action.value}",
                 f"   policy_version:    {proposal.policy_version}",
                 f"   snapshot_hash:     {proposal.snapshot_hash}",
+                f"   submission_key:    {proposal.submission_key if proposal.submission_key else '-'}",
                 f"   rationale:         {proposal.rationale}",
                 f"   expected_outcome:  {proposal.expected_outcome}",
                 f"   created_at:        {proposal.created_at.isoformat()}",
+            ],
+        )
+    return "\n".join(lines)
+
+
+def _render_planner_attempt(attempt: PlannerAttemptView) -> str:
+    return dedent(
+        f"""\
+        Planner governance event
+        -----------------------
+        attempt_id:         {attempt.id}
+        run_id:             {attempt.run_id}
+        phase_key:          {attempt.phase_key}
+        policy_version:     {attempt.policy_version}
+        outcome:            {attempt.outcome.value}
+        selected_action:    {attempt.selected_action.value if attempt.selected_action is not None else '-'}
+        submission_key:     {attempt.submission_key if attempt.submission_key else '-'}
+        attempt_index:      {attempt.attempt_index}
+        budget_limit:       {attempt.budget_limit}
+        budget_used:        {attempt.budget_used}
+        budget_remaining:   {attempt.budget_remaining}
+        reason:             {attempt.outcome_reason}
+        created_at:         {attempt.created_at.isoformat()}
+        """,
+    ).strip()
+
+
+def _render_planner_attempts(attempts: list[PlannerAttemptView], *, run_id: str) -> str:
+    lines = ["Planner attempts", "----------------", f"run_id: {run_id}"]
+    if not attempts:
+        lines.append("No planner attempts are recorded for this run yet.")
+        return "\n".join(lines)
+
+    for index, attempt in enumerate(attempts, start=1):
+        lines.extend(
+            [
+                "",
+                f"{index}. {attempt.outcome.value}",
+                f"   attempt_id:       {attempt.id}",
+                f"   phase_key:        {attempt.phase_key}",
+                f"   action:           {attempt.selected_action.value if attempt.selected_action is not None else '-'}",
+                f"   submission_key:   {attempt.submission_key if attempt.submission_key else '-'}",
+                f"   budget:           {attempt.budget_used}/{attempt.budget_limit}",
+                f"   remaining:        {attempt.budget_remaining}",
+                f"   reason:           {attempt.outcome_reason}",
+                f"   created_at:       {attempt.created_at.isoformat()}",
             ],
         )
     return "\n".join(lines)
@@ -708,6 +807,21 @@ def _render_replay(replay: RunReplayView, *, verbose: bool) -> str:
             lines.append(f"- {task_replay.task.summary}")
             lines.append(f"  stderr: {task_replay.task.stderr if task_replay.task.stderr else '-'}")
 
+    if replay.planner_attempts:
+        lines.extend(["", "Planner governance", "------------------"])
+        grouped_failures = [
+            attempt
+            for attempt in replay.planner_attempts
+            if attempt.outcome.value.startswith("rejected") or attempt.outcome.value == "phase_exhausted"
+        ]
+        latest_attempt = replay.planner_attempts[-1]
+        lines.append(
+            f"- total attempts: {len(replay.planner_attempts)} / latest outcome: {latest_attempt.outcome.value}",
+        )
+        if grouped_failures:
+            lines.append(f"- first failure: {grouped_failures[0].outcome.value} / {grouped_failures[0].outcome_reason}")
+            lines.append(f"- latest failure: {grouped_failures[-1].outcome.value} / {grouped_failures[-1].outcome_reason}")
+
     if replay.consistency_warnings:
         lines.extend(["", "Consistency warnings", "--------------------"])
         for warning in replay.consistency_warnings:
@@ -729,6 +843,14 @@ def _render_replay(replay: RunReplayView, *, verbose: bool) -> str:
         for observation in replay.observations:
             lines.append(f"- {observation.kind.value}: {observation.summary}")
             lines.append(f"  details: {observation.details}")
+
+        if replay.planner_attempts:
+            lines.extend(["", "Detailed planner attempts", "------------------------"])
+            for attempt in replay.planner_attempts:
+                lines.append(f"- {attempt.outcome.value} [{attempt.budget_used}/{attempt.budget_limit}]")
+                lines.append(f"  action: {attempt.selected_action.value if attempt.selected_action is not None else '-'}")
+                lines.append(f"  reason: {attempt.outcome_reason}")
+                lines.append(f"  phase_key: {attempt.phase_key}")
 
     return "\n".join(lines)
 
@@ -975,6 +1097,7 @@ def main() -> None:
             proposal = PlannerProposalInput(
                 snapshot_hash=args.snapshot_hash,
                 selected_action=args.action,
+                submission_key=args.submission_key,
                 rationale=args.rationale,
                 expected_outcome=args.expected_outcome,
             )
@@ -989,7 +1112,16 @@ def main() -> None:
                 print(json.dumps(recorded.model_dump(mode="json"), indent=2, ensure_ascii=False))
             else:
                 print(_render_planner_proposal(recorded))
-        except (LookupError, IllegalPlannerProposalError, StalePlannerProposalError, PermissionError, ValueError) as exc:
+        except (
+            LookupError,
+            IllegalPlannerProposalError,
+            StalePlannerProposalError,
+            TransportDuplicatePlannerProposalError,
+            CognitiveDuplicatePlannerProposalError,
+            PlannerPhaseExhaustedError,
+            PermissionError,
+            ValueError,
+        ) as exc:
             print(str(exc))
             raise SystemExit(1) from exc
         return
@@ -1004,6 +1136,31 @@ def main() -> None:
             print(json.dumps([proposal.model_dump(mode="json") for proposal in proposals], indent=2, ensure_ascii=False))
         else:
             print(_render_planner_proposals(proposals, run_id=args.run_id))
+        return
+
+    if args.command == "planner" and args.planner_command == "attempts":
+        store = _build_store(args.database_url)
+        if store.get_run(args.run_id) is None:
+            print(f"Run {args.run_id} was not found.")
+            raise SystemExit(1)
+        attempts = store.list_planner_attempts_for_run(args.run_id)
+        if args.format == "json":
+            print(json.dumps([attempt.model_dump(mode="json") for attempt in attempts], indent=2, ensure_ascii=False))
+        else:
+            print(_render_planner_attempts(attempts, run_id=args.run_id))
+        return
+
+    if args.command == "planner" and args.planner_command == "recharge":
+        store = _build_store(args.database_url)
+        try:
+            attempt = store.record_planner_recharge(run_id=args.run_id, reason=args.reason)
+            if args.format == "json":
+                print(json.dumps(attempt.model_dump(mode="json"), indent=2, ensure_ascii=False))
+            else:
+                print(_render_planner_attempt(attempt))
+        except (LookupError, PermissionError, ValueError) as exc:
+            print(str(exc))
+            raise SystemExit(1) from exc
         return
 
     parser.print_help()

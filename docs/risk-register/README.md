@@ -50,7 +50,18 @@ GitHub issues are created when a risk becomes an execution slice:
 - repeated or cross-cutting risks
 - anything that needs implementation rather than passive tracking
 
-### 5. Resolve timing follows capability gates, not vague calendar promises
+### 5. Resolved risks stay visible
+
+Resolved risks are not deleted from this register.
+
+We keep them visible with a strikethrough in the index and in the entry title so
+future readers can see:
+
+- what risk existed
+- when it was noticed
+- and that it was later resolved
+
+### 6. Resolve timing follows capability gates, not vague calendar promises
 
 We do not say "sometime later" without also saying:
 
@@ -97,11 +108,14 @@ Observed In:
 ## Current Entries
 
 - [RISK-0001 Approval timeout / deadlock](entries/2026-04-16-approval-timeout.md)
-- [RISK-0002 Approval reject reason missing](entries/2026-04-16-approval-reject-reason.md)
-- [RISK-0003 Pending approval write barrier missing](entries/2026-04-16-pending-approval-write-barrier.md)
+- ~~[RISK-0002 Approval reject reason missing](entries/2026-04-16-approval-reject-reason.md)~~
+- ~~[RISK-0003 Pending approval write barrier missing](entries/2026-04-16-pending-approval-write-barrier.md)~~
 - [RISK-0004 Service-level approval barrier race window](entries/2026-04-16-service-level-barrier-race-window.md)
 - [RISK-0005 RunSnapshot staleness under concurrent writes](entries/2026-04-16-run-snapshot-staleness.md)
 - [RISK-0006 Snapshot/action read-model growth](entries/2026-04-16-snapshot-read-model-growth.md)
-- [RISK-0007 Possible-actions engine purity drift](entries/2026-04-16-possible-actions-engine-purity.md)
-- [RISK-0008 Planner proposal loop lacks retry bounds and idempotency policy](entries/2026-04-16-planner-proposal-loop-control.md)
+- ~~[RISK-0007 Possible-actions engine purity drift](entries/2026-04-16-possible-actions-engine-purity.md)~~
+- ~~[RISK-0008 Planner proposal loop lacks retry bounds and idempotency policy](entries/2026-04-16-planner-proposal-loop-control.md)~~
 - [RISK-0009 Planner-facing audit payload hygiene](entries/2026-04-16-planner-audit-payload-hygiene.md)
+- [RISK-0010 Phase budget reset abuse may refresh planner retries without meaningful progress](entries/2026-04-16-phase-budget-reset-abuse.md)
+- [RISK-0011 Manual recharge lacks environment preflight and misuse guardrails](entries/2026-04-16-manual-recharge-misuse.md)
+- [RISK-0012 Cognitive duplicate detection remains exact-fingerprint only](entries/2026-04-16-cognitive-duplicate-heuristic-limit.md)
