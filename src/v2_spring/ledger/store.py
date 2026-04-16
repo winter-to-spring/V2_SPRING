@@ -49,6 +49,20 @@ from v2_spring.domain.progress import (
 )
 from v2_spring.domain.proposal import PlannerProposalInput, PlannerProposalView
 from v2_spring.domain.replay import ArtifactInspectionView, RunReplayView, TaskReplayView
+from v2_spring.domain.routing import (
+    ExecutionRequirements,
+    ExecutionRuntime,
+    RoutingDecision,
+    RoutingInspectionView,
+    RoutingOutcome,
+    RoutingRefusalCode,
+    RoutingRefusalReceipt,
+    SystemLimits,
+    default_requirements_for_bounded_execution,
+    default_system_limits,
+    derive_requirements_for_snapshot,
+    route_task,
+)
 from v2_spring.domain.run import RunCreateInput, RunStatus, RunView
 from v2_spring.domain.snapshot import (
     ArtifactHeadlineView,
@@ -936,6 +950,83 @@ class LedgerStore:
             trace_entries=trace_entries,
         )
 
+    def inspect_task_route(
+        self,
+        run_id: str,
+        *,
+        requirements: ExecutionRequirements | None = None,
+        system_limits: SystemLimits | None = None,
+        record: bool = False,
+    ) -> RoutingInspectionView:
+        """Project one deterministic execution routing decision for founder/operator inspection."""
+
+        evaluation = evaluate_possible_actions(self.build_run_snapshot(run_id))
+        snapshot = evaluation.snapshot
+        source_action = next(
+            (action for action in evaluation.actions if action.name == PossibleActionName.EXECUTE_BOUNDED_TASK),
+            None,
+        )
+        effective_requirements = requirements or derive_requirements_for_snapshot(snapshot)
+        effective_limits = system_limits or default_system_limits()
+
+        if source_action is None:
+            outcome: RoutingOutcome = RoutingRefusalReceipt(
+                refusal_code=RoutingRefusalCode.NO_ROUTABLE_WORK,
+                message="No execution-plane task is currently legal for this run.",
+                next_step_hint=(
+                    "Resolve the current approval/founder blocker or advance the planner state before routing execution."
+                ),
+                guard_notes=[
+                    f"action_state={snapshot.action_state.value}",
+                    f"action_state_reason={snapshot.action_state_reason}",
+                ],
+            )
+            effective_requirements = None
+        elif effective_requirements is None:
+            outcome = RoutingRefusalReceipt(
+                refusal_code=RoutingRefusalCode.NO_ROUTABLE_WORK,
+                message="The run has an execution lane open, but no deterministic execution requirements could be derived.",
+                next_step_hint=(
+                    "Inspect the current legal action set and provide explicit execution requirements before dispatch."
+                ),
+                guard_notes=[
+                    f"action_state={snapshot.action_state.value}",
+                    f"action_state_reason={snapshot.action_state_reason}",
+                ],
+            )
+        else:
+            outcome = route_task(
+                requirements=effective_requirements,
+                system_limits=effective_limits,
+            )
+
+        recorded_observation_id = None
+        if record:
+            observation = self.record_observation(
+                run_id=run_id,
+                kind=ObservationKind.SYSTEM_AUDIT,
+                summary=self._build_route_summary(source_action, outcome),
+                details=self._build_route_audit_details(
+                    snapshot=snapshot,
+                    source_action=source_action,
+                    requirements=effective_requirements,
+                    system_limits=effective_limits,
+                    outcome=outcome,
+                ),
+            )
+            recorded_observation_id = observation.id
+
+        return RoutingInspectionView(
+            run_id=snapshot.run.id,
+            snapshot_hash=snapshot.state_hash,
+            source_action=source_action.name if source_action is not None else None,
+            source_action_reason=source_action.reason if source_action is not None else None,
+            requirements=effective_requirements,
+            system_limits=effective_limits,
+            outcome=outcome,
+            recorded_observation_id=recorded_observation_id,
+        )
+
     def record_planner_proposal(
         self,
         *,
@@ -962,11 +1053,13 @@ class LedgerStore:
             selected_action=proposal.selected_action,
             rationale=proposal.rationale,
             expected_outcome=proposal.expected_outcome,
+            execution_requirements=proposal.execution_requirements,
         )
         proposal_intent_signature = self._build_planner_proposal_intent_signature(
             selected_action=proposal.selected_action,
             rationale=proposal.rationale,
             expected_outcome=proposal.expected_outcome,
+            execution_requirements=proposal.execution_requirements,
         )
 
         if governance.exhausted:
@@ -1227,6 +1320,11 @@ class LedgerStore:
                 "proposal_fingerprint": proposal_fingerprint,
                 "proposal_intent_signature": proposal_intent_signature,
                 "expected_outcome": proposal.expected_outcome,
+                "execution_requirements": (
+                    proposal.execution_requirements.model_dump(mode="json")
+                    if proposal.execution_requirements is not None
+                    else None
+                ),
                 "legal_actions": [action.name.value for action in evaluation.actions],
                 "legal_action_details": legal_action_descriptions,
                 "action_state": evaluation.snapshot.action_state.value,
@@ -1243,6 +1341,7 @@ class LedgerStore:
             submission_key=proposal.submission_key,
             rationale=proposal.rationale,
             expected_outcome=proposal.expected_outcome,
+            execution_requirements=proposal.execution_requirements,
             created_at=decision.created_at,
         )
 
@@ -1512,6 +1611,7 @@ class LedgerStore:
                         "submission_key": event.payload.get("submission_key"),
                         "rationale": event.payload["rationale"],
                         "expected_outcome": event.payload["expected_outcome"],
+                        "execution_requirements": event.payload.get("execution_requirements"),
                         "created_at": event.recorded_at,
                     },
                 ),
@@ -2432,6 +2532,39 @@ class LedgerStore:
             )
         return commands
 
+    @staticmethod
+    def _build_route_summary(
+        source_action: PossibleActionView | None,
+        outcome: RoutingOutcome,
+    ) -> str:
+        action_label = source_action.name.value if source_action is not None else "no_routable_work"
+        if isinstance(outcome, RoutingDecision):
+            return f"Execution routing selected {outcome.runtime.value} for {action_label}."
+        return f"Execution routing refused {action_label} with {outcome.refusal_code.value}."
+
+    def _build_route_audit_details(
+        self,
+        *,
+        snapshot: RunSnapshotView,
+        source_action: PossibleActionView | None,
+        requirements: ExecutionRequirements | None,
+        system_limits: SystemLimits,
+        outcome: RoutingOutcome,
+    ) -> str:
+        payload = {
+            "snapshot_hash": snapshot.state_hash,
+            "planner_phase_key": snapshot.planner_phase_key,
+            "source_action": source_action.name.value if source_action is not None else None,
+            "source_action_reason": source_action.reason if source_action is not None else None,
+            "requirements": requirements.model_dump(mode="json") if requirements is not None else None,
+            "system_limits": system_limits.model_dump(mode="json"),
+            "outcome": outcome.model_dump(mode="json"),
+        }
+        return self._sanitize_planner_text(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            limit=4000,
+        ) or "Execution routing audit payload unavailable."
+
     @classmethod
     def _classify_failure(cls, failure_text: str) -> tuple[FailureClass, str]:
         normalized = failure_text.lower()
@@ -3104,12 +3237,16 @@ class LedgerStore:
         selected_action: PossibleActionName,
         rationale: str,
         expected_outcome: str,
+        execution_requirements: ExecutionRequirements | None,
     ) -> str:
         payload = {
             "snapshot_hash": snapshot_hash,
             "selected_action": selected_action.value,
             "rationale": rationale.strip(),
             "expected_outcome": expected_outcome.strip(),
+            "execution_requirements": (
+                execution_requirements.model_dump(mode="json") if execution_requirements is not None else None
+            ),
         }
         return sha256(
             json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"),
@@ -3122,6 +3259,7 @@ class LedgerStore:
         selected_action: PossibleActionName,
         rationale: str,
         expected_outcome: str,
+        execution_requirements: ExecutionRequirements | None,
     ) -> str:
         alias_map = {
             "db": "database",
@@ -3181,6 +3319,9 @@ class LedgerStore:
         payload = {
             "selected_action": selected_action.value,
             "normalized_tokens": unique_tokens,
+            "execution_requirements": (
+                execution_requirements.model_dump(mode="json") if execution_requirements is not None else None
+            ),
         }
         return sha256(
             json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"),

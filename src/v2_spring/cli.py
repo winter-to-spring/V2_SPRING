@@ -33,6 +33,15 @@ from v2_spring.domain.planner_attempt import PlannerAttemptView, PlannerRecharge
 from v2_spring.domain.progress import ProgressSummaryView, ProgressTraceMode
 from v2_spring.domain.proposal import PlannerProposalInput, PlannerProposalView
 from v2_spring.domain.replay import ArtifactInspectionView, RunReplayView, TaskReplayView
+from v2_spring.domain.routing import (
+    ExecutionRequirements,
+    ExpectedOutputKind,
+    RoutingDecision,
+    RoutingInspectionView,
+    RoutingRefusalReceipt,
+    TaskComplexity,
+    WriteScope,
+)
 from v2_spring.domain.snapshot import PossibleActionEvaluationView, PossibleActionName, RunSnapshotView
 from v2_spring.ledger.store import BoundedExecutionResult, LedgerStore
 from v2_spring.planner.actions import evaluate_possible_actions
@@ -228,6 +237,64 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output format. Defaults to pretty.",
     )
     task_show_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Override DATABASE_URL for this invocation.",
+    )
+
+    task_route_parser = task_subparsers.add_parser(
+        "route",
+        help="Inspect deterministic execution routing for one run.",
+    )
+    task_route_parser.add_argument("run_id", help="Run id to inspect.")
+    task_route_parser.add_argument(
+        "--format",
+        default="pretty",
+        choices=["pretty", "json"],
+        help="Output format. Defaults to pretty.",
+    )
+    task_route_parser.add_argument(
+        "--record",
+        action="store_true",
+        help="Record the routing inspection as a replayable system audit observation.",
+    )
+    task_route_parser.add_argument(
+        "--task-complexity",
+        default=None,
+        choices=[value.value for value in TaskComplexity],
+        help="Optional explicit task complexity override for routing proofing.",
+    )
+    task_route_parser.add_argument(
+        "--needs-isolation",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Optional explicit isolation requirement override.",
+    )
+    task_route_parser.add_argument(
+        "--requires-network",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Optional explicit network requirement override.",
+    )
+    task_route_parser.add_argument(
+        "--needs-multi-file-context",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Optional explicit multi-file-context requirement override.",
+    )
+    task_route_parser.add_argument(
+        "--write-scope",
+        default=None,
+        choices=[value.value for value in WriteScope],
+        help="Optional explicit write-scope override.",
+    )
+    task_route_parser.add_argument(
+        "--expected-output-kind",
+        default=None,
+        choices=[value.value for value in ExpectedOutputKind],
+        help="Optional explicit output-kind override.",
+    )
+    task_route_parser.add_argument(
         "--database-url",
         default=None,
         help="Override DATABASE_URL for this invocation.",
@@ -923,6 +990,23 @@ def _render_execution_result(result: BoundedExecutionResult) -> str:
     ).strip()
 
 
+def _render_execution_requirements(
+    requirements: ExecutionRequirements | None,
+    *,
+    prefix: str = "",
+) -> list[str]:
+    if requirements is None:
+        return [f"{prefix}requirements:        -"]
+    return [
+        f"{prefix}task_complexity:     {requirements.task_complexity.value}",
+        f"{prefix}needs_isolation:    {requirements.needs_isolation}",
+        f"{prefix}requires_network:   {requirements.requires_network}",
+        f"{prefix}multi_file_context: {requirements.needs_multi_file_context}",
+        f"{prefix}write_scope:        {requirements.write_scope.value}",
+        f"{prefix}output_kind:        {requirements.expected_output_kind.value}",
+    ]
+
+
 def _render_snapshot(snapshot: RunSnapshotView) -> str:
     lines = [
         "Run snapshot",
@@ -1166,22 +1250,88 @@ def _render_actions(evaluation: PossibleActionEvaluationView) -> str:
     return "\n".join(lines)
 
 
+def _render_task_route(inspection: RoutingInspectionView) -> str:
+    lines = [
+        "Task route",
+        "----------",
+        f"run_id:              {inspection.run_id}",
+        f"snapshot_hash:       {inspection.snapshot_hash}",
+        f"source_action:       {inspection.source_action.value if inspection.source_action is not None else '-'}",
+        f"source_reason:       {inspection.source_action_reason if inspection.source_action_reason else '-'}",
+        "",
+        "Requested requirements",
+        "----------------------",
+        *_render_execution_requirements(inspection.requirements),
+        "",
+        "System limits",
+        "-------------",
+        f"max_complexity:      {inspection.system_limits.max_task_complexity.value}",
+        f"allow_network:       {inspection.system_limits.allow_network}",
+        f"allow_isolated:      {inspection.system_limits.allow_isolated_worker}",
+        f"available_runtimes:  {', '.join(runtime.value for runtime in inspection.system_limits.available_runtimes)}",
+        "",
+        "Outcome",
+        "-------",
+    ]
+    if isinstance(inspection.outcome, RoutingDecision):
+        lines.extend(
+            [
+                f"kind:                {inspection.outcome.kind}",
+                f"runtime:             {inspection.outcome.runtime.value}",
+                f"matched_policy:      {inspection.outcome.matched_policy}",
+                f"rationale:           {inspection.outcome.rationale}",
+                "",
+                "Normalized requirements",
+                "-----------------------",
+                *_render_execution_requirements(inspection.outcome.normalized_requirements),
+            ],
+        )
+    elif isinstance(inspection.outcome, RoutingRefusalReceipt):
+        lines.extend(
+            [
+                f"kind:                {inspection.outcome.kind}",
+                f"refusal_code:        {inspection.outcome.refusal_code.value}",
+                f"message:             {inspection.outcome.message}",
+                f"next_step_hint:      {inspection.outcome.next_step_hint}",
+                f"escalation_recommended:{inspection.outcome.escalation_recommended}",
+            ],
+        )
+        if inspection.outcome.normalized_requirements is not None:
+            lines.extend(
+                [
+                    "",
+                    "Normalized requirements",
+                    "-----------------------",
+                    *_render_execution_requirements(inspection.outcome.normalized_requirements),
+                ],
+            )
+    guard_notes = inspection.outcome.guard_notes if inspection.outcome.guard_notes else []
+    if guard_notes:
+        lines.extend(["", "Guard notes", "-----------"])
+        for note in guard_notes:
+            lines.append(f"- {note}")
+    if inspection.recorded_observation_id is not None:
+        lines.extend(["", f"recorded_observation:{inspection.recorded_observation_id}"])
+    return "\n".join(lines)
+
+
 def _render_planner_proposal(proposal: PlannerProposalView) -> str:
-    return dedent(
-        f"""\
-        Planner proposal accepted
-        -------------------------
-        decision_id:        {proposal.decision_id}
-        run_id:             {proposal.run_id}
-        policy_version:     {proposal.policy_version}
-        snapshot_hash:      {proposal.snapshot_hash}
-        selected_action:    {proposal.selected_action.value}
-        submission_key:     {proposal.submission_key if proposal.submission_key else '-'}
-        rationale:          {proposal.rationale}
-        expected_outcome:   {proposal.expected_outcome}
-        created_at:         {proposal.created_at.isoformat()}
-        """,
-    ).strip()
+    lines = [
+        "Planner proposal accepted",
+        "-------------------------",
+        f"decision_id:        {proposal.decision_id}",
+        f"run_id:             {proposal.run_id}",
+        f"policy_version:     {proposal.policy_version}",
+        f"snapshot_hash:      {proposal.snapshot_hash}",
+        f"selected_action:    {proposal.selected_action.value}",
+        f"submission_key:     {proposal.submission_key if proposal.submission_key else '-'}",
+        f"rationale:          {proposal.rationale}",
+        f"expected_outcome:   {proposal.expected_outcome}",
+        f"created_at:         {proposal.created_at.isoformat()}",
+    ]
+    if proposal.execution_requirements is not None:
+        lines.extend(["", "Execution requirements", "----------------------", *_render_execution_requirements(proposal.execution_requirements)])
+    return "\n".join(lines)
 
 
 def _render_planner_proposals(proposals: list[PlannerProposalView], *, run_id: str) -> str:
@@ -1204,6 +1354,8 @@ def _render_planner_proposals(proposals: list[PlannerProposalView], *, run_id: s
                 f"   created_at:        {proposal.created_at.isoformat()}",
             ],
         )
+        if proposal.execution_requirements is not None:
+            lines.extend(_render_execution_requirements(proposal.execution_requirements, prefix="   "))
     return "\n".join(lines)
 
 
@@ -1285,6 +1437,8 @@ def _render_planner_invocation(proof: PlannerInvocationProofView) -> str:
                 f"accepted_decision_id:{proof.accepted_decision_id if proof.accepted_decision_id else '-'}",
             ],
         )
+        if output.execution_requirements is not None:
+            lines.extend(["", "Execution requirements", "----------------------", *_render_execution_requirements(output.execution_requirements)])
     elif isinstance(output, EscalationProposal):
         lines.extend(
             [
@@ -1872,6 +2026,58 @@ def main() -> None:
             print(_render_task_detail(task_replay))
         return
 
+    if args.command == "task" and args.task_command == "route":
+        store = _build_store(args.database_url)
+        explicit_requirements = None
+        requirement_values = {
+            "task_complexity": args.task_complexity,
+            "needs_isolation": args.needs_isolation,
+            "requires_network": args.requires_network,
+            "needs_multi_file_context": args.needs_multi_file_context,
+            "write_scope": args.write_scope,
+            "expected_output_kind": args.expected_output_kind,
+        }
+        if any(value is not None for value in requirement_values.values()):
+            missing = [
+                key
+                for key, value in requirement_values.items()
+                if value is None
+            ]
+            if missing:
+                print(
+                    "Explicit routing proof requires all requirement fields together. Missing: "
+                    + ", ".join(missing),
+                )
+                raise SystemExit(2)
+            try:
+                explicit_requirements = ExecutionRequirements(
+                    task_complexity=args.task_complexity,
+                    needs_isolation=args.needs_isolation,
+                    requires_network=args.requires_network,
+                    needs_multi_file_context=args.needs_multi_file_context,
+                    write_scope=args.write_scope,
+                    expected_output_kind=args.expected_output_kind,
+                )
+            except ValidationError as exc:
+                print("Execution routing requirements failed validation.")
+                print(exc)
+                raise SystemExit(2) from exc
+
+        try:
+            inspection = store.inspect_task_route(
+                args.run_id,
+                requirements=explicit_requirements,
+                record=args.record,
+            )
+            if args.format == "json":
+                print(json.dumps(inspection.model_dump(mode="json"), indent=2, ensure_ascii=False))
+            else:
+                print(_render_task_route(inspection))
+        except (LookupError, ValueError, PermissionError) as exc:
+            print(str(exc))
+            raise SystemExit(1) from exc
+        return
+
     if args.command == "artifact" and args.artifact_command == "list":
         store = _build_store(args.database_url)
         print(_render_artifacts(args.run, store))
@@ -2070,6 +2276,7 @@ def main() -> None:
                         selected_action=invocation.parsed_output.selected_action,
                         rationale=invocation.parsed_output.analysis_summary,
                         expected_outcome=invocation.parsed_output.expected_outcome,
+                        execution_requirements=invocation.parsed_output.execution_requirements,
                     ),
                 )
                 accepted_decision_id = recorded.decision_id

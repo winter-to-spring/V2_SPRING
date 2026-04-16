@@ -5,10 +5,11 @@ from enum import StrEnum
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
 
 from v2_spring.domain.founder_intervention import FounderInterventionDigest
 from v2_spring.domain.planner_attempt import PlannerAttemptOutcome
+from v2_spring.domain.routing import ExecutionRequirements, default_requirements_for_bounded_execution
 from v2_spring.domain.snapshot import PossibleActionName, PossibleActionView, RunSnapshotView
 
 
@@ -159,6 +160,21 @@ class ActionProposal(BaseModel):
     confidence: PlannerConfidence
     selected_action: PossibleActionName
     expected_outcome: str = Field(min_length=1, max_length=4000)
+    execution_requirements: ExecutionRequirements | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def inject_default_execution_requirements(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        selected_action = value.get("selected_action")
+        if isinstance(selected_action, PossibleActionName):
+            selected_action = selected_action.value
+        if selected_action == PossibleActionName.EXECUTE_BOUNDED_TASK.value and value.get("execution_requirements") is None:
+            payload = dict(value)
+            payload["execution_requirements"] = default_requirements_for_bounded_execution().model_dump(mode="python")
+            return payload
+        return value
 
     @field_validator("analysis_summary", "expected_outcome")
     @classmethod

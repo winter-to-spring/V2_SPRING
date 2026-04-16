@@ -3,7 +3,7 @@ Title: RunSnapshot may become stale under concurrent writes
 Class: Before Scale
 Status: Deferred
 Owner: Core / Planner boundary
-Observed In: Step 7 - RunSnapshot + possible actions
+Observed In: Step 7 - RunSnapshot + possible actions; Step 12-a dispatch planning
 
 ## Description
 
@@ -14,10 +14,16 @@ while another process is assembling or consuming a snapshot.
 That means a planner or founder could read a snapshot that is already slightly
 behind current reality.
 
+In Step 12-a this risk also shows up as a dispatch/intake conflict: a worker can
+start from Snapshot A, produce a patch receipt, and return after the main
+workspace has moved to Snapshot B.
+
 ## Impact
 
 - planner may act on stale context
 - founder may see outdated legal moves
+- worker patch intake may conflict with the code state the dispatch originally
+  targeted
 - later multi-worker runs could expose inconsistent reads more often
 
 ## Why This Matters
@@ -30,21 +36,25 @@ system.
 
 - keep snapshots bounded and cheap to recompute
 - include `snapshot_timestamp` and `state_hash`
+- carry dispatch base context such as per-file base hashes or equivalent anchors
+  into later patch intake
+- reject stale or conflicting worker output through a safe conflict-aware path
 - defer stronger freshness guarantees to a later concurrency hardening slice
 - consider transaction boundaries, sequence numbers, or projection tables when
   multi-worker scale begins
 
 ## Capability Gate
-- Capability: opening planner/replanner beyond single-process CLI scale
+- Capability: dispatching execution work beyond simple bounded local execution
 - Gate mode: Before Scale
 - Blocked until: a stronger snapshot freshness strategy is chosen
 
 ## Issue Link
-- GitHub Issue: none yet
+- GitHub Issue: #28
 
 ## Doc Links
 - ADR: docs/adr/0004-deterministic-substrate.md
 - Design note: docs/implementation-notes/STEP_7_RUN_SNAPSHOT_POSSIBLE_ACTIONS.md
+- Design note: docs/implementation-notes/STEP_12A_EXECUTION_PLANE_ROUTING_POLICY.md
 
 ## Exit Criteria
 
@@ -53,3 +63,4 @@ system.
 
 ## Last Updated
 - 2026-04-16
+- 2026-04-17
