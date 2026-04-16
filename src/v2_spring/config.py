@@ -5,15 +5,23 @@ from dataclasses import dataclass
 
 from dotenv import load_dotenv
 
+from v2_spring.domain.planner_adapter import PlannerTransportProvider
+
 
 load_dotenv()
 
 
 @dataclass(frozen=True)
 class AppConfig:
-    """Configuration required by the Step 1 tracer bullet."""
+    """Configuration required by the current CLI slices."""
 
     database_url: str
+    planner_provider: PlannerTransportProvider
+    planner_openai_model: str
+    planner_timeout_seconds: float
+    planner_max_retries: int
+    planner_max_context_chars: int
+    openai_api_key: str | None
 
 
 def load_config(database_url_override: str | None = None) -> AppConfig:
@@ -25,4 +33,21 @@ def load_config(database_url_override: str | None = None) -> AppConfig:
             "DATABASE_URL is not configured. Set it in the environment or pass --database-url.",
         )
 
-    return AppConfig(database_url=database_url)
+    provider_name = (os.getenv("PLANNER_PROVIDER") or PlannerTransportProvider.SCRIPTED.value).strip()
+    try:
+        planner_provider = PlannerTransportProvider(provider_name)
+    except ValueError as exc:
+        raise RuntimeError(
+            "PLANNER_PROVIDER is invalid. Expected one of: "
+            + ", ".join(item.value for item in PlannerTransportProvider),
+        ) from exc
+
+    return AppConfig(
+        database_url=database_url,
+        planner_provider=planner_provider,
+        planner_openai_model=(os.getenv("PLANNER_OPENAI_MODEL") or "gpt-4o").strip(),
+        planner_timeout_seconds=float(os.getenv("PLANNER_TIMEOUT_SECONDS") or "30"),
+        planner_max_retries=int(os.getenv("PLANNER_MAX_RETRIES") or "2"),
+        planner_max_context_chars=int(os.getenv("PLANNER_MAX_CONTEXT_CHARS") or "12000"),
+        openai_api_key=os.getenv("OPENAI_API_KEY"),
+    )

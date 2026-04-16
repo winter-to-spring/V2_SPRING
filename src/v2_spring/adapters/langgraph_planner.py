@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import re
+import time
+from dataclasses import dataclass
 from typing import Any, Protocol, TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -10,8 +14,94 @@ from v2_spring.domain.planner_adapter import (
     PLANNER_ADAPTER_OUTPUT_ADAPTER,
     PlannerAdapterOutput,
     PlannerContextWindow,
+    PlannerTransportAuditView,
+    PlannerTransportProvider,
 )
 from v2_spring.planner.proposals import PlannerAdapterFormatError
+
+_CONTROL_CHARACTER_PATTERN = re.compile(r"[\x00-\x08\x0B-\x1F\x7F]+")
+_PATH_PATTERN = re.compile(r"/Users/[^\s\"']+")
+_SECRET_PATTERNS = [
+    re.compile(r"sk-[A-Za-z0-9_-]{20,}"),
+    re.compile(r"ghp_[A-Za-z0-9]{20,}"),
+    re.compile(r"(?i)(api[_-]?key|authorization|token)\s*[:=]\s*[^\s,;]+"),
+]
+
+
+@dataclass(frozen=True)
+class StructuredTransportResponse:
+    """One raw provider response plus bounded transport telemetry."""
+
+    raw_response: Any
+    provider: PlannerTransportProvider
+    model: str
+    response_id: str | None = None
+    retry_count: int = 0
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    total_tokens: int | None = None
+
+
+@dataclass(frozen=True)
+class PlannerAdapterInvocationResult:
+    """Final parsed planner output with transport telemetry."""
+
+    parsed_output: PlannerAdapterOutput
+    format_failures: int
+    transport_audit: PlannerTransportAuditView
+
+
+class PlannerTransportError(RuntimeError):
+    """Base error for provider/network failures at the adapter edge."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str,
+        provider: PlannerTransportProvider,
+        model: str,
+        retryable: bool,
+        retry_count: int = 0,
+        response_id: str | None = None,
+        status_code: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.provider = provider
+        self.model = model
+        self.retryable = retryable
+        self.retry_count = retry_count
+        self.response_id = response_id
+        self.status_code = status_code
+
+
+class PlannerTransportTimeoutError(PlannerTransportError):
+    """Raised when the provider call times out."""
+
+
+class PlannerTransportRateLimitError(PlannerTransportError):
+    """Raised when the provider responds with a rate limit failure."""
+
+
+class PlannerTransportNetworkError(PlannerTransportError):
+    """Raised when the provider cannot be reached reliably."""
+
+
+class PlannerTransportUnavailableError(PlannerTransportError):
+    """Raised when the provider has a retryable 5xx-style outage."""
+
+
+class PlannerTransportAuthenticationError(PlannerTransportError):
+    """Raised when credentials or permissions are invalid."""
+
+
+class PlannerTransportProviderResponseError(PlannerTransportError):
+    """Raised when the provider returns an unusable response."""
+
+
+class PlannerTransportCancelledError(PlannerTransportError):
+    """Raised when the local caller interrupts the provider request."""
 
 
 class StructuredPlannerTransport(Protocol):
@@ -23,7 +113,7 @@ class StructuredPlannerTransport(Protocol):
         system_prompt: str,
         user_prompt: str,
         output_schema: dict[str, Any],
-    ) -> Any: ...
+    ) -> StructuredTransportResponse: ...
 
 
 class ScriptedStructuredPlannerTransport:
@@ -39,17 +129,227 @@ class ScriptedStructuredPlannerTransport:
         system_prompt: str,
         user_prompt: str,
         output_schema: dict[str, Any],
-    ) -> Any:
+    ) -> StructuredTransportResponse:
         if not self._responses:
             if self._fallback_response is None:
                 raise RuntimeError("No scripted planner responses remain for this invocation.")
-            return self._fallback_response
-        return self._responses.pop(0)
+            raw_response = self._fallback_response
+        else:
+            raw_response = self._responses.pop(0)
+        return StructuredTransportResponse(
+            raw_response=raw_response,
+            provider=PlannerTransportProvider.SCRIPTED,
+            model="scripted-proof",
+            retry_count=0,
+        )
+
+
+class OpenAIStructuredPlannerTransport:
+    """Concrete OpenAI-first transport behind a provider-agnostic seam."""
+
+    def __init__(
+        self,
+        *,
+        model: str,
+        api_key: str | None = None,
+        timeout_seconds: float = 30.0,
+        max_retries: int = 2,
+        backoff_seconds: float = 0.5,
+        client: Any | None = None,
+    ) -> None:
+        self._model = model
+        self._api_key = api_key
+        self._timeout_seconds = timeout_seconds
+        self._max_retries = max_retries
+        self._backoff_seconds = backoff_seconds
+        self._client = client
+
+    def invoke(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        output_schema: dict[str, Any],
+    ) -> StructuredTransportResponse:
+        client = self._client or self._build_client()
+        attempts = 0
+        while True:
+            try:
+                response = client.chat.completions.create(
+                    model=self._model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "planner_adapter_output",
+                            "strict": True,
+                            "schema": output_schema,
+                        },
+                    },
+                    temperature=0,
+                    timeout=self._timeout_seconds,
+                )
+                return StructuredTransportResponse(
+                    raw_response=self._extract_raw_content(response),
+                    provider=PlannerTransportProvider.OPENAI,
+                    model=getattr(response, "model", self._model) or self._model,
+                    response_id=getattr(response, "id", None),
+                    retry_count=attempts,
+                    input_tokens=self._usage_field(response, "prompt_tokens"),
+                    output_tokens=self._usage_field(response, "completion_tokens"),
+                    total_tokens=self._usage_field(response, "total_tokens"),
+                )
+            except KeyboardInterrupt as exc:
+                raise PlannerTransportCancelledError(
+                    "Planner provider invocation was interrupted locally before completion.",
+                    code="cancelled",
+                    provider=PlannerTransportProvider.OPENAI,
+                    model=self._model,
+                    retryable=False,
+                    retry_count=attempts,
+                ) from exc
+            except Exception as exc:  # pragma: no cover - exercised by fake client tests
+                normalized = self._normalize_error(exc, retry_count=attempts)
+                if normalized.retryable and attempts < self._max_retries:
+                    time.sleep(self._backoff_seconds * (2**attempts))
+                    attempts += 1
+                    continue
+                raise normalized from exc
+
+    def _build_client(self) -> Any:
+        try:
+            from openai import OpenAI
+        except ImportError as exc:  # pragma: no cover - depends on optional dependency installation
+            raise PlannerTransportProviderResponseError(
+                "The openai package is not installed. Install project dependencies before using --provider openai.",
+                code="client_not_installed",
+                provider=PlannerTransportProvider.OPENAI,
+                model=self._model,
+                retryable=False,
+            ) from exc
+
+        kwargs: dict[str, Any] = {"max_retries": 0}
+        if self._api_key is not None:
+            kwargs["api_key"] = self._api_key
+        return OpenAI(**kwargs)
+
+    def _normalize_error(self, exc: Exception, *, retry_count: int) -> PlannerTransportError:
+        name = exc.__class__.__name__
+        status_code = getattr(exc, "status_code", None)
+        message = _sanitize_text(str(exc) or name, limit=400)
+
+        if name == "APITimeoutError":
+            return PlannerTransportTimeoutError(
+                f"OpenAI planner transport timed out: {message}",
+                code="timeout",
+                provider=PlannerTransportProvider.OPENAI,
+                model=self._model,
+                retryable=True,
+                retry_count=retry_count,
+                status_code=status_code,
+            )
+        if name == "RateLimitError" or status_code == 429:
+            return PlannerTransportRateLimitError(
+                f"OpenAI planner transport hit a rate limit: {message}",
+                code="rate_limit",
+                provider=PlannerTransportProvider.OPENAI,
+                model=self._model,
+                retryable=True,
+                retry_count=retry_count,
+                status_code=status_code,
+            )
+        if name == "APIConnectionError":
+            return PlannerTransportNetworkError(
+                f"OpenAI planner transport could not reach the provider: {message}",
+                code="network",
+                provider=PlannerTransportProvider.OPENAI,
+                model=self._model,
+                retryable=True,
+                retry_count=retry_count,
+                status_code=status_code,
+            )
+        if status_code in {401, 403} or name == "AuthenticationError":
+            return PlannerTransportAuthenticationError(
+                f"OpenAI planner transport authentication failed: {message}",
+                code="authentication",
+                provider=PlannerTransportProvider.OPENAI,
+                model=self._model,
+                retryable=False,
+                retry_count=retry_count,
+                status_code=status_code,
+            )
+        if isinstance(status_code, int) and status_code >= 500:
+            return PlannerTransportUnavailableError(
+                f"OpenAI planner transport is temporarily unavailable: {message}",
+                code="provider_unavailable",
+                provider=PlannerTransportProvider.OPENAI,
+                model=self._model,
+                retryable=True,
+                retry_count=retry_count,
+                status_code=status_code,
+            )
+        return PlannerTransportProviderResponseError(
+            f"OpenAI planner transport failed with an unexpected provider response: {message}",
+            code="provider_response",
+            provider=PlannerTransportProvider.OPENAI,
+            model=self._model,
+            retryable=False,
+            retry_count=retry_count,
+            status_code=status_code,
+        )
+
+    @staticmethod
+    def _usage_field(response: Any, field_name: str) -> int | None:
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return None
+        return getattr(usage, field_name, None)
+
+    @staticmethod
+    def _extract_raw_content(response: Any) -> Any:
+        if not getattr(response, "choices", None):
+            raise PlannerTransportProviderResponseError(
+                "OpenAI planner transport returned no choices.",
+                code="empty_choices",
+                provider=PlannerTransportProvider.OPENAI,
+                model=getattr(response, "model", "unknown"),
+                retryable=False,
+                response_id=getattr(response, "id", None),
+            )
+        message = response.choices[0].message
+        if getattr(message, "refusal", None):
+            raise PlannerTransportProviderResponseError(
+                f"OpenAI planner transport returned a refusal: {_sanitize_text(message.refusal, limit=300)}",
+                code="refusal",
+                provider=PlannerTransportProvider.OPENAI,
+                model=getattr(response, "model", "unknown"),
+                retryable=False,
+                response_id=getattr(response, "id", None),
+            )
+        content = getattr(message, "content", None)
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            text_parts = [item.get("text", "") for item in content if isinstance(item, dict)]
+            if text_parts:
+                return "".join(text_parts)
+        raise PlannerTransportProviderResponseError(
+            "OpenAI planner transport returned no structured message content.",
+            code="missing_content",
+            provider=PlannerTransportProvider.OPENAI,
+            model=getattr(response, "model", "unknown"),
+            retryable=False,
+            response_id=getattr(response, "id", None),
+        )
 
 
 class PlannerGraphState(TypedDict, total=False):
     context: PlannerContextWindow
-    raw_response: Any
+    transport_response: StructuredTransportResponse
+    transport_audit: PlannerTransportAuditView
     parsed_output: PlannerAdapterOutput
     format_failures: int
     parse_errors: list[str]
@@ -63,12 +363,14 @@ class LangGraphPlannerAdapter:
         *,
         transport: StructuredPlannerTransport,
         max_format_retries: int = 1,
+        max_user_prompt_chars: int = 12_000,
     ) -> None:
         self._transport = transport
         self._max_format_retries = max_format_retries
+        self._max_user_prompt_chars = max_user_prompt_chars
         self._compiled = self._build_graph().compile()
 
-    def invoke(self, context: PlannerContextWindow) -> tuple[PlannerAdapterOutput, int]:
+    def invoke(self, context: PlannerContextWindow) -> PlannerAdapterInvocationResult:
         state = self._compiled.invoke(
             {
                 "context": context,
@@ -82,8 +384,16 @@ class LangGraphPlannerAdapter:
             raise PlannerAdapterFormatError(
                 "Planner adapter could not parse a schema-valid structured response. "
                 f"Observed parse errors: {parse_errors}",
+                transport_audit=state.get("transport_audit"),
             )
-        return parsed, state.get("format_failures", 0)
+        transport_audit = state.get("transport_audit")
+        if transport_audit is None:
+            raise RuntimeError("Planner transport audit metadata was not recorded.")
+        return PlannerAdapterInvocationResult(
+            parsed_output=parsed,
+            format_failures=state.get("format_failures", 0),
+            transport_audit=transport_audit,
+        )
 
     def _build_graph(self) -> StateGraph[PlannerGraphState]:
         graph = StateGraph(PlannerGraphState)
@@ -103,15 +413,36 @@ class LangGraphPlannerAdapter:
 
     def _invoke_transport(self, state: PlannerGraphState) -> PlannerGraphState:
         context = state["context"]
-        raw_response = self._transport.invoke(
-            system_prompt=self._build_system_prompt(),
-            user_prompt=self._build_user_prompt(context, parse_errors=state.get("parse_errors", [])),
+        system_prompt = self._build_system_prompt()
+        user_prompt, truncated = self._build_user_prompt(context, parse_errors=state.get("parse_errors", []))
+        response = self._transport.invoke(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
             output_schema=PLANNER_ADAPTER_OUTPUT_ADAPTER.json_schema(),
         )
-        return {"raw_response": raw_response}
+        transport_audit = PlannerTransportAuditView(
+            provider=response.provider,
+            model=response.model,
+            response_id=response.response_id,
+            retry_count=response.retry_count,
+            truncated=truncated,
+            input_tokens=response.input_tokens,
+            output_tokens=response.output_tokens,
+            total_tokens=response.total_tokens,
+            system_prompt_hash=_sha256(system_prompt),
+            user_prompt_hash=_sha256(user_prompt),
+            user_prompt_chars=len(user_prompt),
+        )
+        return {
+            "transport_response": response,
+            "transport_audit": transport_audit,
+        }
 
     def _parse_output(self, state: PlannerGraphState) -> PlannerGraphState:
-        raw_response = state.get("raw_response")
+        transport_response = state.get("transport_response")
+        if transport_response is None:
+            raise RuntimeError("Planner graph is missing the provider response.")
+        raw_response = transport_response.raw_response
         normalized = raw_response
         if isinstance(raw_response, str):
             normalized = json.loads(raw_response)
@@ -120,7 +451,7 @@ class LangGraphPlannerAdapter:
         except (ValidationError, json.JSONDecodeError) as exc:
             return {
                 "format_failures": state.get("format_failures", 0) + 1,
-                "parse_errors": [*state.get("parse_errors", []), str(exc)],
+                "parse_errors": [*state.get("parse_errors", []), _sanitize_text(str(exc), limit=500)],
             }
         return {"parsed_output": parsed}
 
@@ -135,23 +466,108 @@ class LangGraphPlannerAdapter:
     def _build_system_prompt() -> str:
         return (
             "You are the bounded planner for V2_SPRING. "
-            "Return only schema-valid structured output. "
-            "Prefer a legal action proposal when the context shows a safe next move. "
-            "Use escalation only when every available legal action is blocked by a clear founder-facing blocker. "
+            "Return only schema-valid structured output that matches the discriminated union. "
+            "Use an action proposal when a safe legal move exists. "
+            "Use escalation only after checking the available legal actions and identifying a concrete founder-facing blocker. "
             "Do not fabricate missing state. "
-            "Summarize your reasoning in analysis_summary rather than emitting hidden chain-of-thought."
+            "Use analysis_summary to explain the decision briefly without hidden chain-of-thought."
         )
 
-    @staticmethod
     def _build_user_prompt(
+        self,
         context: PlannerContextWindow,
         *,
         parse_errors: list[str],
-    ) -> str:
-        payload = context.model_dump(mode="json")
+    ) -> tuple[str, bool]:
+        payload = self._sanitize_payload(context.model_dump(mode="json"))
         if parse_errors:
             payload["adapter_feedback"] = {
-                "previous_parse_errors": parse_errors[-2:],
-                "instruction": "Return a schema-valid response that matches the discriminator and field requirements.",
+                "previous_parse_errors": [_sanitize_text(item, limit=220) for item in parse_errors[-2:]],
+                "instruction": (
+                    "Return one schema-valid response. Do not mix action and escalation fields. "
+                    "Use the discriminator field `kind` first."
+                ),
             }
-        return json.dumps(payload, ensure_ascii=False, indent=2)
+
+        serialized = json.dumps(payload, ensure_ascii=False, indent=2)
+        if len(serialized) <= self._max_user_prompt_chars:
+            return serialized, False
+
+        truncated_payload = json.loads(serialized)
+        truncated = True
+
+        truncation_steps = [
+            lambda item: self._trim_list(item, "founder_interventions", keep=2),
+            lambda item: self._trim_list(item, "recent_attempts", keep=3),
+            lambda item: self._shrink_failure_report(item),
+            lambda item: self._trim_list(item, "founder_interventions", keep=1),
+            lambda item: self._trim_list(item, "recent_attempts", keep=1),
+            lambda item: self._clear_list(item, "founder_interventions"),
+            lambda item: self._clear_list(item, "recent_attempts"),
+        ]
+        for step in truncation_steps:
+            step(truncated_payload)
+            serialized = json.dumps(truncated_payload, ensure_ascii=False, indent=2)
+            if len(serialized) <= self._max_user_prompt_chars:
+                return serialized, truncated
+
+        fallback_payload = {
+            "snapshot": truncated_payload["snapshot"],
+            "legal_actions": truncated_payload["legal_actions"],
+            "masked_actions": truncated_payload["masked_actions"],
+            "failure_report": truncated_payload.get("failure_report"),
+            "adapter_feedback": truncated_payload.get("adapter_feedback"),
+        }
+        serialized = json.dumps(fallback_payload, ensure_ascii=False, indent=2)
+        if len(serialized) > self._max_user_prompt_chars:
+            serialized = serialized[: self._max_user_prompt_chars - 3] + "..."
+        return serialized, truncated
+
+    @classmethod
+    def _sanitize_payload(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return _sanitize_text(value, limit=900)
+        if isinstance(value, list):
+            return [cls._sanitize_payload(item) for item in value]
+        if isinstance(value, dict):
+            return {key: cls._sanitize_payload(item) for key, item in value.items()}
+        return value
+
+    @staticmethod
+    def _trim_list(payload: dict[str, Any], key: str, *, keep: int) -> None:
+        values = payload.get(key)
+        if isinstance(values, list) and len(values) > keep:
+            payload[key] = values[-keep:]
+
+    @staticmethod
+    def _clear_list(payload: dict[str, Any], key: str) -> None:
+        values = payload.get(key)
+        if isinstance(values, list):
+            payload[key] = []
+
+    @staticmethod
+    def _shrink_failure_report(payload: dict[str, Any]) -> None:
+        report = payload.get("failure_report")
+        if not isinstance(report, dict):
+            return
+        if isinstance(report.get("previous_rationale"), str):
+            report["previous_rationale"] = _sanitize_text(report["previous_rationale"], limit=250)
+        if isinstance(report.get("short_traceback"), str):
+            report["short_traceback"] = _sanitize_text(report["short_traceback"], limit=180)
+        if isinstance(report.get("observed_outcome"), str):
+            report["observed_outcome"] = _sanitize_text(report["observed_outcome"], limit=240)
+
+
+def _sha256(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _sanitize_text(value: str, *, limit: int) -> str:
+    cleaned = _CONTROL_CHARACTER_PATTERN.sub(" ", value)
+    cleaned = _PATH_PATTERN.sub("<path>", cleaned)
+    for pattern in _SECRET_PATTERNS:
+        cleaned = pattern.sub("<redacted>", cleaned)
+    cleaned = " ".join(cleaned.split())
+    if len(cleaned) > limit:
+        return cleaned[: limit - 3] + "..."
+    return cleaned

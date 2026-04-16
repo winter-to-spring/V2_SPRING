@@ -125,3 +125,6 @@ Observed In:
 - [RISK-0016 Planner may escalate too early or too often once escalation becomes a legal output type](entries/2026-04-17-premature-escalation-thrash.md)
 - ~~[RISK-0017 Founder reply semantics are still ambiguous after planner escalation](entries/2026-04-17-founder-reply-contract-ambiguity.md)~~
 - [RISK-0018 Founder reply CLI ergonomics may cause operator error before a richer surface exists](entries/2026-04-17-founder-reply-cli-ergonomics.md)
+- [RISK-0019 Single-provider structured output may leak vendor semantics into the core planner transport seam](entries/2026-04-17-provider-schema-lock-in.md)
+- ~~[RISK-0020 Provider/network errors may bypass planner governance if they are not normalized at the adapter edge](entries/2026-04-17-provider-error-normalization-leak.md)~~
+- [RISK-0021 Local CLI cancellation may leave an in-flight provider call orphaned after the terminal exits](entries/2026-04-17-provider-cancellation-orphan.md)

@@ -65,7 +65,20 @@ Step 10-a가 scripted proof transport로 adapter 계약과 governance slot을
 - output parsing은 자유 텍스트 후처리가 아니라
   **schema-enforced structured outputs**를 기본 경로로 사용합니다
 - provider 구현은 먼저 하나로 닫되, 내부 seam은 provider-agnostic하게 유지합니다
+- **OpenAI structured-output 경로를 첫 concrete transport로 구현**하고,
+  도메인 코어는 `PlannerTransport` 같은 내부 추상 경계 뒤에 숨깁니다
+- 외부 provider 예외는 코어 도메인으로 직접 새지 않게 하고,
+  adapter edge에서 내부 typed transport error로 정규화합니다
+- 공통 인터페이스를 만들되, 최소 공통 분모 때문에 provider 고유 강점을
+  포기하지 않도록 **transport seam은 좁게, concrete adapter는 풍부하게**
+  설계합니다
 - `stale`은 main planner budget과 분리된 stale quota를 사용합니다
+- production transport는 token usage metadata를 반드시 남기고,
+  provider 호출 전 bounded truncation/windowing을 수행합니다
+- cancellation / timeout / retry는 provider/network failure 경로에만 적용하고,
+  planner logic failure와 섞지 않습니다
+- 단일 provider 구현은 하되, provider SDK 타입과 예외는 코어로 새지 않게
+  adapter edge에서 모두 번역합니다
 
 ## Acceptance Criteria
 
@@ -76,6 +89,8 @@ Step 10-a가 scripted proof transport로 adapter 계약과 governance slot을
 - context window truncation 정책이 존재한다
 - 민감 정보 노출 없이 adapter observability가 확보된다
 - planner-facing audit hygiene 리스크가 완화된다
+- provider/network 예외가 raw SDK crash가 아니라 bounded internal transport
+  error로 드러난다
 
 ## 메모
 
@@ -83,3 +98,8 @@ Step 10-a가 scripted proof transport로 adapter 계약과 governance slot을
   planner logic failure와 섞지 않습니다
 - structured failure report의 fidelity가 낮으면 planner 품질도 같이 낮아지므로
   production hardening과 함께 failure report 품질 검토가 필요합니다
+- provider choice는 **single-provider-first, seam-kept-open**으로 간다
+- 첫 concrete transport는 OpenAI structured output을 기준으로 닫되,
+  나중 provider 추가 시 adapter edge 번역 레이어만 늘리는 방향이 좋습니다
+- local CLI cancellation으로 인한 provider-side orphan cost는 아직 완전히
+  닫지 못하므로 별도 리스크(`RISK-0021`)로 유지합니다

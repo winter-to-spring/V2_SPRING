@@ -20,6 +20,13 @@ class PlannerConfidence(StrEnum):
     HIGH = "high"
 
 
+class PlannerTransportProvider(StrEnum):
+    """Supported bounded planner transport providers."""
+
+    SCRIPTED = "scripted"
+    OPENAI = "openai"
+
+
 class FailureClass(StrEnum):
     """Normalized failure buckets fed back into the planner."""
 
@@ -199,6 +206,7 @@ class PlannerInvocationProofView(BaseModel):
     accepted_decision_id: UUID | None = None
     escalation_observation_id: UUID | None = None
     stale_quota_exhausted: bool = False
+    transport: "PlannerTransportAuditView"
 
     @field_validator("policy_version")
     @classmethod
@@ -214,4 +222,40 @@ class PlannerInvocationProofView(BaseModel):
         cleaned = value.strip().lower()
         if len(cleaned) != 64 or any(character not in "0123456789abcdef" for character in cleaned):
             raise ValueError("snapshot_hash must be a 64-character hexadecimal string")
+        return cleaned
+
+
+class PlannerTransportAuditView(BaseModel):
+    """Provider-facing transport metadata safe for replay and founder inspection."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    provider: PlannerTransportProvider
+    model: str = Field(min_length=1, max_length=200)
+    response_id: str | None = Field(default=None, max_length=200)
+    retry_count: int = Field(ge=0)
+    truncated: bool = False
+    input_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+    total_tokens: int | None = Field(default=None, ge=0)
+    system_prompt_hash: str = Field(min_length=64, max_length=64)
+    user_prompt_hash: str = Field(min_length=64, max_length=64)
+    user_prompt_chars: int = Field(ge=0)
+
+    @field_validator("model", "response_id")
+    @classmethod
+    def ensure_optional_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("value must not be blank when provided")
+        return cleaned
+
+    @field_validator("system_prompt_hash", "user_prompt_hash")
+    @classmethod
+    def ensure_sha256(cls, value: str) -> str:
+        cleaned = value.strip().lower()
+        if len(cleaned) != 64 or any(character not in "0123456789abcdef" for character in cleaned):
+            raise ValueError("value must be a 64-character hexadecimal string")
         return cleaned

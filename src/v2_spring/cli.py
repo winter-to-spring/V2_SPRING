@@ -9,18 +9,23 @@ from pydantic import ValidationError
 
 from v2_spring.adapters.langgraph_planner import (
     LangGraphPlannerAdapter,
+    OpenAIStructuredPlannerTransport,
+    PlannerTransportError,
     ScriptedStructuredPlannerTransport,
 )
-from v2_spring.config import load_config
+from v2_spring.config import AppConfig, load_config
 from v2_spring.domain.approval import ApprovalStatus
 from v2_spring.domain.founder_intervention import (
     FOUNDER_REPLY_INPUT_ADAPTER,
     FounderInterventionView,
 )
+from v2_spring.domain.observation import ObservationKind
 from v2_spring.domain.planner_adapter import (
     ActionProposal,
     EscalationProposal,
     PlannerInvocationProofView,
+    PlannerTransportAuditView,
+    PlannerTransportProvider,
 )
 from v2_spring.domain.planner_attempt import PlannerAttemptView
 from v2_spring.domain.proposal import PlannerProposalInput, PlannerProposalView
@@ -368,6 +373,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     planner_invoke_parser.add_argument("run_id", help="Run id to target.")
     planner_invoke_parser.add_argument(
+        "--provider",
+        default=None,
+        choices=[provider.value for provider in PlannerTransportProvider],
+        help="Planner transport provider. Defaults to PLANNER_PROVIDER or scripted.",
+    )
+    planner_invoke_parser.add_argument(
+        "--model",
+        default=None,
+        help="Optional provider model override. Defaults to the configured planner model.",
+    )
+    planner_invoke_parser.add_argument(
         "--scripted-response-json",
         default=None,
         help="Single structured planner response payload as JSON for CLI proofing.",
@@ -503,6 +519,33 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _build_store(database_url_override: str | None) -> LedgerStore:
     return LedgerStore(load_config(database_url_override).database_url)
+
+
+def _build_planner_transport(
+    *,
+    args: argparse.Namespace,
+    config: AppConfig,
+):
+    provider = PlannerTransportProvider(args.provider) if args.provider else config.planner_provider
+    if provider == PlannerTransportProvider.SCRIPTED:
+        scripted_responses = _load_scripted_planner_responses(
+            inline_json=args.scripted_response_json,
+            file_path=args.scripted_response_file,
+        )
+        return ScriptedStructuredPlannerTransport(scripted_responses), provider
+    if provider == PlannerTransportProvider.OPENAI:
+        if not config.openai_api_key:
+            raise ValueError(
+                "OPENAI_API_KEY is not configured. Set it in the environment before using --provider openai.",
+            )
+        transport = OpenAIStructuredPlannerTransport(
+            model=args.model or config.planner_openai_model,
+            api_key=config.openai_api_key,
+            timeout_seconds=config.planner_timeout_seconds,
+            max_retries=config.planner_max_retries,
+        )
+        return transport, provider
+    raise ValueError(f"Unsupported planner transport provider: {provider.value}")
 
 
 def _render_run(run_id: str, store: LedgerStore) -> str:
@@ -914,6 +957,20 @@ def _render_planner_invocation(proof: PlannerInvocationProofView) -> str:
         f"format_failures:      {proof.format_failures}",
         f"stale_quota_exhausted:{proof.stale_quota_exhausted}",
         "",
+        "Transport",
+        "---------",
+        f"provider:             {proof.transport.provider.value}",
+        f"model:                {proof.transport.model}",
+        f"response_id:          {proof.transport.response_id if proof.transport.response_id else '-'}",
+        f"retry_count:          {proof.transport.retry_count}",
+        f"truncated:            {proof.transport.truncated}",
+        f"input_tokens:         {proof.transport.input_tokens if proof.transport.input_tokens is not None else '-'}",
+        f"output_tokens:        {proof.transport.output_tokens if proof.transport.output_tokens is not None else '-'}",
+        f"total_tokens:         {proof.transport.total_tokens if proof.transport.total_tokens is not None else '-'}",
+        f"system_prompt_hash:   {proof.transport.system_prompt_hash}",
+        f"user_prompt_hash:     {proof.transport.user_prompt_hash}",
+        f"user_prompt_chars:    {proof.transport.user_prompt_chars}",
+        "",
         "Context window",
         "--------------",
         f"legal_actions:        {', '.join(action.name.value for action in proof.context_window.legal_actions) or '-'}",
@@ -963,6 +1020,93 @@ def _render_planner_invocation(proof: PlannerInvocationProofView) -> str:
             ],
         )
     return "\n".join(lines)
+
+
+def _record_transport_success_audit(
+    *,
+    store: LedgerStore,
+    run_id: str,
+    audit: PlannerTransportAuditView,
+) -> None:
+    store.record_observation(
+        run_id=run_id,
+        kind=ObservationKind.SYSTEM_AUDIT,
+        summary=f"Planner transport completed via {audit.provider.value} and produced a structured candidate.",
+        details=(
+            "error_code=planner_transport_success; "
+            f"provider={audit.provider.value}; "
+            f"model={audit.model}; "
+            f"response_id={audit.response_id if audit.response_id else '-'}; "
+            f"retry_count={audit.retry_count}; "
+            f"input_tokens={audit.input_tokens if audit.input_tokens is not None else '-'}; "
+            f"output_tokens={audit.output_tokens if audit.output_tokens is not None else '-'}; "
+            f"total_tokens={audit.total_tokens if audit.total_tokens is not None else '-'}; "
+            f"truncated={audit.truncated}; "
+            f"system_prompt_hash={audit.system_prompt_hash}; "
+            f"user_prompt_hash={audit.user_prompt_hash}; "
+            f"user_prompt_chars={audit.user_prompt_chars}."
+        ),
+    )
+
+
+def _record_transport_format_failure_audit(
+    *,
+    store: LedgerStore,
+    run_id: str,
+    audit: PlannerTransportAuditView | None,
+    reason: str,
+) -> None:
+    if audit is None:
+        details = f"error_code=planner_transport_format_failure; reason={reason}."
+        summary = "Planner transport returned a response that failed schema parsing."
+    else:
+        details = (
+            "error_code=planner_transport_format_failure; "
+            f"provider={audit.provider.value}; "
+            f"model={audit.model}; "
+            f"response_id={audit.response_id if audit.response_id else '-'}; "
+            f"retry_count={audit.retry_count}; "
+            f"input_tokens={audit.input_tokens if audit.input_tokens is not None else '-'}; "
+            f"output_tokens={audit.output_tokens if audit.output_tokens is not None else '-'}; "
+            f"total_tokens={audit.total_tokens if audit.total_tokens is not None else '-'}; "
+            f"truncated={audit.truncated}; "
+            f"system_prompt_hash={audit.system_prompt_hash}; "
+            f"user_prompt_hash={audit.user_prompt_hash}; "
+            f"user_prompt_chars={audit.user_prompt_chars}; "
+            f"reason={reason}."
+        )
+        summary = (
+            f"Planner transport via {audit.provider.value} returned a response that failed schema parsing."
+        )
+    store.record_observation(
+        run_id=run_id,
+        kind=ObservationKind.SYSTEM_AUDIT,
+        summary=summary,
+        details=details,
+    )
+
+
+def _record_transport_error_audit(
+    *,
+    store: LedgerStore,
+    run_id: str,
+    error: PlannerTransportError,
+) -> None:
+    store.record_observation(
+        run_id=run_id,
+        kind=ObservationKind.SYSTEM_AUDIT,
+        summary=f"Planner transport via {error.provider.value} failed before a structured response was accepted.",
+        details=(
+            f"error_code={error.code}; "
+            f"provider={error.provider.value}; "
+            f"model={error.model}; "
+            f"retryable={error.retryable}; "
+            f"retry_count={error.retry_count}; "
+            f"status_code={error.status_code if error.status_code is not None else '-'}; "
+            f"response_id={error.response_id if error.response_id else '-'}; "
+            f"message={str(error)}."
+        ),
+    )
 
 
 def _render_planner_attempt(attempt: PlannerAttemptView) -> str:
@@ -1490,7 +1634,8 @@ def main() -> None:
         return
 
     if args.command == "planner" and args.planner_command == "invoke":
-        store = _build_store(args.database_url)
+        config = load_config(args.database_url)
+        store = LedgerStore(config.database_url)
         try:
             context = store.build_planner_context(args.run_id)
             if context.snapshot.pending_founder_escalation is not None:
@@ -1503,16 +1648,20 @@ def main() -> None:
                     "Planner phase budget is exhausted for the current state segment. "
                     "Use `v2-spring planner recharge <run-id> --reason ...` or resolve the founder lane first.",
                 )
-            scripted_responses = _load_scripted_planner_responses(
-                inline_json=args.scripted_response_json,
-                file_path=args.scripted_response_file,
-            )
+            transport, _ = _build_planner_transport(args=args, config=config)
             adapter = LangGraphPlannerAdapter(
-                transport=ScriptedStructuredPlannerTransport(scripted_responses),
+                transport=transport,
+                max_user_prompt_chars=config.planner_max_context_chars,
             )
             try:
-                parsed_output, format_failures = adapter.invoke(context)
+                invocation = adapter.invoke(context)
             except PlannerAdapterFormatError as exc:
+                _record_transport_format_failure_audit(
+                    store=store,
+                    run_id=args.run_id,
+                    audit=exc.transport_audit,
+                    reason=str(exc),
+                )
                 store.record_planner_format_failure(
                     run_id=args.run_id,
                     snapshot_hash=context.snapshot.state_hash,
@@ -1522,39 +1671,45 @@ def main() -> None:
 
             accepted_decision_id = None
             escalation_observation_id = None
-            if isinstance(parsed_output, ActionProposal):
+            if isinstance(invocation.parsed_output, ActionProposal):
                 recorded = store.record_planner_proposal(
                     run_id=args.run_id,
                     proposal=PlannerProposalInput(
                         snapshot_hash=context.snapshot.state_hash,
-                        selected_action=parsed_output.selected_action,
-                        rationale=parsed_output.analysis_summary,
-                        expected_outcome=parsed_output.expected_outcome,
+                        selected_action=invocation.parsed_output.selected_action,
+                        rationale=invocation.parsed_output.analysis_summary,
+                        expected_outcome=invocation.parsed_output.expected_outcome,
                     ),
                 )
                 accepted_decision_id = recorded.decision_id
-            elif isinstance(parsed_output, EscalationProposal):
+            elif isinstance(invocation.parsed_output, EscalationProposal):
                 observation = store.record_planner_escalation(
                     run_id=args.run_id,
                     snapshot_hash=context.snapshot.state_hash,
-                    analysis_summary=parsed_output.analysis_summary,
-                    confidence=parsed_output.confidence.value,
-                    help_kind=parsed_output.help_kind.value,
-                    blocking_reason=parsed_output.blocking_reason,
-                    requested_help=parsed_output.requested_help,
+                    analysis_summary=invocation.parsed_output.analysis_summary,
+                    confidence=invocation.parsed_output.confidence.value,
+                    help_kind=invocation.parsed_output.help_kind.value,
+                    blocking_reason=invocation.parsed_output.blocking_reason,
+                    requested_help=invocation.parsed_output.requested_help,
                 )
                 escalation_observation_id = observation.id
 
+            _record_transport_success_audit(
+                store=store,
+                run_id=args.run_id,
+                audit=invocation.transport_audit,
+            )
             proof = PlannerInvocationProofView(
                 run_id=context.snapshot.run.id,
                 policy_version=context.snapshot.policy_version,
                 snapshot_hash=context.snapshot.state_hash,
                 context_window=context,
-                parsed_output=parsed_output,
-                format_failures=format_failures,
+                parsed_output=invocation.parsed_output,
+                format_failures=invocation.format_failures,
                 accepted_decision_id=accepted_decision_id,
                 escalation_observation_id=escalation_observation_id,
                 stale_quota_exhausted=context.snapshot.planner_stale_quota_exhausted,
+                transport=invocation.transport_audit,
             )
             if args.format == "json":
                 print(json.dumps(proof.model_dump(mode="json"), indent=2, ensure_ascii=False))
@@ -1571,7 +1726,10 @@ def main() -> None:
             CognitiveDuplicatePlannerProposalError,
             PlannerPhaseExhaustedError,
             PermissionError,
+            PlannerTransportError,
         ) as exc:
+            if isinstance(exc, PlannerTransportError):
+                _record_transport_error_audit(store=store, run_id=args.run_id, error=exc)
             print(str(exc))
             raise SystemExit(1) from exc
         return

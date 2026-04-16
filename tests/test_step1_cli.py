@@ -6,6 +6,8 @@ import json
 import pytest
 
 from v2_spring.cli import main
+from v2_spring.adapters.langgraph_planner import StructuredTransportResponse
+from v2_spring.domain.planner_adapter import PlannerTransportProvider
 
 
 def test_run_create_and_show_cli_flow(capsys, monkeypatch, tmp_path: Path) -> None:
@@ -801,6 +803,7 @@ def test_planner_invoke_cli_accepts_action_and_escalation(capsys, monkeypatch, t
     main()
     invoke_output = capsys.readouterr().out
     assert "Planner invocation" in invoke_output
+    assert "provider:             scripted" in invoke_output
     assert "selected_action:     execute_bounded_task" in invoke_output
 
     monkeypatch.setattr(
@@ -850,6 +853,7 @@ def test_planner_invoke_cli_accepts_action_and_escalation(capsys, monkeypatch, t
     )
     main()
     escalation_output = capsys.readouterr().out
+    assert "provider:             scripted" in escalation_output
     assert "kind:                escalation" in escalation_output
     assert "help_kind:           policy_decision" in escalation_output
 
@@ -919,6 +923,105 @@ def test_planner_invoke_cli_records_format_failure(capsys, monkeypatch, tmp_path
     assert exc.value.code == 1
     output = capsys.readouterr().out
     assert "could not parse a schema-valid structured response" in output
+
+
+def test_planner_invoke_cli_accepts_openai_provider_path_without_network(
+    capsys,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    database_url = f"sqlite+pysqlite:///{tmp_path / 'cli-step10c-openai.db'}"
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("PLANNER_OPENAI_MODEL", "gpt-4o-test")
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "run",
+            "create",
+            "--project",
+            "demo",
+            "--goal",
+            "Exercise the openai transport seam without a real network call",
+            "--urgency",
+            "normal",
+            "--risk",
+            "medium",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    run_id = capsys.readouterr().out.splitlines()[0].split()[-1]
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["v2-spring", "approval", "list", "--database-url", database_url],
+    )
+    main()
+    approval_output = capsys.readouterr().out
+    approval_id = next(line.strip().replace("1. ", "") for line in approval_output.splitlines() if line.startswith("1. "))
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "approval",
+            "resolve",
+            approval_id,
+            "--approve",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    capsys.readouterr()
+
+    class FakeOpenAITransport:
+        def __init__(self, **kwargs) -> None:
+            self.model = kwargs["model"]
+
+        def invoke(self, *, system_prompt: str, user_prompt: str, output_schema: dict[str, object]):
+            return StructuredTransportResponse(
+                raw_response=json.dumps(
+                    {
+                        "kind": "action",
+                        "analysis_summary": "The openai seam should still choose bounded execution.",
+                        "confidence": "medium",
+                        "selected_action": "execute_bounded_task",
+                        "expected_outcome": "One accepted proposal should be recorded without a network call.",
+                    },
+                ),
+                provider=PlannerTransportProvider.OPENAI,
+                model=self.model,
+                response_id="resp_test_openai",
+                retry_count=1,
+                input_tokens=50,
+                output_tokens=20,
+                total_tokens=70,
+            )
+
+    monkeypatch.setattr("v2_spring.cli.OpenAIStructuredPlannerTransport", FakeOpenAITransport)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "planner",
+            "invoke",
+            run_id,
+            "--provider",
+            "openai",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    output = capsys.readouterr().out
+    assert "provider:             openai" in output
+    assert "model:                gpt-4o-test" in output
+    assert "selected_action:     execute_bounded_task" in output
 
 
 def test_founder_hint_cli_reopens_pending_escalation_and_lists_interventions(
