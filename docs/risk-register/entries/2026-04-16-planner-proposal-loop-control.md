@@ -17,6 +17,11 @@ does not yet define what should happen when the same planner repeatedly submits:
 There is currently no max-retry rule, no duplicate-submission policy, and no
 idempotency key for planner proposals.
 
+Step 9 will treat this as a **phase-scoped governance problem**, not a
+run-lifetime global budget problem. The immediate goal is to prevent bounded
+planner loops from spinning forever inside one state segment while still
+allowing long multi-stage runs to progress.
+
 ## Impact
 
 - future planner adapters may waste tokens by looping on the same bad move
@@ -32,6 +37,8 @@ and finite.
 ## Suggested Mitigation
 
 - define a planner-side retry policy for stale/illegal proposals
+- define planner attempt budget as a phase-scoped budget with deterministic
+  reset on successful state advancement
 - decide whether identical proposals should be deduplicated or recorded as
   distinct attempts
 - introduce an idempotency key or equivalent submission identity once a real
