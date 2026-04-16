@@ -51,6 +51,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override DATABASE_URL for this invocation.",
     )
+
+    events_parser = run_subparsers.add_parser("events", help="Show ledger events for a run.")
+    events_parser.add_argument("run_id", help="Run id to inspect.")
+    events_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Override DATABASE_URL for this invocation.",
+    )
     return parser
 
 
@@ -79,6 +87,49 @@ def _render_run(run_id: str, store: LedgerStore) -> str:
         {run.goal}
         """,
     ).strip()
+
+
+def _render_events(run_id: str, store: LedgerStore) -> str:
+    run = store.get_run(run_id)
+    if run is None:
+        raise LookupError(f"Run {run_id} was not found.")
+
+    ledger_events = store.list_events_for_run(run_id)
+    decisions = {str(item.id): item for item in store.list_decisions_for_run(run_id)}
+    observations = {str(item.id): item for item in store.list_observations_for_run(run_id)}
+
+    lines = [
+        "Run events",
+        "----------",
+        f"run_id: {run.id}",
+    ]
+
+    for index, event in enumerate(ledger_events, start=1):
+        lines.extend(
+            [
+                "",
+                f"{index}. {event.event_type.value}",
+                f"   recorded_at: {event.recorded_at.isoformat()}",
+            ],
+        )
+
+        if event.event_type.value == "DECISION_RECORDED":
+            decision = decisions.get(event.payload.get("decision_id", ""))
+            if decision is not None:
+                lines.append(f"   summary:     {decision.summary}")
+                lines.append(f"   rationale:   {decision.rationale}")
+                continue
+
+        if event.event_type.value == "OBSERVATION_RECORDED":
+            observation = observations.get(event.payload.get("observation_id", ""))
+            if observation is not None:
+                lines.append(f"   summary:     {observation.summary}")
+                lines.append(f"   details:     {observation.details}")
+                continue
+
+        lines.append(f"   payload:     {event.payload}")
+
+    return "\n".join(lines)
 
 
 def main() -> None:
@@ -117,6 +168,15 @@ def main() -> None:
         store = _build_store(args.database_url)
         try:
             print(_render_run(args.run_id, store))
+        except LookupError as exc:
+            print(str(exc))
+            raise SystemExit(1) from exc
+        return
+
+    if args.command == "run" and args.run_command == "events":
+        store = _build_store(args.database_url)
+        try:
+            print(_render_events(args.run_id, store))
         except LookupError as exc:
             print(str(exc))
             raise SystemExit(1) from exc

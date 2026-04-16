@@ -8,6 +8,8 @@ from uuid import uuid4
 from sqlalchemy import DateTime, Enum, ForeignKey, JSON, String, event
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
+from v2_spring.domain.decision import DecisionKind
+from v2_spring.domain.observation import ObservationKind
 from v2_spring.domain.run import RiskLevel, RunStatus, UrgencyLevel
 
 
@@ -21,6 +23,8 @@ class Base(DeclarativeBase):
 
 class LedgerEventType(StrEnum):
     RUN_CREATED = "RUN_CREATED"
+    OBSERVATION_RECORDED = "OBSERVATION_RECORDED"
+    DECISION_RECORDED = "DECISION_RECORDED"
 
 
 class RunRecord(Base):
@@ -58,6 +62,62 @@ class RunRecord(Base):
         back_populates="run",
         cascade="all, delete-orphan",
     )
+    decisions: Mapped[list["DecisionRecord"]] = relationship(
+        back_populates="run",
+        cascade="all, delete-orphan",
+    )
+    observations: Mapped[list["ObservationRecord"]] = relationship(
+        back_populates="run",
+        cascade="all, delete-orphan",
+    )
+
+
+class DecisionRecord(Base):
+    __tablename__ = "decisions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("runs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    kind: Mapped[DecisionKind] = mapped_column(
+        Enum(DecisionKind, native_enum=False),
+        nullable=False,
+    )
+    summary: Mapped[str] = mapped_column(String(400), nullable=False)
+    rationale: Mapped[str] = mapped_column(String(4000), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=utc_now,
+    )
+
+    run: Mapped[RunRecord] = relationship(back_populates="decisions")
+
+
+class ObservationRecord(Base):
+    __tablename__ = "observations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("runs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    kind: Mapped[ObservationKind] = mapped_column(
+        Enum(ObservationKind, native_enum=False),
+        nullable=False,
+    )
+    summary: Mapped[str] = mapped_column(String(400), nullable=False)
+    details: Mapped[str] = mapped_column(String(4000), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=utc_now,
+    )
+
+    run: Mapped[RunRecord] = relationship(back_populates="observations")
 
 
 class EventLedgerRecord(Base):
@@ -91,3 +151,7 @@ def _prevent_mutation(_: Any, __: Any, target: EventLedgerRecord) -> None:
 
 event.listen(EventLedgerRecord, "before_update", _prevent_mutation)
 event.listen(EventLedgerRecord, "before_delete", _prevent_mutation)
+event.listen(DecisionRecord, "before_update", _prevent_mutation)
+event.listen(DecisionRecord, "before_delete", _prevent_mutation)
+event.listen(ObservationRecord, "before_update", _prevent_mutation)
+event.listen(ObservationRecord, "before_delete", _prevent_mutation)

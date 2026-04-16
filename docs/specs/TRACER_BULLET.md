@@ -40,6 +40,7 @@ Expected result:
 - a `Run` is created in Postgres
 - an initial `Observation` is recorded
 - an initial `Decision` record explains that the run entered planning
+- the append-only ledger captures all three bootstrap events
 
 ### Step 2. Build a state snapshot
 
