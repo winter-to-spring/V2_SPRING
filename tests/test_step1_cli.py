@@ -49,3 +49,23 @@ def test_run_create_and_show_cli_flow(capsys, monkeypatch, tmp_path: Path) -> No
     assert created_run_id in show_output
     assert "status:     created" in show_output
     assert "Analyze repository structure" in show_output
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "run",
+            "events",
+            created_run_id,
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    events_output = capsys.readouterr().out
+
+    assert "RUN_CREATED" in events_output
+    assert "DECISION_RECORDED" in events_output
+    assert "OBSERVATION_RECORDED" in events_output
+    assert "Run was submitted from the CLI." in events_output
+    assert "Run intake accepted." in events_output

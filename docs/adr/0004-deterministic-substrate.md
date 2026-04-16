@@ -15,6 +15,8 @@ unreplayable.
 - V2 starts with a hybrid persistence model:
   - state tables for current truth
   - append-only event ledger for replay and audit
+- Decisions and observations are recorded in typed tables and mirrored into the
+  append-only ledger as immutable process evidence.
 
 ## Consequences
 - Queue, lease, cancel, retry, and resume semantics must be explicit.
