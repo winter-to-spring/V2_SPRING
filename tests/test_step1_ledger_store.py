@@ -272,3 +272,76 @@ def test_bounded_execution_failure_records_failed_task(tmp_path: Path, monkeypat
     assert "timed out" in (result.task.stderr or "").lower()
     assert events[-2].event_type == LedgerEventType.TASK_FAILED
     assert events[-1].event_type == LedgerEventType.OBSERVATION_RECORDED
+
+
+def test_build_run_replay_includes_linkage_and_integrity(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "README.md").write_text("# Demo\n", encoding="utf-8")
+    run = store.create_run(
+        RunCreateInput(
+            project="demo",
+            goal="Analyze repository structure",
+            urgency="normal",
+            risk="medium",
+        ),
+    )
+    approval = store.list_approvals(status=ApprovalStatus.PENDING)[0]
+    store.resolve_approval(str(approval.id), approved=True)
+    execution = store.execute_bounded_task(
+        run_id=str(run.id),
+        workspace=workspace,
+        artifact_root=tmp_path / "artifacts",
+        timeout_seconds=5,
+    )
+
+    replay = store.build_run_replay(str(run.id))
+
+    assert replay.run.id == run.id
+    assert len(replay.approvals) == 1
+    assert any(decision.kind == DecisionKind.BOUNDED_TASK_SELECTED for decision in replay.decisions)
+    assert len(replay.tasks) == 1
+    task_replay = replay.tasks[0]
+    assert task_replay.task.id == execution.task.id
+    assert task_replay.decision is not None
+    assert len(task_replay.artifacts) == 1
+    assert task_replay.artifacts[0].artifact.id == execution.artifact.id
+    assert task_replay.artifacts[0].file_exists is True
+    assert task_replay.artifacts[0].hash_matches is True
+    assert replay.orphan_artifacts == []
+    assert replay.consistency_warnings == []
+
+
+def test_get_artifact_reports_hash_mismatch_when_file_changes(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "README.md").write_text("# Demo\n", encoding="utf-8")
+    run = store.create_run(
+        RunCreateInput(
+            project="demo",
+            goal="Analyze repository structure",
+            urgency="normal",
+            risk="medium",
+        ),
+    )
+    approval = store.list_approvals(status=ApprovalStatus.PENDING)[0]
+    store.resolve_approval(str(approval.id), approved=True)
+    execution = store.execute_bounded_task(
+        run_id=str(run.id),
+        workspace=workspace,
+        artifact_root=tmp_path / "artifacts",
+        timeout_seconds=5,
+    )
+
+    artifact_path = Path(execution.artifact.path)
+    artifact_path.write_text("tampered\n", encoding="utf-8")
+
+    inspected = store.get_artifact(str(execution.artifact.id))
+    replay = store.build_run_replay(str(run.id))
+
+    assert inspected is not None
+    assert inspected.file_exists is True
+    assert inspected.hash_matches is False
+    assert any("no longer match the stored sha256" in warning for warning in replay.consistency_warnings)

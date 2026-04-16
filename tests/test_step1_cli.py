@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 
 from v2_spring.cli import main
 
@@ -390,3 +391,145 @@ def test_run_execute_requires_approved_run(capsys, monkeypatch, tmp_path: Path) 
 
     execute_output = capsys.readouterr().out
     assert "requires the run to be ready" in execute_output
+
+
+def test_run_replay_and_detail_queries_cli(capsys, monkeypatch, tmp_path: Path) -> None:
+    database_url = f"sqlite+pysqlite:///{tmp_path / 'cli-step6.db'}"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "README.md").write_text("# Demo\n", encoding="utf-8")
+    artifact_root = tmp_path / "artifacts"
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "run",
+            "create",
+            "--project",
+            "demo",
+            "--goal",
+            "Replay one bounded execution",
+            "--urgency",
+            "normal",
+            "--risk",
+            "medium",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    run_id = capsys.readouterr().out.splitlines()[0].split()[-1]
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["v2-spring", "approval", "list", "--database-url", database_url],
+    )
+    main()
+    approval_output = capsys.readouterr().out
+    approval_id = next(
+        line.strip().replace("1. ", "")
+        for line in approval_output.splitlines()
+        if line.startswith("1. ")
+    )
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "approval",
+            "resolve",
+            approval_id,
+            "--approve",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    capsys.readouterr()
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "run",
+            "execute",
+            run_id,
+            "--workspace",
+            str(workspace),
+            "--artifact-root",
+            str(artifact_root),
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    execute_output = capsys.readouterr().out
+    task_id = next(
+        line.split(":", maxsplit=1)[1].strip()
+        for line in execute_output.splitlines()
+        if line.startswith("task_id:")
+    )
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["v2-spring", "run", "replay", run_id, "--database-url", database_url],
+    )
+    main()
+    replay_output = capsys.readouterr().out
+    assert "Run replay" in replay_output
+    assert "Approval summary" in replay_output
+    assert "Execution path" in replay_output
+    assert "Repository scan report" in replay_output
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "run",
+            "replay",
+            run_id,
+            "--format",
+            "json",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    replay_json_output = capsys.readouterr().out
+    replay_payload = json.loads(replay_json_output)
+    assert replay_payload["run"]["id"] == run_id
+    assert replay_payload["tasks"][0]["task"]["id"] == task_id
+    artifact_id = replay_payload["tasks"][0]["artifacts"][0]["artifact"]["id"]
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "task",
+            "show",
+            task_id,
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    task_output = capsys.readouterr().out
+    assert "Decision linkage" in task_output
+    assert "Artifacts" in task_output
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "artifact",
+            "show",
+            artifact_id,
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    artifact_output = capsys.readouterr().out
+    assert "Artifact" in artifact_output
+    assert "hash_matches:       True" in artifact_output

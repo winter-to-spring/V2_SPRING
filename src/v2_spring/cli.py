@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 from textwrap import dedent
 
@@ -8,6 +9,7 @@ from pydantic import ValidationError
 
 from v2_spring.config import load_config
 from v2_spring.domain.approval import ApprovalStatus
+from v2_spring.domain.replay import ArtifactInspectionView, RunReplayView, TaskReplayView
 from v2_spring.ledger.store import BoundedExecutionResult, LedgerStore
 
 
@@ -61,6 +63,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override DATABASE_URL for this invocation.",
     )
 
+    replay_parser = run_subparsers.add_parser(
+        "replay",
+        help="Show a compact replay summary for a run.",
+    )
+    replay_parser.add_argument("run_id", help="Run id to replay.")
+    replay_parser.add_argument(
+        "--format",
+        default="pretty",
+        choices=["pretty", "json"],
+        help="Output format. Defaults to pretty.",
+    )
+    replay_parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Include deeper details such as full observations and approval history.",
+    )
+    replay_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Override DATABASE_URL for this invocation.",
+    )
+
     execute_parser = run_subparsers.add_parser(
         "execute",
         help="Execute the first bounded task for an approved run.",
@@ -99,12 +123,43 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override DATABASE_URL for this invocation.",
     )
 
+    task_show_parser = task_subparsers.add_parser("show", help="Show one task with linkage details.")
+    task_show_parser.add_argument("task_id", help="Task id to inspect.")
+    task_show_parser.add_argument(
+        "--format",
+        default="pretty",
+        choices=["pretty", "json"],
+        help="Output format. Defaults to pretty.",
+    )
+    task_show_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Override DATABASE_URL for this invocation.",
+    )
+
     artifact_parser = subparsers.add_parser("artifact", help="Inspect produced artifacts.")
     artifact_subparsers = artifact_parser.add_subparsers(dest="artifact_command")
 
     artifact_list_parser = artifact_subparsers.add_parser("list", help="List artifacts for a run.")
     artifact_list_parser.add_argument("--run", required=True, help="Run id to inspect.")
     artifact_list_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Override DATABASE_URL for this invocation.",
+    )
+
+    artifact_show_parser = artifact_subparsers.add_parser(
+        "show",
+        help="Show one artifact with provenance and integrity details.",
+    )
+    artifact_show_parser.add_argument("artifact_id", help="Artifact id to inspect.")
+    artifact_show_parser.add_argument(
+        "--format",
+        default="pretty",
+        choices=["pretty", "json"],
+        help="Output format. Defaults to pretty.",
+    )
+    artifact_show_parser.add_argument(
         "--database-url",
         default=None,
         help="Override DATABASE_URL for this invocation.",
@@ -369,6 +424,156 @@ def _render_execution_result(result: BoundedExecutionResult) -> str:
     ).strip()
 
 
+def _render_replay(replay: RunReplayView, *, verbose: bool) -> str:
+    lines = [
+        "Run replay",
+        "----------",
+        f"run_id:         {replay.run.id}",
+        f"project:        {replay.run.project}",
+        f"status:         {replay.run.status.value}",
+        f"urgency:        {replay.run.urgency.value}",
+        f"risk:           {replay.run.risk.value}",
+        "",
+        "goal:",
+        replay.run.goal,
+        "",
+        "Approval summary",
+        "----------------",
+    ]
+
+    if replay.approvals:
+        latest_approval = replay.approvals[-1]
+        lines.extend(
+            [
+                f"- current approval state: {latest_approval.status.value}",
+                f"- requested action: {latest_approval.requested_action}",
+                f"- resolution reason: {latest_approval.resolution_reason if latest_approval.resolution_reason else '-'}",
+            ],
+        )
+    else:
+        lines.append("- no approvals recorded")
+
+    lines.extend(["", "Execution path", "--------------"])
+    if not replay.tasks:
+        lines.append("- no tasks recorded yet")
+    else:
+        for task_replay in replay.tasks:
+            lines.append(
+                f"- {task_replay.task.summary} [{task_replay.task.status.value}]",
+            )
+            if task_replay.decision is not None:
+                lines.append(f"  decision: {task_replay.decision.summary}")
+            if task_replay.artifacts:
+                for artifact in task_replay.artifacts:
+                    lines.append(
+                        f"  artifact: {artifact.artifact.title} "
+                        f"(exists={artifact.file_exists}, hash_matches={artifact.hash_matches})",
+                    )
+            elif task_replay.task.status == task_replay.task.status.COMPLETED:
+                lines.append("  artifact: -")
+
+    failed_attempts = [
+        task_replay
+        for task_replay in replay.tasks
+        if task_replay.task.status.value == "failed"
+    ]
+    if failed_attempts:
+        lines.extend(["", "Failed attempts", "---------------"])
+        for task_replay in failed_attempts:
+            lines.append(f"- {task_replay.task.summary}")
+            lines.append(f"  stderr: {task_replay.task.stderr if task_replay.task.stderr else '-'}")
+
+    if replay.consistency_warnings:
+        lines.extend(["", "Consistency warnings", "--------------------"])
+        for warning in replay.consistency_warnings:
+            lines.append(f"- {warning}")
+
+    if verbose:
+        lines.extend(["", "Detailed approvals", "-----------------"])
+        for approval in replay.approvals:
+            lines.append(
+                f"- {approval.id}: {approval.status.value} / {approval.requested_action}",
+            )
+
+        lines.extend(["", "Detailed decisions", "------------------"])
+        for decision in replay.decisions:
+            lines.append(f"- {decision.id}: {decision.summary}")
+            lines.append(f"  rationale: {decision.rationale}")
+
+        lines.extend(["", "Detailed observations", "---------------------"])
+        for observation in replay.observations:
+            lines.append(f"- {observation.kind.value}: {observation.summary}")
+            lines.append(f"  details: {observation.details}")
+
+    return "\n".join(lines)
+
+
+def _render_task_detail(task_replay: TaskReplayView) -> str:
+    lines = [
+        "Task",
+        "----",
+        f"id:                 {task_replay.task.id}",
+        f"run_id:             {task_replay.task.run_id}",
+        f"status:             {task_replay.task.status.value}",
+        f"kind:               {task_replay.task.kind.value}",
+        f"summary:            {task_replay.task.summary}",
+        f"decision_id:        {task_replay.task.decision_id if task_replay.task.decision_id else '-'}",
+        f"execution_context:  {task_replay.task.execution_context_id}",
+        f"command:            {task_replay.task.command}",
+        f"cwd:                {task_replay.task.cwd}",
+        f"timeout_seconds:    {task_replay.task.timeout_seconds}",
+        f"stdout:             {task_replay.task.stdout if task_replay.task.stdout else '-'}",
+        f"stderr:             {task_replay.task.stderr if task_replay.task.stderr else '-'}",
+    ]
+    if task_replay.decision is not None:
+        lines.extend(
+            [
+                "",
+                "Decision linkage",
+                "----------------",
+                f"id:                 {task_replay.decision.id}",
+                f"summary:            {task_replay.decision.summary}",
+                f"rationale:          {task_replay.decision.rationale}",
+            ],
+        )
+    lines.extend(["", "Artifacts", "---------"])
+    if not task_replay.artifacts:
+        lines.append("No artifacts linked to this task.")
+    else:
+        for artifact in task_replay.artifacts:
+            lines.append(
+                f"- {artifact.artifact.id}: {artifact.artifact.title} "
+                f"(exists={artifact.file_exists}, hash_matches={artifact.hash_matches})",
+            )
+    return "\n".join(lines)
+
+
+def _render_artifact_detail(artifact: ArtifactInspectionView) -> str:
+    item = artifact.artifact
+    return dedent(
+        f"""\
+        Artifact
+        --------
+        id:                 {item.id}
+        run_id:             {item.run_id}
+        task_id:            {item.task_id}
+        decision_id:        {item.decision_id if item.decision_id else '-'}
+        type:               {item.artifact_type.value}
+        title:              {item.title}
+        storage_kind:       {item.storage_kind.value}
+        path:               {item.path}
+        size_bytes:         {item.size_bytes}
+        sha256:             {item.sha256}
+        file_exists:        {artifact.file_exists}
+        hash_matches:       {artifact.hash_matches}
+        execution_context:  {item.execution_context_id}
+        command:            {item.command}
+        cwd:                {item.cwd}
+        created_at:         {item.created_at.isoformat()}
+        """,
+    ).strip()
+
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
@@ -421,6 +626,19 @@ def main() -> None:
             raise SystemExit(1) from exc
         return
 
+    if args.command == "run" and args.run_command == "replay":
+        store = _build_store(args.database_url)
+        try:
+            replay = store.build_run_replay(args.run_id)
+            if args.format == "json":
+                print(json.dumps(replay.model_dump(mode="json"), indent=2, ensure_ascii=False))
+            else:
+                print(_render_replay(replay, verbose=args.verbose))
+        except LookupError as exc:
+            print(str(exc))
+            raise SystemExit(1) from exc
+        return
+
     if args.command == "run" and args.run_command == "execute":
         store = _build_store(args.database_url)
         try:
@@ -441,9 +659,38 @@ def main() -> None:
         print(_render_tasks(args.run, store))
         return
 
+    if args.command == "task" and args.task_command == "show":
+        store = _build_store(args.database_url)
+        task = store.get_task(args.task_id)
+        if task is None:
+            print(f"Task {args.task_id} was not found.")
+            raise SystemExit(1)
+        replay = store.build_run_replay(str(task.run_id))
+        task_replay = next((item for item in replay.tasks if str(item.task.id) == args.task_id), None)
+        if task_replay is None:
+            print(f"Task {args.task_id} is not linked inside run {task.run_id}.")
+            raise SystemExit(1)
+        if args.format == "json":
+            print(json.dumps(task_replay.model_dump(mode="json"), indent=2, ensure_ascii=False))
+        else:
+            print(_render_task_detail(task_replay))
+        return
+
     if args.command == "artifact" and args.artifact_command == "list":
         store = _build_store(args.database_url)
         print(_render_artifacts(args.run, store))
+        return
+
+    if args.command == "artifact" and args.artifact_command == "show":
+        store = _build_store(args.database_url)
+        artifact = store.get_artifact(args.artifact_id)
+        if artifact is None:
+            print(f"Artifact {args.artifact_id} was not found.")
+            raise SystemExit(1)
+        if args.format == "json":
+            print(json.dumps(artifact.model_dump(mode="json"), indent=2, ensure_ascii=False))
+        else:
+            print(_render_artifact_detail(artifact))
         return
 
     if args.command == "approval" and args.approval_command == "list":
