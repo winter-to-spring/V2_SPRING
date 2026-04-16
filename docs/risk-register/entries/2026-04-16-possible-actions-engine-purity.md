@@ -1,5 +1,5 @@
 # Risk ID: RISK-0007
-Title: Possible-actions engine purity may drift as planner logic grows
+Title: ~~Possible-actions engine purity may drift as planner logic grows~~
 Class: Before Next Phase
 Status: Resolved
 Owner: Core / Planner boundary

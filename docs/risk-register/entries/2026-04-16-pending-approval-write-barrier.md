@@ -1,5 +1,5 @@
 # Risk ID: RISK-0003
-Title: Pending approval lacks a write barrier for non-approval state changes
+Title: ~~Pending approval lacks a write barrier for non-approval state changes~~
 Class: Before Next Phase
 Status: Resolved
 Owner: Core orchestration

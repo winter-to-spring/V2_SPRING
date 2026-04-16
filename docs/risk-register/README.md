@@ -58,6 +58,23 @@ We do not say "sometime later" without also saying:
 - before which capability
 - or before which scale jump
 
+### 6. Resolved risks stay visible
+
+Resolved risks are **not deleted** from the register.
+
+They stay in the shared history so future contributors can see:
+
+- what went wrong
+- when it was fixed
+- which slice fixed it
+
+When a risk is resolved:
+
+- keep the entry file
+- keep the status as `Resolved`
+- strike through the title in the index and in the entry itself so it reads as
+  "this existed, and it was closed"
+
 ## Minimal Entry Template
 
 ```markdown
@@ -97,11 +114,11 @@ Observed In:
 ## Current Entries
 
 - [RISK-0001 Approval timeout / deadlock](entries/2026-04-16-approval-timeout.md)
-- [RISK-0002 Approval reject reason missing](entries/2026-04-16-approval-reject-reason.md)
-- [RISK-0003 Pending approval write barrier missing](entries/2026-04-16-pending-approval-write-barrier.md)
+- [~~RISK-0002 Approval reject reason missing~~](entries/2026-04-16-approval-reject-reason.md)
+- [~~RISK-0003 Pending approval write barrier missing~~](entries/2026-04-16-pending-approval-write-barrier.md)
 - [RISK-0004 Service-level approval barrier race window](entries/2026-04-16-service-level-barrier-race-window.md)
 - [RISK-0005 RunSnapshot staleness under concurrent writes](entries/2026-04-16-run-snapshot-staleness.md)
 - [RISK-0006 Snapshot/action read-model growth](entries/2026-04-16-snapshot-read-model-growth.md)
-- [RISK-0007 Possible-actions engine purity drift](entries/2026-04-16-possible-actions-engine-purity.md)
+- [~~RISK-0007 Possible-actions engine purity drift~~](entries/2026-04-16-possible-actions-engine-purity.md)
 - [RISK-0008 Planner proposal loop lacks retry bounds and idempotency policy](entries/2026-04-16-planner-proposal-loop-control.md)
 - [RISK-0009 Planner-facing audit payload hygiene](entries/2026-04-16-planner-audit-payload-hygiene.md)
