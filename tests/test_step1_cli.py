@@ -6,7 +6,8 @@ import json
 import pytest
 
 from v2_spring.cli import main
-from v2_spring.adapters.langgraph_planner import StructuredTransportResponse
+from v2_spring.adapters.langgraph_planner import PlannerTransportCancelledError, StructuredTransportResponse
+from v2_spring.ledger.store import LedgerStore
 from v2_spring.domain.planner_adapter import PlannerTransportProvider
 
 
@@ -1121,6 +1122,105 @@ def test_planner_invoke_cli_accepts_anthropic_provider_path_without_network(
     assert "provider:             anthropic" in output
     assert "model:                claude-3-5-test" in output
     assert "kind:                escalation" in output
+
+
+def test_planner_invoke_cli_records_local_cancel_with_orphan_risk_metadata(
+    capsys,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    database_url = f"sqlite+pysqlite:///{tmp_path / 'cli-step10c-cancel.db'}"
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("PLANNER_OPENAI_MODEL", "gpt-4o-test")
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "run",
+            "create",
+            "--project",
+            "demo",
+            "--goal",
+            "Surface local cancellation as bounded orphan-risk audit evidence",
+            "--urgency",
+            "normal",
+            "--risk",
+            "medium",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    run_id = capsys.readouterr().out.splitlines()[0].split()[-1]
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["v2-spring", "approval", "list", "--database-url", database_url],
+    )
+    main()
+    approval_output = capsys.readouterr().out
+    approval_id = next(line.strip().replace("1. ", "") for line in approval_output.splitlines() if line.startswith("1. "))
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "approval",
+            "resolve",
+            approval_id,
+            "--approve",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    capsys.readouterr()
+
+    class CancelledOpenAITransport:
+        def __init__(self, **kwargs) -> None:
+            self.model = kwargs["model"]
+
+        def invoke(self, *, system_prompt: str, user_prompt: str, output_schema: dict[str, object]):
+            raise PlannerTransportCancelledError(
+                "Planner provider invocation was interrupted locally before completion.",
+                code="cancelled",
+                provider=PlannerTransportProvider.OPENAI,
+                model=self.model,
+                retryable=False,
+                retry_count=0,
+                timeout_seconds=19,
+                orphan_risk_possible=True,
+            )
+
+    monkeypatch.setattr("v2_spring.cli.OpenAIStructuredPlannerTransport", CancelledOpenAITransport)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "planner",
+            "invoke",
+            run_id,
+            "--provider",
+            "openai",
+            "--database-url",
+            database_url,
+        ],
+    )
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 1
+    output = capsys.readouterr().out
+    assert "interrupted locally before completion" in output
+
+    store = LedgerStore(database_url)
+    observations = store.list_observations_for_run(run_id)
+    audit = observations[-1]
+    assert "error_code=cancelled" in audit.details
+    assert "orphan_risk_possible=True" in audit.details
+    assert "timeout_seconds=19" in audit.details
+    assert "cancellation_scope=local_cli_only" in audit.details
 
 
 def test_founder_hint_cli_reopens_pending_escalation_and_lists_interventions(

@@ -1,6 +1,7 @@
 """External adapters such as LangGraph and CrewAI live here."""
 
 from .langgraph_planner import (
+    AnthropicStructuredPlannerTransport,
     LangGraphPlannerAdapter,
     OpenAIStructuredPlannerTransport,
     PlannerAdapterInvocationResult,
@@ -17,6 +18,7 @@ from .langgraph_planner import (
 
 __all__ = [
     "LangGraphPlannerAdapter",
+    "AnthropicStructuredPlannerTransport",
     "OpenAIStructuredPlannerTransport",
     "PlannerAdapterInvocationResult",
     "PlannerTransportAuthenticationError",

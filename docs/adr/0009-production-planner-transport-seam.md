@@ -41,6 +41,8 @@ Rules:
   separate from planner phase budget accounting
 - a second provider path may be added behind the same seam without changing
   planner core types
+- local cancellation is normalized into typed transport errors and recorded as
+  bounded orphan-risk audit evidence rather than being treated as a silent drop
 
 ## Consequences
 

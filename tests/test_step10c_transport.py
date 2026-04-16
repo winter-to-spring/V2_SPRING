@@ -4,10 +4,13 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from v2_spring.adapters.langgraph_planner import (
     AnthropicStructuredPlannerTransport,
     LangGraphPlannerAdapter,
     OpenAIStructuredPlannerTransport,
+    PlannerTransportCancelledError,
     ScriptedStructuredPlannerTransport,
 )
 from v2_spring.domain.approval import ApprovalStatus
@@ -258,3 +261,33 @@ def test_langgraph_adapter_accepts_second_provider_without_core_changes(tmp_path
     assert invocation.parsed_output.kind == "escalation"
     assert invocation.transport_audit.provider == PlannerTransportProvider.ANTHROPIC
     assert invocation.transport_audit.model == "claude-3-5-sonnet-latest"
+
+
+class _InterruptingOpenAIClient:
+    def __init__(self) -> None:
+        def _create(**kwargs):
+            raise KeyboardInterrupt()
+
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=_create))
+
+
+def test_openai_transport_marks_local_cancel_as_bounded_orphan_risk() -> None:
+    transport = OpenAIStructuredPlannerTransport(
+        model="gpt-4o",
+        client=_InterruptingOpenAIClient(),
+        timeout_seconds=17,
+        max_retries=0,
+    )
+
+    with pytest.raises(PlannerTransportCancelledError) as exc_info:
+        transport.invoke(
+            system_prompt="system prompt",
+            user_prompt="user prompt",
+            output_schema={"type": "object"},
+        )
+
+    error = exc_info.value
+    assert error.code == "cancelled"
+    assert error.provider == PlannerTransportProvider.OPENAI
+    assert error.timeout_seconds == 17
+    assert error.orphan_risk_possible is True

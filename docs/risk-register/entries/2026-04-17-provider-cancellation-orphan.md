@@ -1,7 +1,7 @@
 # Risk ID: RISK-0021
 Title: Local CLI cancellation may leave an in-flight provider call orphaned after the terminal exits
 Class: Before Scale
-Status: Open
+Status: Mitigating
 Owner: Core / Planner transport
 Observed In: Step 10-c production transport hardening
 
@@ -42,6 +42,16 @@ surfaces, cancellation semantics must become more explicit.
 - add worker-safe cancellation policy before moving planner transport off the
   foreground CLI
 
+Current mitigation:
+
+- local cancellation is normalized into a typed `PlannerTransportCancelledError`
+- cancellation audit observations now include:
+  - `timeout_seconds`
+  - `orphan_risk_possible`
+  - `cancellation_scope=local_cli_only`
+  - a bounded reinvocation hint for founders
+- transport tests and CLI tests now cover the cancellation path explicitly
+
 ## Capability Gate
 - Capability: background planner workers / long-running planner invokes
 - Gate mode: Before Scale
@@ -64,3 +74,4 @@ surfaces, cancellation semantics must become more explicit.
 
 ## Last Updated
 - 2026-04-17
+- 2026-04-17 (mitigating)

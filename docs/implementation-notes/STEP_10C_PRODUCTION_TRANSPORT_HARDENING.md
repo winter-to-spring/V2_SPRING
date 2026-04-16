@@ -64,5 +64,17 @@ The planner core now runs unchanged against:
 Both providers are translated at the adapter edge into the same
 `StructuredTransportResponse` and `PlannerTransportAuditView` shapes.
 
-`RISK-0021` remains open because local CLI cancellation can still leave a remote
-provider request in flight for a bounded amount of time.
+`RISK-0021` is now mitigating rather than fully open.
+
+Current cancellation guardrails:
+
+- local transport cancellation is normalized into a typed `cancelled` transport
+  error
+- audit observations now record:
+  - `timeout_seconds`
+  - `orphan_risk_possible`
+  - `cancellation_scope=local_cli_only`
+  - a bounded reinvocation hint
+
+The risk remains because this is still foreground CLI cancellation, not true
+provider-side request abort or worker-safe cancellation.

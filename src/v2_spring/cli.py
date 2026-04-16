@@ -1130,6 +1130,31 @@ def _record_transport_error_audit(
     run_id: str,
     error: PlannerTransportError,
 ) -> None:
+    if error.code == "cancelled":
+        summary = (
+            f"Planner transport via {error.provider.value} was interrupted locally before a structured response was accepted."
+        )
+        details = (
+            f"error_code={error.code}; "
+            f"provider={error.provider.value}; "
+            f"model={error.model}; "
+            f"retryable={error.retryable}; "
+            f"retry_count={error.retry_count}; "
+            f"status_code={error.status_code if error.status_code is not None else '-'}; "
+            f"response_id={error.response_id if error.response_id else '-'}; "
+            f"timeout_seconds={error.timeout_seconds if error.timeout_seconds is not None else '-'}; "
+            f"orphan_risk_possible={error.orphan_risk_possible}; "
+            "cancellation_scope=local_cli_only; "
+            "recommended_action=inspect planner attempts and provider telemetry before reinvoking; "
+            f"message={str(error)}."
+        )
+        store.record_observation(
+            run_id=run_id,
+            kind=ObservationKind.SYSTEM_AUDIT,
+            summary=summary,
+            details=details,
+        )
+        return
     store.record_observation(
         run_id=run_id,
         kind=ObservationKind.SYSTEM_AUDIT,
@@ -1142,6 +1167,8 @@ def _record_transport_error_audit(
             f"retry_count={error.retry_count}; "
             f"status_code={error.status_code if error.status_code is not None else '-'}; "
             f"response_id={error.response_id if error.response_id else '-'}; "
+            f"timeout_seconds={error.timeout_seconds if error.timeout_seconds is not None else '-'}; "
+            f"orphan_risk_possible={error.orphan_risk_possible}; "
             f"message={str(error)}."
         ),
     )

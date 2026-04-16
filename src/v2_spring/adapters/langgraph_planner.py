@@ -65,6 +65,8 @@ class PlannerTransportError(RuntimeError):
         retry_count: int = 0,
         response_id: str | None = None,
         status_code: int | None = None,
+        timeout_seconds: float | None = None,
+        orphan_risk_possible: bool = False,
     ) -> None:
         super().__init__(message)
         self.code = code
@@ -74,6 +76,8 @@ class PlannerTransportError(RuntimeError):
         self.retry_count = retry_count
         self.response_id = response_id
         self.status_code = status_code
+        self.timeout_seconds = timeout_seconds
+        self.orphan_risk_possible = orphan_risk_possible
 
 
 class PlannerTransportTimeoutError(PlannerTransportError):
@@ -210,6 +214,8 @@ class OpenAIStructuredPlannerTransport:
                     model=self._model,
                     retryable=False,
                     retry_count=attempts,
+                    timeout_seconds=self._timeout_seconds,
+                    orphan_risk_possible=True,
                 ) from exc
             except Exception as exc:  # pragma: no cover - exercised by fake client tests
                 normalized = self._normalize_error(exc, retry_count=attempts)
@@ -250,6 +256,7 @@ class OpenAIStructuredPlannerTransport:
                 retryable=True,
                 retry_count=retry_count,
                 status_code=status_code,
+                timeout_seconds=self._timeout_seconds,
             )
         if name == "RateLimitError" or status_code == 429:
             return PlannerTransportRateLimitError(
@@ -260,6 +267,7 @@ class OpenAIStructuredPlannerTransport:
                 retryable=True,
                 retry_count=retry_count,
                 status_code=status_code,
+                timeout_seconds=self._timeout_seconds,
             )
         if name == "APIConnectionError":
             return PlannerTransportNetworkError(
@@ -270,6 +278,7 @@ class OpenAIStructuredPlannerTransport:
                 retryable=True,
                 retry_count=retry_count,
                 status_code=status_code,
+                timeout_seconds=self._timeout_seconds,
             )
         if status_code in {401, 403} or name == "AuthenticationError":
             return PlannerTransportAuthenticationError(
@@ -280,6 +289,7 @@ class OpenAIStructuredPlannerTransport:
                 retryable=False,
                 retry_count=retry_count,
                 status_code=status_code,
+                timeout_seconds=self._timeout_seconds,
             )
         if isinstance(status_code, int) and status_code >= 500:
             return PlannerTransportUnavailableError(
@@ -290,6 +300,7 @@ class OpenAIStructuredPlannerTransport:
                 retryable=True,
                 retry_count=retry_count,
                 status_code=status_code,
+                timeout_seconds=self._timeout_seconds,
             )
         return PlannerTransportProviderResponseError(
             f"OpenAI planner transport failed with an unexpected provider response: {message}",
@@ -299,6 +310,7 @@ class OpenAIStructuredPlannerTransport:
             retryable=False,
             retry_count=retry_count,
             status_code=status_code,
+            timeout_seconds=self._timeout_seconds,
         )
 
     @staticmethod
@@ -416,6 +428,8 @@ class AnthropicStructuredPlannerTransport:
                     model=self._model,
                     retryable=False,
                     retry_count=attempts,
+                    timeout_seconds=self._timeout_seconds,
+                    orphan_risk_possible=True,
                 ) from exc
             except Exception as exc:  # pragma: no cover - exercised by fake client tests
                 normalized = self._normalize_error(exc, retry_count=attempts)
@@ -456,6 +470,7 @@ class AnthropicStructuredPlannerTransport:
                 retryable=True,
                 retry_count=retry_count,
                 status_code=status_code,
+                timeout_seconds=self._timeout_seconds,
             )
         if name == "RateLimitError" or status_code == 429:
             return PlannerTransportRateLimitError(
@@ -466,6 +481,7 @@ class AnthropicStructuredPlannerTransport:
                 retryable=True,
                 retry_count=retry_count,
                 status_code=status_code,
+                timeout_seconds=self._timeout_seconds,
             )
         if name in {"APIConnectionError", "APIError"} and status_code is None:
             return PlannerTransportNetworkError(
@@ -476,6 +492,7 @@ class AnthropicStructuredPlannerTransport:
                 retryable=True,
                 retry_count=retry_count,
                 status_code=status_code,
+                timeout_seconds=self._timeout_seconds,
             )
         if status_code in {401, 403} or name == "AuthenticationError":
             return PlannerTransportAuthenticationError(
@@ -486,6 +503,7 @@ class AnthropicStructuredPlannerTransport:
                 retryable=False,
                 retry_count=retry_count,
                 status_code=status_code,
+                timeout_seconds=self._timeout_seconds,
             )
         if isinstance(status_code, int) and status_code >= 500:
             return PlannerTransportUnavailableError(
@@ -496,6 +514,7 @@ class AnthropicStructuredPlannerTransport:
                 retryable=True,
                 retry_count=retry_count,
                 status_code=status_code,
+                timeout_seconds=self._timeout_seconds,
             )
         return PlannerTransportProviderResponseError(
             f"Anthropic planner transport failed with an unexpected provider response: {message}",
@@ -505,6 +524,7 @@ class AnthropicStructuredPlannerTransport:
             retryable=False,
             retry_count=retry_count,
             status_code=status_code,
+            timeout_seconds=self._timeout_seconds,
         )
 
     @staticmethod
