@@ -12,6 +12,9 @@ unreplayable.
 - Redis is coordination only.
 - Planners do not mutate state directly.
 - Deterministic executors perform state transitions.
+- V2 starts with a hybrid persistence model:
+  - state tables for current truth
+  - append-only event ledger for replay and audit
 
 ## Consequences
 - Queue, lease, cancel, retry, and resume semantics must be explicit.

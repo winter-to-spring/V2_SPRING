@@ -6,9 +6,16 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "langgraph",
+  "pydantic>=2.11",
   "python-dotenv",
   "psycopg[binary]",
   "redis",
+  "sqlalchemy>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3",
 ]
 
 [project.scripts]
@@ -23,4 +30,3 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
