@@ -44,7 +44,7 @@ from v2_spring.ledger.models import (
     TaskRecord,
     utc_now,
 )
-from v2_spring.planner.actions import evaluate_possible_actions
+from v2_spring.planner.actions import POSSIBLE_ACTIONS_ENGINE_VERSION, evaluate_possible_actions
 from v2_spring.planner.proposals import IllegalPlannerProposalError, StalePlannerProposalError
 
 
@@ -558,6 +558,7 @@ class LedgerStore:
             task_summary = self._build_task_status_summary(task_records)
 
             snapshot_payload = {
+                "policy_version": POSSIBLE_ACTIONS_ENGINE_VERSION,
                 "run": self._to_run_view(run_record).model_dump(mode="json"),
                 "pending_approval": pending_approval.model_dump(mode="json") if pending_approval else None,
                 "latest_rejection_reason": latest_rejection_reason,
@@ -572,6 +573,7 @@ class LedgerStore:
 
             return RunSnapshotView(
                 snapshot_timestamp=utc_now(),
+                policy_version=POSSIBLE_ACTIONS_ENGINE_VERSION,
                 state_hash=state_hash,
                 run=self._to_run_view(run_record),
                 action_state=SnapshotActionState.STUCK,
@@ -595,6 +597,14 @@ class LedgerStore:
         snapshot = self.build_run_snapshot(run_id)
         evaluation = evaluate_possible_actions(snapshot)
         legal_actions = {action.name for action in evaluation.actions}
+        legal_action_descriptions = [
+            {
+                "name": action.name.value,
+                "reason": action.reason,
+                "context_hint": action.context_hint,
+            }
+            for action in evaluation.actions
+        ]
 
         if proposal.snapshot_hash != evaluation.snapshot.state_hash:
             self.record_observation(
@@ -603,6 +613,7 @@ class LedgerStore:
                 summary="Planner proposal rejected because the snapshot hash was stale.",
                 details=(
                     f"Selected action={proposal.selected_action.value}; "
+                    f"policy_version={evaluation.snapshot.policy_version}; "
                     f"provided_hash={proposal.snapshot_hash}; "
                     f"current_hash={evaluation.snapshot.state_hash}."
                 ),
@@ -618,12 +629,19 @@ class LedgerStore:
                 summary="Planner proposal rejected because the selected action was not legal.",
                 details=(
                     f"Selected action={proposal.selected_action.value}; "
-                    f"legal_actions={[action.name.value for action in evaluation.actions]}."
+                    f"action_state={evaluation.snapshot.action_state.value}; "
+                    f"action_state_reason={evaluation.snapshot.action_state_reason}; "
+                    f"legal_actions={legal_action_descriptions}."
                 ),
+            )
+            legal_action_summary = ", ".join(
+                f"{action['name']} ({action['reason']})" for action in legal_action_descriptions
             )
             raise IllegalPlannerProposalError(
                 f"Planner action {proposal.selected_action.value} is not legal for run {run_id} under the current snapshot. "
-                f"Legal actions: {[action.name.value for action in evaluation.actions]}.",
+                f"Current action_state={evaluation.snapshot.action_state.value} "
+                f"({evaluation.snapshot.action_state_reason}). "
+                f"Legal actions: {legal_action_summary if legal_action_summary else 'none'}.",
             )
 
         decision = self.record_decision(
@@ -633,17 +651,21 @@ class LedgerStore:
             rationale=proposal.rationale,
             allow_during_waiting_approval=True,
             extra_payload={
+                "policy_version": evaluation.snapshot.policy_version,
                 "snapshot_hash": proposal.snapshot_hash,
                 "selected_action": proposal.selected_action.value,
                 "expected_outcome": proposal.expected_outcome,
                 "legal_actions": [action.name.value for action in evaluation.actions],
+                "legal_action_details": legal_action_descriptions,
                 "action_state": evaluation.snapshot.action_state.value,
+                "action_state_reason": evaluation.snapshot.action_state_reason,
             },
         )
 
         return PlannerProposalView(
             decision_id=decision.id,
             run_id=decision.run_id,
+            policy_version=evaluation.snapshot.policy_version,
             snapshot_hash=proposal.snapshot_hash,
             selected_action=proposal.selected_action,
             rationale=proposal.rationale,
@@ -665,6 +687,7 @@ class LedgerStore:
                     {
                         "decision_id": event.payload["decision_id"],
                         "run_id": run_id,
+                        "policy_version": event.payload.get("policy_version", POSSIBLE_ACTIONS_ENGINE_VERSION),
                         "snapshot_hash": event.payload["snapshot_hash"],
                         "selected_action": event.payload["selected_action"],
                         "rationale": event.payload["rationale"],

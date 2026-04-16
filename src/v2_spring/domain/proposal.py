@@ -42,11 +42,20 @@ class PlannerProposalView(BaseModel):
 
     decision_id: UUID
     run_id: UUID
+    policy_version: str = Field(min_length=1, max_length=100)
     snapshot_hash: str = Field(min_length=64, max_length=64)
     selected_action: PossibleActionName
     rationale: str = Field(min_length=1, max_length=4000)
     expected_outcome: str = Field(min_length=1, max_length=4000)
     created_at: datetime
+
+    @field_validator("policy_version")
+    @classmethod
+    def ensure_policy_version(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("value must not be blank")
+        return cleaned
 
     @field_validator("snapshot_hash")
     @classmethod

@@ -9,6 +9,7 @@ This slice introduces:
 - a typed `PlannerProposal` input contract
 - deterministic legality validation against the current legal move set
 - snapshot-hash freshness checks
+- policy-version visibility folded into the snapshot hash contract
 - CLI proof commands for `planner propose` and `planner show`
 
 ## Why This Matters
@@ -52,6 +53,11 @@ That matters because legality drift would otherwise create a split brain:
 
 Step 8 avoids that by using one deterministic source.
 
+The same engine now also carries an explicit policy version. That version is
+surfaced in snapshots and folded into the `state_hash`, so a future engine
+policy change naturally invalidates old proposals instead of silently
+pretending cross-version compatibility exists.
+
 ## Freshness Policy
 
 The proposal must carry the `snapshot_hash` it was created against.
@@ -64,8 +70,10 @@ over quietly accepting a proposal built against an old world-model.
 Rejected proposals are not silently dropped.
 
 Step 8 records a `SYSTEM_AUDIT` observation whenever a proposal is rejected for
-staleness or illegality. That keeps replay and debugging honest even though no
-planner `Decision` is written for rejected proposals.
+staleness or illegality. Rejected illegality checks also include the current
+action state and legal action reasons, so the planner boundary is easier to
+debug when a proposal is blocked. This keeps replay and debugging honest even
+though no planner `Decision` is written for rejected proposals.
 
 ## Approval Boundary Policy
 

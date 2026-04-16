@@ -526,6 +526,7 @@ def _render_snapshot(snapshot: RunSnapshotView) -> str:
         "------------",
         f"run_id:              {snapshot.run.id}",
         f"snapshot_timestamp:  {snapshot.snapshot_timestamp.isoformat()}",
+        f"policy_version:      {snapshot.policy_version}",
         f"state_hash:          {snapshot.state_hash}",
         f"status:              {snapshot.run.status.value}",
         f"action_state:        {snapshot.action_state.value}",
@@ -588,6 +589,7 @@ def _render_actions(evaluation: PossibleActionEvaluationView) -> str:
         "-----------",
         f"run_id:              {evaluation.snapshot.run.id}",
         f"snapshot_timestamp:  {evaluation.snapshot.snapshot_timestamp.isoformat()}",
+        f"policy_version:      {evaluation.snapshot.policy_version}",
         f"state_hash:          {evaluation.snapshot.state_hash}",
         f"action_state:        {evaluation.snapshot.action_state.value}",
         f"action_state_reason: {evaluation.snapshot.action_state_reason}",
@@ -615,6 +617,7 @@ def _render_planner_proposal(proposal: PlannerProposalView) -> str:
         -------------------------
         decision_id:        {proposal.decision_id}
         run_id:             {proposal.run_id}
+        policy_version:     {proposal.policy_version}
         snapshot_hash:      {proposal.snapshot_hash}
         selected_action:    {proposal.selected_action.value}
         rationale:          {proposal.rationale}
@@ -636,6 +639,7 @@ def _render_planner_proposals(proposals: list[PlannerProposalView], *, run_id: s
                 "",
                 f"{index}. {proposal.decision_id}",
                 f"   action:            {proposal.selected_action.value}",
+                f"   policy_version:    {proposal.policy_version}",
                 f"   snapshot_hash:     {proposal.snapshot_hash}",
                 f"   rationale:         {proposal.rationale}",
                 f"   expected_outcome:  {proposal.expected_outcome}",

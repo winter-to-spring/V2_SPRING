@@ -87,6 +87,7 @@ class RunSnapshotView(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     snapshot_timestamp: datetime
+    policy_version: str = Field(min_length=1, max_length=100)
     state_hash: str = Field(min_length=64, max_length=64)
     run: RunView
     action_state: SnapshotActionState
@@ -106,7 +107,7 @@ class RunSnapshotView(BaseModel):
             raise ValueError("state_hash must be a 64-character hexadecimal string")
         return cleaned
 
-    @field_validator("action_state_reason", "latest_rejection_reason", "latest_decision_summary")
+    @field_validator("policy_version", "action_state_reason", "latest_rejection_reason", "latest_decision_summary")
     @classmethod
     def ensure_optional_text(cls, value: str | None) -> str | None:
         if value is None:

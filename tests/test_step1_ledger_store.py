@@ -13,7 +13,7 @@ from v2_spring.domain.proposal import PlannerProposalInput
 from v2_spring.domain.run import RunCreateInput, RunStatus
 from v2_spring.domain.snapshot import PossibleActionName, SnapshotActionState
 from v2_spring.domain.task import TaskKind, TaskStatus
-from v2_spring.planner.actions import evaluate_possible_actions
+from v2_spring.planner.actions import POSSIBLE_ACTIONS_ENGINE_VERSION, evaluate_possible_actions
 from v2_spring.executor.bounded import BoundedExecutorTimeout
 from v2_spring.ledger.models import LedgerEventType
 from v2_spring.ledger.store import LedgerStore
@@ -365,6 +365,7 @@ def test_run_snapshot_and_possible_actions_cover_ready_and_terminal_paths(tmp_pa
     waiting_snapshot = store.build_run_snapshot(str(run.id))
     waiting_actions = evaluate_possible_actions(waiting_snapshot)
     assert waiting_snapshot.pending_approval is not None
+    assert waiting_snapshot.policy_version == POSSIBLE_ACTIONS_ENGINE_VERSION
     assert len(waiting_snapshot.state_hash) == 64
     assert waiting_actions.snapshot.action_state == SnapshotActionState.AVAILABLE
     assert waiting_actions.actions[0].name == PossibleActionName.RESOLVE_PENDING_APPROVAL
@@ -446,10 +447,14 @@ def test_planner_proposal_accepts_only_current_legal_moves(tmp_path: Path) -> No
     recorded = store.record_planner_proposal(run_id=str(run.id), proposal=proposal)
     proposals = store.list_planner_proposals_for_run(str(run.id))
     decisions = store.list_decisions_for_run(str(run.id))
+    events = store.list_events_for_run(str(run.id))
 
     assert recorded.selected_action == PossibleActionName.EXECUTE_BOUNDED_TASK
+    assert recorded.policy_version == POSSIBLE_ACTIONS_ENGINE_VERSION
     assert proposals[-1].decision_id == recorded.decision_id
     assert decisions[-1].kind == DecisionKind.PLANNER_PROPOSAL_ACCEPTED
+    assert events[-1].payload["policy_version"] == POSSIBLE_ACTIONS_ENGINE_VERSION
+    assert events[-1].payload["legal_action_details"][0]["name"] == PossibleActionName.EXECUTE_BOUNDED_TASK.value
 
 
 def test_planner_proposal_can_record_pending_approval_resolution_as_non_mutating_evidence(tmp_path: Path) -> None:
@@ -492,7 +497,7 @@ def test_planner_proposal_rejects_stale_hash_and_illegal_action(tmp_path: Path) 
     )
     waiting_snapshot = store.build_run_snapshot(str(run.id))
 
-    with pytest.raises(IllegalPlannerProposalError):
+    with pytest.raises(IllegalPlannerProposalError) as illegal_exc:
         store.record_planner_proposal(
             run_id=str(run.id),
             proposal=PlannerProposalInput(
@@ -502,6 +507,8 @@ def test_planner_proposal_rejects_stale_hash_and_illegal_action(tmp_path: Path) 
                 expected_outcome="Execution should not be allowed.",
             ),
         )
+    assert "action_state=available" in str(illegal_exc.value).lower()
+    assert "resolve_pending_approval" in str(illegal_exc.value)
     illegal_observation = store.list_observations_for_run(str(run.id))[-1]
     assert illegal_observation.kind == ObservationKind.SYSTEM_AUDIT
     assert "selected action was not legal" in illegal_observation.summary.lower()

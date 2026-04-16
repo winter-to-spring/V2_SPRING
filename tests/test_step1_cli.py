@@ -665,6 +665,7 @@ def test_planner_propose_and_show_cli(capsys, monkeypatch, tmp_path: Path) -> No
     )
     main()
     snapshot_payload = json.loads(capsys.readouterr().out)
+    assert snapshot_payload["policy_version"] == "v1"
     snapshot_hash = snapshot_payload["state_hash"]
 
     monkeypatch.setattr(
@@ -689,6 +690,7 @@ def test_planner_propose_and_show_cli(capsys, monkeypatch, tmp_path: Path) -> No
     main()
     proposal_output = capsys.readouterr().out
     assert "Planner proposal accepted" in proposal_output
+    assert "policy_version:     v1" in proposal_output
     assert "selected_action:    execute_bounded_task" in proposal_output
 
     monkeypatch.setattr(
@@ -698,6 +700,7 @@ def test_planner_propose_and_show_cli(capsys, monkeypatch, tmp_path: Path) -> No
     main()
     show_output = capsys.readouterr().out
     assert "Planner proposals" in show_output
+    assert "policy_version:    v1" in show_output
     assert "execute_bounded_task" in show_output
 
     monkeypatch.setattr(
