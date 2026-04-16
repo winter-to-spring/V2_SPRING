@@ -12,6 +12,7 @@ from v2_spring.domain.approval import ApprovalStatus
 from v2_spring.domain.artifact import ArtifactStorageKind, ArtifactType
 from v2_spring.domain.decision import DecisionKind
 from v2_spring.domain.observation import ObservationKind
+from v2_spring.domain.planner_attempt import PlannerAttemptOutcome
 from v2_spring.domain.run import RiskLevel, RunStatus, UrgencyLevel
 from v2_spring.domain.task import TaskKind, TaskStatus
 
@@ -35,6 +36,7 @@ class LedgerEventType(StrEnum):
     TASK_COMPLETED = "TASK_COMPLETED"
     TASK_FAILED = "TASK_FAILED"
     ARTIFACT_RECORDED = "ARTIFACT_RECORDED"
+    PLANNER_ATTEMPT_RECORDED = "PLANNER_ATTEMPT_RECORDED"
 
 
 class RunRecord(Base):
@@ -89,6 +91,10 @@ class RunRecord(Base):
         cascade="all, delete-orphan",
     )
     artifacts: Mapped[list["ArtifactRecord"]] = relationship(
+        back_populates="run",
+        cascade="all, delete-orphan",
+    )
+    planner_attempts: Mapped[list["PlannerAttemptRecord"]] = relationship(
         back_populates="run",
         cascade="all, delete-orphan",
     )
@@ -291,6 +297,39 @@ class EventLedgerRecord(Base):
     run: Mapped[RunRecord] = relationship(back_populates="ledger_events")
 
 
+class PlannerAttemptRecord(Base):
+    __tablename__ = "planner_attempts"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("runs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    phase_key: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    policy_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    snapshot_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    selected_action: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    submission_key: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
+    proposal_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    outcome: Mapped[PlannerAttemptOutcome] = mapped_column(
+        Enum(PlannerAttemptOutcome, native_enum=False),
+        nullable=False,
+    )
+    outcome_reason: Mapped[str] = mapped_column(String(4000), nullable=False)
+    attempt_index: Mapped[int] = mapped_column(nullable=False)
+    budget_limit: Mapped[int] = mapped_column(nullable=False)
+    budget_used: Mapped[int] = mapped_column(nullable=False)
+    budget_remaining: Mapped[int] = mapped_column(nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=utc_now,
+    )
+
+    run: Mapped[RunRecord] = relationship(back_populates="planner_attempts")
+
+
 def _prevent_mutation(_: Any, __: Any, target: EventLedgerRecord) -> None:
     raise ValueError(
         f"EventLedgerRecord {target.id} is append-only and cannot be mutated or deleted.",
@@ -305,3 +344,5 @@ event.listen(ObservationRecord, "before_update", _prevent_mutation)
 event.listen(ObservationRecord, "before_delete", _prevent_mutation)
 event.listen(ArtifactRecord, "before_update", _prevent_mutation)
 event.listen(ArtifactRecord, "before_delete", _prevent_mutation)
+event.listen(PlannerAttemptRecord, "before_update", _prevent_mutation)
+event.listen(PlannerAttemptRecord, "before_delete", _prevent_mutation)

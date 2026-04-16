@@ -95,19 +95,31 @@ class RunSnapshotView(BaseModel):
     pending_approval: ApprovalView | None
     latest_rejection_reason: str | None
     latest_decision_summary: str | None
+    planner_phase_key: str = Field(min_length=64, max_length=64)
+    planner_budget_limit: int = Field(ge=1)
+    planner_budget_used: int = Field(ge=0)
+    planner_budget_remaining: int = Field(ge=0)
+    planner_phase_exhausted: bool = False
+    latest_planner_attempt_summary: str | None
     task_summary: TaskStatusSummary
     latest_task: TaskHeadlineView | None
     latest_artifact: ArtifactHeadlineView | None
 
-    @field_validator("state_hash")
+    @field_validator("state_hash", "planner_phase_key")
     @classmethod
     def ensure_sha256(cls, value: str) -> str:
         cleaned = value.strip().lower()
         if len(cleaned) != 64 or any(character not in "0123456789abcdef" for character in cleaned):
-            raise ValueError("state_hash must be a 64-character hexadecimal string")
+            raise ValueError("value must be a 64-character hexadecimal string")
         return cleaned
 
-    @field_validator("policy_version", "action_state_reason", "latest_rejection_reason", "latest_decision_summary")
+    @field_validator(
+        "policy_version",
+        "action_state_reason",
+        "latest_rejection_reason",
+        "latest_decision_summary",
+        "latest_planner_attempt_summary",
+    )
     @classmethod
     def ensure_optional_text(cls, value: str | None) -> str | None:
         if value is None:

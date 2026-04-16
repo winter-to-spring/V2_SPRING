@@ -15,11 +15,17 @@ from v2_spring.domain.approval import ApprovalStatus, ApprovalView
 from v2_spring.domain.artifact import ArtifactStorageKind, ArtifactType, ArtifactView
 from v2_spring.domain.decision import DecisionKind, DecisionView
 from v2_spring.domain.observation import ObservationKind, ObservationView
+from v2_spring.domain.planner_attempt import (
+    PlannerAttemptOutcome,
+    PlannerAttemptView,
+    PlannerGovernanceView,
+)
 from v2_spring.domain.proposal import PlannerProposalInput, PlannerProposalView
 from v2_spring.domain.replay import ArtifactInspectionView, RunReplayView, TaskReplayView
 from v2_spring.domain.run import RunCreateInput, RunStatus, RunView
 from v2_spring.domain.snapshot import (
     ArtifactHeadlineView,
+    PossibleActionName,
     RunSnapshotView,
     SnapshotActionState,
     TaskHeadlineView,
@@ -40,12 +46,19 @@ from v2_spring.ledger.models import (
     EventLedgerRecord,
     LedgerEventType,
     ObservationRecord,
+    PlannerAttemptRecord,
     RunRecord,
     TaskRecord,
     utc_now,
 )
 from v2_spring.planner.actions import POSSIBLE_ACTIONS_ENGINE_VERSION, evaluate_possible_actions
-from v2_spring.planner.proposals import IllegalPlannerProposalError, StalePlannerProposalError
+from v2_spring.planner.proposals import (
+    CognitiveDuplicatePlannerProposalError,
+    IllegalPlannerProposalError,
+    PlannerPhaseExhaustedError,
+    StalePlannerProposalError,
+    TransportDuplicatePlannerProposalError,
+)
 
 
 @dataclass(frozen=True)
@@ -62,6 +75,14 @@ class LedgerStore:
 
     # Approval should pause stateful progression, not blind the system.
     _APPROVAL_SAFE_OBSERVATION_KINDS = frozenset({ObservationKind.SYSTEM_AUDIT})
+    _PLANNER_PHASE_BUDGET_LIMIT = 3
+    _PLANNER_BUDGET_CONSUMING_OUTCOMES = frozenset(
+        {
+            PlannerAttemptOutcome.REJECTED_STALE,
+            PlannerAttemptOutcome.REJECTED_ILLEGAL,
+            PlannerAttemptOutcome.REJECTED_DUPLICATE_COGNITIVE,
+        },
+    )
 
     def __init__(self, database_url: str) -> None:
         self._engine = create_engine(database_url, future=True)
@@ -354,6 +375,17 @@ class LedgerStore:
             records = list(session.scalars(statement).all())
             return [self._to_observation_view(record) for record in records]
 
+    def list_planner_attempts_for_run(self, run_id: str) -> list[PlannerAttemptView]:
+        self.ensure_schema()
+        with self.session() as session:
+            statement = (
+                select(PlannerAttemptRecord)
+                .where(PlannerAttemptRecord.run_id == run_id)
+                .order_by(PlannerAttemptRecord.created_at.asc(), PlannerAttemptRecord.id.asc())
+            )
+            records = list(session.scalars(statement).all())
+            return [self._to_planner_attempt_view(record) for record in records]
+
     def list_tasks_for_run(self, run_id: str) -> list[TaskView]:
         self.ensure_schema()
         with self.session() as session:
@@ -439,6 +471,13 @@ class LedgerStore:
                     .order_by(ArtifactRecord.created_at.asc(), ArtifactRecord.id.asc()),
                 ).all(),
             )
+            planner_attempt_records = list(
+                session.scalars(
+                    select(PlannerAttemptRecord)
+                    .where(PlannerAttemptRecord.run_id == run_id)
+                    .order_by(PlannerAttemptRecord.created_at.asc(), PlannerAttemptRecord.id.asc()),
+                ).all(),
+            )
             ledger_events = list(
                 session.scalars(
                     select(EventLedgerRecord)
@@ -446,6 +485,7 @@ class LedgerStore:
                     .order_by(EventLedgerRecord.recorded_at.asc(), EventLedgerRecord.id.asc()),
                 ).all(),
             )
+            planner_attempts = [self._to_planner_attempt_view(record) for record in planner_attempt_records]
 
             decision_map = {str(decision.id): decision for decision in decisions}
             task_map = {record.id: self._to_task_view(record) for record in task_records}
@@ -485,6 +525,7 @@ class LedgerStore:
                 approvals=approvals,
                 decisions=decisions,
                 tasks=task_replays,
+                planner_attempts=planner_attempts,
                 observations=observations,
                 orphan_artifacts=orphan_artifacts,
                 consistency_warnings=self._build_consistency_warnings(
@@ -535,6 +576,13 @@ class LedgerStore:
                     .order_by(ArtifactRecord.created_at.asc(), ArtifactRecord.id.asc()),
                 ).all(),
             )
+            planner_attempt_records = list(
+                session.scalars(
+                    select(PlannerAttemptRecord)
+                    .where(PlannerAttemptRecord.run_id == run_id)
+                    .order_by(PlannerAttemptRecord.created_at.asc(), PlannerAttemptRecord.id.asc()),
+                ).all(),
+            )
 
             pending_approval = next(
                 (approval for approval in reversed(approvals) if approval.status == ApprovalStatus.PENDING),
@@ -556,6 +604,19 @@ class LedgerStore:
                 else None
             )
             task_summary = self._build_task_status_summary(task_records)
+            planner_phase_key = self._build_planner_phase_key(
+                run=self._to_run_view(run_record),
+                pending_approval=pending_approval,
+                latest_rejection_reason=latest_rejection_reason,
+                task_summary=task_summary,
+                latest_task=latest_task,
+                latest_artifact=latest_artifact,
+            )
+            planner_governance = self._build_planner_governance_from_records(
+                run_id=run_id,
+                phase_key=planner_phase_key,
+                records=planner_attempt_records,
+            )
 
             snapshot_payload = {
                 "policy_version": POSSIBLE_ACTIONS_ENGINE_VERSION,
@@ -563,6 +624,12 @@ class LedgerStore:
                 "pending_approval": pending_approval.model_dump(mode="json") if pending_approval else None,
                 "latest_rejection_reason": latest_rejection_reason,
                 "latest_decision_summary": latest_decision_summary,
+                "planner_phase_key": planner_governance.phase_key,
+                "planner_budget_limit": planner_governance.budget_limit,
+                "planner_budget_used": planner_governance.budget_used,
+                "planner_budget_remaining": planner_governance.budget_remaining,
+                "planner_phase_exhausted": planner_governance.exhausted,
+                "latest_planner_attempt_summary": planner_governance.latest_attempt_summary,
                 "task_summary": task_summary.model_dump(mode="json"),
                 "latest_task": latest_task.model_dump(mode="json") if latest_task else None,
                 "latest_artifact": latest_artifact.model_dump(mode="json") if latest_artifact else None,
@@ -581,6 +648,12 @@ class LedgerStore:
                 pending_approval=pending_approval,
                 latest_rejection_reason=latest_rejection_reason,
                 latest_decision_summary=latest_decision_summary,
+                planner_phase_key=planner_governance.phase_key,
+                planner_budget_limit=planner_governance.budget_limit,
+                planner_budget_used=planner_governance.budget_used,
+                planner_budget_remaining=planner_governance.budget_remaining,
+                planner_phase_exhausted=planner_governance.exhausted,
+                latest_planner_attempt_summary=planner_governance.latest_attempt_summary,
                 task_summary=task_summary,
                 latest_task=latest_task,
                 latest_artifact=latest_artifact,
@@ -605,30 +678,121 @@ class LedgerStore:
             }
             for action in evaluation.actions
         ]
+        governance = self.build_planner_governance(run_id)
+        current_attempts = governance.attempts
+        proposal_fingerprint = self._build_planner_proposal_fingerprint(
+            snapshot_hash=proposal.snapshot_hash,
+            selected_action=proposal.selected_action,
+            rationale=proposal.rationale,
+            expected_outcome=proposal.expected_outcome,
+        )
+
+        if governance.exhausted:
+            raise PlannerPhaseExhaustedError(
+                "Planner phase budget is exhausted for the current state segment. "
+                "Use `v2-spring planner recharge <run-id> --reason ...` before proposing again.",
+            )
+
+        if proposal.submission_key is not None:
+            duplicate_transport = next(
+                (
+                    attempt
+                    for attempt in current_attempts
+                    if attempt.submission_key == proposal.submission_key
+                ),
+                None,
+            )
+            if duplicate_transport is not None:
+                attempt = self._record_planner_attempt(
+                    run_id=run_id,
+                    phase_key=governance.phase_key,
+                    policy_version=governance.policy_version,
+                    snapshot_hash=evaluation.snapshot.state_hash,
+                    selected_action=proposal.selected_action,
+                    submission_key=proposal.submission_key,
+                    proposal_fingerprint=proposal_fingerprint,
+                    outcome=PlannerAttemptOutcome.REJECTED_DUPLICATE_TRANSPORT,
+                    outcome_reason=(
+                        f"Submission key {proposal.submission_key} already exists for this phase; "
+                        "transport-level duplicates are rejected explicitly."
+                    ),
+                    budget_used=governance.budget_used,
+                    budget_limit=governance.budget_limit,
+                    consume_budget=False,
+                )
+                raise TransportDuplicatePlannerProposalError(
+                    "Planner submission was rejected as a transport-level duplicate. "
+                    f"Existing phase key={attempt.phase_key}, submission_key={proposal.submission_key}.",
+                )
 
         if proposal.snapshot_hash != evaluation.snapshot.state_hash:
+            budget_used = governance.budget_used + 1
+            self._record_planner_attempt(
+                run_id=run_id,
+                phase_key=governance.phase_key,
+                policy_version=governance.policy_version,
+                snapshot_hash=proposal.snapshot_hash,
+                selected_action=proposal.selected_action,
+                submission_key=proposal.submission_key,
+                proposal_fingerprint=proposal_fingerprint,
+                outcome=PlannerAttemptOutcome.REJECTED_STALE,
+                outcome_reason=(
+                    f"Provided snapshot hash {proposal.snapshot_hash} does not match current "
+                    f"state hash {evaluation.snapshot.state_hash}."
+                ),
+                budget_used=governance.budget_used,
+                budget_limit=governance.budget_limit,
+                consume_budget=True,
+            )
             self.record_observation(
                 run_id=run_id,
                 kind=ObservationKind.SYSTEM_AUDIT,
                 summary="Planner proposal rejected because the snapshot hash was stale.",
                 details=(
-                    f"Selected action={proposal.selected_action.value}; "
+                    f"error_code={PlannerAttemptOutcome.REJECTED_STALE.value}; "
+                    f"selected_action={proposal.selected_action.value}; "
                     f"policy_version={evaluation.snapshot.policy_version}; "
                     f"provided_hash={proposal.snapshot_hash}; "
                     f"current_hash={evaluation.snapshot.state_hash}."
                 ),
             )
+            if budget_used >= governance.budget_limit:
+                self._record_phase_exhaustion(
+                    run_id=run_id,
+                    governance=governance,
+                    snapshot_hash=evaluation.snapshot.state_hash,
+                    reason="Planner phase budget was exhausted after a stale proposal attempt.",
+                )
             raise StalePlannerProposalError(
                 "Planner proposal snapshot hash is stale; refresh the run snapshot before proposing again. "
                 f"Provided={proposal.snapshot_hash}, current={evaluation.snapshot.state_hash}.",
             )
         if proposal.selected_action not in legal_actions:
+            budget_used = governance.budget_used + 1
+            self._record_planner_attempt(
+                run_id=run_id,
+                phase_key=governance.phase_key,
+                policy_version=governance.policy_version,
+                snapshot_hash=evaluation.snapshot.state_hash,
+                selected_action=proposal.selected_action,
+                submission_key=proposal.submission_key,
+                proposal_fingerprint=proposal_fingerprint,
+                outcome=PlannerAttemptOutcome.REJECTED_ILLEGAL,
+                outcome_reason=(
+                    f"Selected action {proposal.selected_action.value} is not legal under "
+                    f"{evaluation.snapshot.action_state.value} ({evaluation.snapshot.action_state_reason})."
+                ),
+                budget_used=governance.budget_used,
+                budget_limit=governance.budget_limit,
+                consume_budget=True,
+            )
             self.record_observation(
                 run_id=run_id,
                 kind=ObservationKind.SYSTEM_AUDIT,
                 summary="Planner proposal rejected because the selected action was not legal.",
                 details=(
-                    f"Selected action={proposal.selected_action.value}; "
+                    f"error_code={PlannerAttemptOutcome.REJECTED_ILLEGAL.value}; "
+                    f"selected_action={proposal.selected_action.value}; "
                     f"action_state={evaluation.snapshot.action_state.value}; "
                     f"action_state_reason={evaluation.snapshot.action_state_reason}; "
                     f"legal_actions={legal_action_descriptions}."
@@ -637,12 +801,98 @@ class LedgerStore:
             legal_action_summary = ", ".join(
                 f"{action['name']} ({action['reason']})" for action in legal_action_descriptions
             )
+            if budget_used >= governance.budget_limit:
+                self._record_phase_exhaustion(
+                    run_id=run_id,
+                    governance=governance,
+                    snapshot_hash=evaluation.snapshot.state_hash,
+                    reason="Planner phase budget was exhausted after an illegal proposal attempt.",
+                )
             raise IllegalPlannerProposalError(
                 f"Planner action {proposal.selected_action.value} is not legal for run {run_id} under the current snapshot. "
                 f"Current action_state={evaluation.snapshot.action_state.value} "
                 f"({evaluation.snapshot.action_state_reason}). "
                 f"Legal actions: {legal_action_summary if legal_action_summary else 'none'}.",
             )
+
+        existing_accepted = next(
+            (
+                attempt
+                for attempt in current_attempts
+                if attempt.outcome == PlannerAttemptOutcome.ACCEPTED
+            ),
+            None,
+        )
+        duplicate_cognitive = next(
+            (
+                attempt
+                for attempt in current_attempts
+                if attempt.proposal_fingerprint == proposal_fingerprint
+                and attempt.outcome
+                in {
+                    PlannerAttemptOutcome.ACCEPTED,
+                    PlannerAttemptOutcome.REJECTED_DUPLICATE_COGNITIVE,
+                }
+            ),
+            None,
+        )
+        if existing_accepted is not None or duplicate_cognitive is not None:
+            duplicate_reason = (
+                "The current phase already has an accepted planner proposal and state has not advanced yet."
+                if existing_accepted is not None
+                else "The planner repeated the same proposal fingerprint inside the current phase."
+            )
+            budget_used = governance.budget_used + 1
+            self._record_planner_attempt(
+                run_id=run_id,
+                phase_key=governance.phase_key,
+                policy_version=governance.policy_version,
+                snapshot_hash=evaluation.snapshot.state_hash,
+                selected_action=proposal.selected_action,
+                submission_key=proposal.submission_key,
+                proposal_fingerprint=proposal_fingerprint,
+                outcome=PlannerAttemptOutcome.REJECTED_DUPLICATE_COGNITIVE,
+                outcome_reason=duplicate_reason,
+                budget_used=governance.budget_used,
+                budget_limit=governance.budget_limit,
+                consume_budget=True,
+            )
+            self.record_observation(
+                run_id=run_id,
+                kind=ObservationKind.SYSTEM_AUDIT,
+                summary="Planner proposal rejected as a cognitive duplicate.",
+                details=(
+                    f"error_code={PlannerAttemptOutcome.REJECTED_DUPLICATE_COGNITIVE.value}; "
+                    f"selected_action={proposal.selected_action.value}; "
+                    f"proposal_fingerprint={proposal_fingerprint}; "
+                    f"phase_key={governance.phase_key}."
+                ),
+            )
+            if budget_used >= governance.budget_limit:
+                self._record_phase_exhaustion(
+                    run_id=run_id,
+                    governance=governance,
+                    snapshot_hash=evaluation.snapshot.state_hash,
+                    reason="Planner phase budget was exhausted after repeated duplicate proposals.",
+                )
+            raise CognitiveDuplicatePlannerProposalError(
+                f"Planner proposal was rejected as a cognitive duplicate for phase {governance.phase_key}.",
+            )
+
+        self._record_planner_attempt(
+            run_id=run_id,
+            phase_key=governance.phase_key,
+            policy_version=governance.policy_version,
+            snapshot_hash=proposal.snapshot_hash,
+            selected_action=proposal.selected_action,
+            submission_key=proposal.submission_key,
+            proposal_fingerprint=proposal_fingerprint,
+            outcome=PlannerAttemptOutcome.ACCEPTED,
+            outcome_reason="Planner proposal was accepted under the current legal-action guard.",
+            budget_used=governance.budget_used,
+            budget_limit=governance.budget_limit,
+            consume_budget=False,
+        )
 
         decision = self.record_decision(
             run_id=run_id,
@@ -654,6 +904,8 @@ class LedgerStore:
                 "policy_version": evaluation.snapshot.policy_version,
                 "snapshot_hash": proposal.snapshot_hash,
                 "selected_action": proposal.selected_action.value,
+                "submission_key": proposal.submission_key,
+                "proposal_fingerprint": proposal_fingerprint,
                 "expected_outcome": proposal.expected_outcome,
                 "legal_actions": [action.name.value for action in evaluation.actions],
                 "legal_action_details": legal_action_descriptions,
@@ -668,10 +920,127 @@ class LedgerStore:
             policy_version=evaluation.snapshot.policy_version,
             snapshot_hash=proposal.snapshot_hash,
             selected_action=proposal.selected_action,
+            submission_key=proposal.submission_key,
             rationale=proposal.rationale,
             expected_outcome=proposal.expected_outcome,
             created_at=decision.created_at,
         )
+
+    def build_planner_governance(self, run_id: str) -> PlannerGovernanceView:
+        """Return the current phase-scoped planner budget state for one run."""
+
+        self.ensure_schema()
+        with self.session() as session:
+            run_record = session.get(RunRecord, run_id)
+            if run_record is None:
+                raise LookupError(f"Run {run_id} was not found.")
+
+            approvals = [
+                self._to_approval_view(record)
+                for record in session.scalars(
+                    select(ApprovalRecord)
+                    .where(ApprovalRecord.run_id == run_id)
+                    .order_by(ApprovalRecord.requested_at.asc(), ApprovalRecord.id.asc()),
+                ).all()
+            ]
+            task_records = list(
+                session.scalars(
+                    select(TaskRecord)
+                    .where(TaskRecord.run_id == run_id)
+                    .order_by(TaskRecord.created_at.asc(), TaskRecord.id.asc()),
+                ).all(),
+            )
+            artifact_records = list(
+                session.scalars(
+                    select(ArtifactRecord)
+                    .where(ArtifactRecord.run_id == run_id)
+                    .order_by(ArtifactRecord.created_at.asc(), ArtifactRecord.id.asc()),
+                ).all(),
+            )
+            planner_attempt_records = list(
+                session.scalars(
+                    select(PlannerAttemptRecord)
+                    .where(PlannerAttemptRecord.run_id == run_id)
+                    .order_by(PlannerAttemptRecord.created_at.asc(), PlannerAttemptRecord.id.asc()),
+                ).all(),
+            )
+
+            pending_approval = next(
+                (approval for approval in reversed(approvals) if approval.status == ApprovalStatus.PENDING),
+                None,
+            )
+            latest_rejection_reason = next(
+                (
+                    approval.resolution_reason
+                    for approval in reversed(approvals)
+                    if approval.status == ApprovalStatus.REJECTED and approval.resolution_reason
+                ),
+                None,
+            )
+            latest_task = self._build_task_headline(task_records[-1]) if task_records else None
+            latest_artifact = (
+                self._build_artifact_headline(self._inspect_artifact(artifact_records[-1]))
+                if artifact_records
+                else None
+            )
+            task_summary = self._build_task_status_summary(task_records)
+            phase_key = self._build_planner_phase_key(
+                run=self._to_run_view(run_record),
+                pending_approval=pending_approval,
+                latest_rejection_reason=latest_rejection_reason,
+                task_summary=task_summary,
+                latest_task=latest_task,
+                latest_artifact=latest_artifact,
+            )
+            return self._build_planner_governance_from_records(
+                run_id=run_id,
+                phase_key=phase_key,
+                records=planner_attempt_records,
+            )
+
+    def record_planner_recharge(self, *, run_id: str, reason: str) -> PlannerAttemptView:
+        """Manually reopen a planner phase after the current budget is exhausted."""
+
+        normalized_reason = self._normalize_optional_text(reason)
+        if normalized_reason is None:
+            raise ValueError("Planner recharge requires a non-blank reason.")
+
+        snapshot = self.build_run_snapshot(run_id)
+        governance = self.build_planner_governance(run_id)
+        if not governance.exhausted:
+            raise PermissionError(
+                f"Run {run_id} is not exhausted in the current planner phase; recharge is not allowed yet.",
+            )
+
+        attempt = self._record_planner_attempt(
+            run_id=run_id,
+            phase_key=governance.phase_key,
+            policy_version=governance.policy_version,
+            snapshot_hash=snapshot.state_hash,
+            selected_action=None,
+            submission_key=None,
+            proposal_fingerprint=None,
+            outcome=PlannerAttemptOutcome.MANUAL_RECHARGE,
+            outcome_reason=(
+                "Founder manually reopened the current planner phase after exhaustion. "
+                f"Reason: {normalized_reason}"
+            ),
+            budget_used=governance.budget_used,
+            budget_limit=governance.budget_limit,
+            consume_budget=False,
+        )
+        self.record_observation(
+            run_id=run_id,
+            kind=ObservationKind.SYSTEM_AUDIT,
+            summary="Planner phase was manually recharged after exhaustion.",
+            details=(
+                f"error_code={PlannerAttemptOutcome.MANUAL_RECHARGE.value}; "
+                f"phase_key={governance.phase_key}; "
+                f"budget_limit={governance.budget_limit}; "
+                f"reason={normalized_reason}."
+            ),
+        )
+        return attempt
 
     def list_planner_proposals_for_run(self, run_id: str) -> list[PlannerProposalView]:
         """Return accepted planner proposals recorded for one run."""
@@ -690,6 +1059,7 @@ class LedgerStore:
                         "policy_version": event.payload.get("policy_version", POSSIBLE_ACTIONS_ENGINE_VERSION),
                         "snapshot_hash": event.payload["snapshot_hash"],
                         "selected_action": event.payload["selected_action"],
+                        "submission_key": event.payload.get("submission_key"),
                         "rationale": event.payload["rationale"],
                         "expected_outcome": event.payload["expected_outcome"],
                         "created_at": event.recorded_at,
@@ -1282,3 +1652,224 @@ class LedgerStore:
                         f"Artifact {artifact.artifact.id} exists in state but is missing ARTIFACT_RECORDED in the ledger.",
                     )
         return warnings
+
+    @staticmethod
+    def _build_planner_phase_key(
+        *,
+        run: RunView,
+        pending_approval: ApprovalView | None,
+        latest_rejection_reason: str | None,
+        task_summary: TaskStatusSummary,
+        latest_task: TaskHeadlineView | None,
+        latest_artifact: ArtifactHeadlineView | None,
+    ) -> str:
+        """Hash only meaningful advancement signals, not planner-only traces."""
+
+        payload = {
+            "policy_version": POSSIBLE_ACTIONS_ENGINE_VERSION,
+            "run": {
+                "id": str(run.id),
+                "status": run.status.value,
+                "urgency": run.urgency.value,
+                "risk": run.risk.value,
+            },
+            "pending_approval": pending_approval.model_dump(mode="json") if pending_approval else None,
+            "latest_rejection_reason": latest_rejection_reason,
+            "task_summary": task_summary.model_dump(mode="json"),
+            "latest_task": latest_task.model_dump(mode="json") if latest_task else None,
+            "latest_artifact": latest_artifact.model_dump(mode="json") if latest_artifact else None,
+        }
+        return sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        ).hexdigest()
+
+    def _build_planner_governance_from_records(
+        self,
+        *,
+        run_id: str,
+        phase_key: str,
+        records: list[PlannerAttemptRecord],
+    ) -> PlannerGovernanceView:
+        phase_records = [record for record in records if record.phase_key == phase_key]
+        recharge_indices = [
+            index
+            for index, record in enumerate(phase_records)
+            if record.outcome == PlannerAttemptOutcome.MANUAL_RECHARGE
+        ]
+        active_start_index = recharge_indices[-1] + 1 if recharge_indices else 0
+        active_records = phase_records[active_start_index:]
+        budget_used = sum(
+            1
+            for record in active_records
+            if record.outcome in self._PLANNER_BUDGET_CONSUMING_OUTCOMES
+        )
+        exhausted = any(
+            record.outcome == PlannerAttemptOutcome.PHASE_EXHAUSTED
+            for record in active_records
+        )
+        latest_attempt_summary = None
+        if phase_records:
+            latest_attempt = phase_records[-1]
+            latest_attempt_summary = (
+                f"{latest_attempt.outcome.value}: {latest_attempt.outcome_reason}"
+            )
+
+        return PlannerGovernanceView(
+            run_id=run_id,
+            phase_key=phase_key,
+            policy_version=POSSIBLE_ACTIONS_ENGINE_VERSION,
+            budget_limit=self._PLANNER_PHASE_BUDGET_LIMIT,
+            budget_used=budget_used,
+            budget_remaining=max(self._PLANNER_PHASE_BUDGET_LIMIT - budget_used, 0),
+            exhausted=exhausted,
+            recharge_count=len(recharge_indices),
+            latest_attempt_summary=latest_attempt_summary,
+            attempts=[self._to_planner_attempt_view(record) for record in active_records],
+        )
+
+    @staticmethod
+    def _build_planner_proposal_fingerprint(
+        *,
+        snapshot_hash: str,
+        selected_action: PossibleActionName,
+        rationale: str,
+        expected_outcome: str,
+    ) -> str:
+        payload = {
+            "snapshot_hash": snapshot_hash,
+            "selected_action": selected_action.value,
+            "rationale": rationale.strip(),
+            "expected_outcome": expected_outcome.strip(),
+        }
+        return sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        ).hexdigest()
+
+    def _record_planner_attempt(
+        self,
+        *,
+        run_id: str,
+        phase_key: str,
+        policy_version: str,
+        snapshot_hash: str,
+        selected_action: PossibleActionName | None,
+        submission_key: str | None,
+        proposal_fingerprint: str | None,
+        outcome: PlannerAttemptOutcome,
+        outcome_reason: str,
+        budget_used: int,
+        budget_limit: int,
+        consume_budget: bool,
+    ) -> PlannerAttemptView:
+        self.ensure_schema()
+        effective_budget_used = budget_used + (1 if consume_budget else 0)
+        with self.session() as session:
+            existing_phase_records = list(
+                session.scalars(
+                    select(PlannerAttemptRecord)
+                    .where(
+                        PlannerAttemptRecord.run_id == run_id,
+                        PlannerAttemptRecord.phase_key == phase_key,
+                    )
+                    .order_by(PlannerAttemptRecord.created_at.asc(), PlannerAttemptRecord.id.asc()),
+                ).all(),
+            )
+            record = PlannerAttemptRecord(
+                run_id=run_id,
+                phase_key=phase_key,
+                policy_version=policy_version,
+                snapshot_hash=snapshot_hash,
+                selected_action=selected_action.value if selected_action is not None else None,
+                submission_key=submission_key,
+                proposal_fingerprint=proposal_fingerprint,
+                outcome=outcome,
+                outcome_reason=outcome_reason,
+                attempt_index=len(existing_phase_records) + 1,
+                budget_limit=budget_limit,
+                budget_used=effective_budget_used,
+                budget_remaining=max(budget_limit - effective_budget_used, 0),
+            )
+            session.add(record)
+            session.flush()
+            session.add(
+                EventLedgerRecord(
+                    run_id=run_id,
+                    event_type=LedgerEventType.PLANNER_ATTEMPT_RECORDED,
+                    payload={
+                        "planner_attempt_id": record.id,
+                        "phase_key": phase_key,
+                        "policy_version": policy_version,
+                        "snapshot_hash": snapshot_hash,
+                        "selected_action": selected_action.value if selected_action is not None else None,
+                        "submission_key": submission_key,
+                        "proposal_fingerprint": proposal_fingerprint,
+                        "outcome": outcome.value,
+                        "outcome_reason": outcome_reason,
+                        "attempt_index": record.attempt_index,
+                        "budget_limit": budget_limit,
+                        "budget_used": record.budget_used,
+                        "budget_remaining": record.budget_remaining,
+                    },
+                ),
+            )
+            session.flush()
+            return self._to_planner_attempt_view(record)
+
+    def _record_phase_exhaustion(
+        self,
+        *,
+        run_id: str,
+        governance: PlannerGovernanceView,
+        snapshot_hash: str,
+        reason: str,
+    ) -> PlannerAttemptView:
+        if governance.exhausted:
+            return governance.attempts[-1]
+        attempt = self._record_planner_attempt(
+            run_id=run_id,
+            phase_key=governance.phase_key,
+            policy_version=governance.policy_version,
+            snapshot_hash=snapshot_hash,
+            selected_action=None,
+            submission_key=None,
+            proposal_fingerprint=None,
+            outcome=PlannerAttemptOutcome.PHASE_EXHAUSTED,
+            outcome_reason=reason,
+            budget_used=governance.budget_limit,
+            budget_limit=governance.budget_limit,
+            consume_budget=False,
+        )
+        self.record_observation(
+            run_id=run_id,
+            kind=ObservationKind.SYSTEM_AUDIT,
+            summary="Planner phase budget was exhausted and further proposals are blocked.",
+            details=(
+                f"error_code={PlannerAttemptOutcome.PHASE_EXHAUSTED.value}; "
+                f"phase_key={governance.phase_key}; "
+                f"budget_limit={governance.budget_limit}; "
+                f"reason={reason}."
+            ),
+        )
+        return attempt
+
+    @staticmethod
+    def _to_planner_attempt_view(record: PlannerAttemptRecord) -> PlannerAttemptView:
+        return PlannerAttemptView.model_validate(
+            {
+                "id": record.id,
+                "run_id": record.run_id,
+                "phase_key": record.phase_key,
+                "policy_version": record.policy_version,
+                "snapshot_hash": record.snapshot_hash,
+                "selected_action": record.selected_action,
+                "submission_key": record.submission_key,
+                "proposal_fingerprint": record.proposal_fingerprint,
+                "outcome": record.outcome,
+                "outcome_reason": record.outcome_reason,
+                "attempt_index": record.attempt_index,
+                "budget_limit": record.budget_limit,
+                "budget_used": record.budget_used,
+                "budget_remaining": record.budget_remaining,
+                "created_at": record.created_at,
+            },
+        )

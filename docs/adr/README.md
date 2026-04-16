@@ -5,3 +5,4 @@
 3. `0003-core-state-model.md`
 4. `0004-deterministic-substrate.md`
 5. `0005-founder-verification-surface.md`
+6. `0006-bounded-replanning-governance.md`

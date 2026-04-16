@@ -7,3 +7,15 @@ class StalePlannerProposalError(ValueError):
 
 class IllegalPlannerProposalError(PermissionError):
     """Raised when the selected action is not currently legal for the run."""
+
+
+class TransportDuplicatePlannerProposalError(PermissionError):
+    """Raised when the same submission key is replayed within one phase."""
+
+
+class CognitiveDuplicatePlannerProposalError(PermissionError):
+    """Raised when the planner repeats the same proposal content in one phase."""
+
+
+class PlannerPhaseExhaustedError(PermissionError):
+    """Raised when the current phase has no planner attempt budget left."""

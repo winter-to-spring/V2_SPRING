@@ -1,21 +1,28 @@
 # Risk ID: RISK-0008
-Title: Planner proposal loop lacks retry bounds and idempotency policy
+Title: ~~Planner proposal loop lacks retry bounds and idempotency policy~~
 Class: Before Next Phase
-Status: Open
+Status: Resolved
 Owner: Core / Planner boundary
 Observed In: Step 8 - Planner proposal contract review
 
 ## Description
 
-Step 8 proves that planner proposals can be accepted or rejected safely, but it
-does not yet define what should happen when the same planner repeatedly submits:
+Step 8 proved that planner proposals could be accepted or rejected safely, but
+it did not yet define what should happen when the same planner repeatedly
+submits:
 
 - the same stale proposal
 - the same illegal action
 - the same legal proposal multiple times
 
-There is currently no max-retry rule, no duplicate-submission policy, and no
-idempotency key for planner proposals.
+That gap is now closed in Step 9 with:
+
+- phase-scoped retry budget
+- explicit `phase_exhausted` outcome
+- transport-level duplicate handling via `submission_key`
+- cognitive duplicate handling via proposal fingerprint and accepted-proposal
+  guard
+- founder-controlled `manual_recharge`
 
 ## Impact
 
@@ -26,29 +33,26 @@ idempotency key for planner proposals.
 ## Why This Matters
 
 The next phase introduces a real planner slot. Before that happens, the system
-needs a bounded failure policy so planner mistakes remain observable, governed,
-and finite.
+needed a bounded failure policy so planner mistakes remain observable,
+governed, and finite.
 
 ## Suggested Mitigation
 
-- define a planner-side retry policy for stale/illegal proposals
-- decide whether identical proposals should be deduplicated or recorded as
-  distinct attempts
-- introduce an idempotency key or equivalent submission identity once a real
-  planner adapter is attached
-- surface retry exhaustion as a governed run state or approval event
+- keep semantic duplicate detection risk tracked separately
+- keep recharge misuse / preflight concerns tracked separately
+- revisit stronger planner-loop controls when a real planner adapter is attached
 
 ## Capability Gate
 - Capability: real planner adapter / automatic replanning loop
 - Gate mode: Before Next Phase
-- Blocked until: retry and duplicate-submission policy are documented
+- Blocked until: completed in Step 9
 
 ## Issue Link
-- GitHub Issue: -
+- GitHub Issue: #17
 
 ## Doc Links
-- ADR: ../../adr/0004-deterministic-substrate.md
-- Design note: ../../implementation-notes/STEP_8_PLANNER_PROPOSAL_CONTRACT.md
+- ADR: ../../adr/0006-bounded-replanning-governance.md
+- Design note: ../../implementation-notes/STEP_9_BOUNDED_REPLANNING_AND_PLANNER_GOVERNANCE.md
 
 ## Exit Criteria
 

@@ -9,6 +9,7 @@ from v2_spring.domain.artifact import ArtifactStorageKind, ArtifactType
 from v2_spring.domain.approval import ApprovalStatus
 from v2_spring.domain.decision import DecisionKind
 from v2_spring.domain.observation import ObservationKind
+from v2_spring.domain.planner_attempt import PlannerAttemptOutcome
 from v2_spring.domain.proposal import PlannerProposalInput
 from v2_spring.domain.run import RunCreateInput, RunStatus
 from v2_spring.domain.snapshot import PossibleActionName, SnapshotActionState
@@ -17,7 +18,12 @@ from v2_spring.planner.actions import POSSIBLE_ACTIONS_ENGINE_VERSION, evaluate_
 from v2_spring.executor.bounded import BoundedExecutorTimeout
 from v2_spring.ledger.models import LedgerEventType
 from v2_spring.ledger.store import LedgerStore
-from v2_spring.planner.proposals import IllegalPlannerProposalError, StalePlannerProposalError
+from v2_spring.planner.proposals import (
+    IllegalPlannerProposalError,
+    PlannerPhaseExhaustedError,
+    StalePlannerProposalError,
+    TransportDuplicatePlannerProposalError,
+)
 
 
 def make_store(tmp_path: Path) -> LedgerStore:
@@ -569,3 +575,145 @@ def test_planner_proposal_rejects_stale_hash_and_illegal_action(tmp_path: Path) 
     stale_observation = store.list_observations_for_run(str(run.id))[-1]
     assert stale_observation.kind == ObservationKind.SYSTEM_AUDIT
     assert "snapshot hash was stale" in stale_observation.summary.lower()
+
+
+def test_planner_phase_budget_exhausts_after_three_budget_consuming_failures(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    run = store.create_run(
+        RunCreateInput(
+            project="demo",
+            goal="Prove planner phase exhaustion",
+            urgency="normal",
+            risk="medium",
+        ),
+    )
+    for index in range(3):
+        snapshot = store.build_run_snapshot(str(run.id))
+        with pytest.raises(IllegalPlannerProposalError):
+            store.record_planner_proposal(
+                run_id=str(run.id),
+                proposal=PlannerProposalInput(
+                    snapshot_hash=snapshot.state_hash,
+                    selected_action=PossibleActionName.EXECUTE_BOUNDED_TASK,
+                    rationale=f"Illegal attempt {index + 1}",
+                    expected_outcome="Should be rejected while approval is pending.",
+                ),
+            )
+
+    attempts = store.list_planner_attempts_for_run(str(run.id))
+    exhausted_snapshot = store.build_run_snapshot(str(run.id))
+
+    assert [attempt.outcome for attempt in attempts][-1] == PlannerAttemptOutcome.PHASE_EXHAUSTED
+    assert exhausted_snapshot.planner_phase_exhausted is True
+    assert exhausted_snapshot.planner_budget_used == 3
+    assert exhausted_snapshot.planner_budget_remaining == 0
+
+    with pytest.raises(PlannerPhaseExhaustedError):
+        store.record_planner_proposal(
+            run_id=str(run.id),
+            proposal=PlannerProposalInput(
+                snapshot_hash=exhausted_snapshot.state_hash,
+                selected_action=PossibleActionName.RESOLVE_PENDING_APPROVAL,
+                rationale="Try again after exhaustion",
+                expected_outcome="This should be blocked until a recharge happens.",
+            ),
+        )
+
+
+def test_transport_duplicate_does_not_consume_phase_budget(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    run = store.create_run(
+        RunCreateInput(
+            project="demo",
+            goal="Separate transport duplicates from cognitive retries",
+            urgency="normal",
+            risk="medium",
+        ),
+    )
+    approval = store.list_approvals(status=ApprovalStatus.PENDING)[0]
+    store.resolve_approval(str(approval.id), approved=True)
+
+    snapshot = store.build_run_snapshot(str(run.id))
+    accepted = store.record_planner_proposal(
+        run_id=str(run.id),
+        proposal=PlannerProposalInput(
+            snapshot_hash=snapshot.state_hash,
+            selected_action=PossibleActionName.EXECUTE_BOUNDED_TASK,
+            submission_key="transport-1",
+            rationale="Take the one legal bounded execution step.",
+            expected_outcome="A bounded task can be executed next.",
+        ),
+    )
+    assert accepted.submission_key == "transport-1"
+
+    with pytest.raises(TransportDuplicatePlannerProposalError):
+        store.record_planner_proposal(
+            run_id=str(run.id),
+            proposal=PlannerProposalInput(
+                snapshot_hash=snapshot.state_hash,
+                selected_action=PossibleActionName.EXECUTE_BOUNDED_TASK,
+                submission_key="transport-1",
+                rationale="Retry the same packet after a transport glitch.",
+                expected_outcome="This should be rejected explicitly but not consume budget.",
+            ),
+        )
+
+    snapshot_after = store.build_run_snapshot(str(run.id))
+    attempts = store.list_planner_attempts_for_run(str(run.id))
+
+    assert snapshot_after.planner_budget_used == 0
+    assert snapshot_after.planner_budget_remaining == 3
+    assert [attempt.outcome for attempt in attempts] == [
+        PlannerAttemptOutcome.ACCEPTED,
+        PlannerAttemptOutcome.REJECTED_DUPLICATE_TRANSPORT,
+    ]
+
+
+def test_manual_planner_recharge_reopens_exhausted_phase(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    run = store.create_run(
+        RunCreateInput(
+            project="demo",
+            goal="Allow a founder to reopen one exhausted planner phase",
+            urgency="normal",
+            risk="medium",
+        ),
+    )
+    for index in range(3):
+        snapshot = store.build_run_snapshot(str(run.id))
+        with pytest.raises(IllegalPlannerProposalError):
+            store.record_planner_proposal(
+                run_id=str(run.id),
+                proposal=PlannerProposalInput(
+                    snapshot_hash=snapshot.state_hash,
+                    selected_action=PossibleActionName.EXECUTE_BOUNDED_TASK,
+                    rationale=f"Illegal attempt before recharge {index + 1}",
+                    expected_outcome="Should still be blocked on approval.",
+                ),
+            )
+
+    recharge = store.record_planner_recharge(
+        run_id=str(run.id),
+        reason="The founder wants one more planning pass after reviewing the failed attempts.",
+    )
+    recharged_snapshot = store.build_run_snapshot(str(run.id))
+    accepted = store.record_planner_proposal(
+        run_id=str(run.id),
+        proposal=PlannerProposalInput(
+            snapshot_hash=recharged_snapshot.state_hash,
+            selected_action=PossibleActionName.RESOLVE_PENDING_APPROVAL,
+            rationale="The next legal move is still to resolve the human approval gate.",
+            expected_outcome="The founder should approve or reject the run explicitly.",
+        ),
+    )
+
+    replay = store.build_run_replay(str(run.id))
+
+    assert recharge.outcome == PlannerAttemptOutcome.MANUAL_RECHARGE
+    assert recharged_snapshot.planner_phase_exhausted is False
+    assert recharged_snapshot.planner_budget_used == 0
+    assert accepted.selected_action == PossibleActionName.RESOLVE_PENDING_APPROVAL
+    assert any(
+        attempt.outcome == PlannerAttemptOutcome.MANUAL_RECHARGE
+        for attempt in replay.planner_attempts
+    )
