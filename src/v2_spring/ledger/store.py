@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import timedelta
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -9,7 +10,7 @@ import re
 from typing import Iterator
 from uuid import uuid4
 
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, inspect, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from v2_spring.domain.approval import ApprovalStatus, ApprovalView
@@ -96,6 +97,7 @@ class BoundedExecutionResult:
 class LedgerStore:
     """Typed persistence boundary for V2_SPRING tracer-bullet state and events."""
 
+    _DEFAULT_APPROVAL_TIMEOUT = timedelta(hours=24)
     # Approval should pause stateful progression, not blind the system.
     _APPROVAL_SAFE_OBSERVATION_KINDS = frozenset(
         {
@@ -125,6 +127,31 @@ class LedgerStore:
 
     def ensure_schema(self) -> None:
         Base.metadata.create_all(self._engine)
+        self._ensure_schema_columns()
+        self._backfill_approval_expirations()
+
+    def _ensure_schema_columns(self) -> None:
+        with self._engine.begin() as connection:
+            inspector = inspect(connection)
+            if "approvals" not in inspector.get_table_names():
+                return
+            approval_columns = {column["name"] for column in inspector.get_columns("approvals")}
+            if "expires_at" not in approval_columns:
+                connection.execute(text("ALTER TABLE approvals ADD COLUMN expires_at DATETIME"))
+
+    def _backfill_approval_expirations(self) -> None:
+        with self.session() as session:
+            records = list(
+                session.scalars(
+                    select(ApprovalRecord).where(ApprovalRecord.expires_at.is_(None)),
+                ).all(),
+            )
+            changed = False
+            for record in records:
+                record.expires_at = record.requested_at + self._DEFAULT_APPROVAL_TIMEOUT
+                changed = True
+            if changed:
+                session.flush()
 
     @contextmanager
     def session(self) -> Iterator[Session]:
@@ -209,6 +236,7 @@ class LedgerStore:
                 ),
                 approve_effect="The run moves from waiting approval to ready for the next bounded step.",
                 reject_effect="The run is marked rejected and remains stopped until a new decision is made.",
+                expires_at=utc_now() + self._DEFAULT_APPROVAL_TIMEOUT,
             )
             session.add(approval)
             session.flush()
@@ -220,6 +248,7 @@ class LedgerStore:
                         "approval_id": approval.id,
                         "status": approval.status.value,
                         "requested_action": approval.requested_action,
+                        "expires_at": approval.expires_at.isoformat() if approval.expires_at else None,
                     },
                 ),
             )
@@ -297,11 +326,81 @@ class LedgerStore:
                         "status": approval.status.value,
                         "run_status": run.status.value,
                         "resolution_reason": approval.resolution_reason,
+                        "expires_at": approval.expires_at.isoformat() if approval.expires_at else None,
                     },
                 ),
             )
             session.flush()
             return self._to_approval_view(approval)
+
+    def expire_overdue_approvals(self, *, now=None) -> list[ApprovalView]:
+        self.ensure_schema()
+        effective_now = now or utc_now()
+        with self.session() as session:
+            records = list(
+                session.scalars(
+                    select(ApprovalRecord)
+                    .where(ApprovalRecord.status == ApprovalStatus.PENDING)
+                    .where(ApprovalRecord.expires_at.is_not(None))
+                    .where(ApprovalRecord.expires_at <= effective_now)
+                    .order_by(ApprovalRecord.expires_at.asc(), ApprovalRecord.id.asc()),
+                ).all(),
+            )
+            expired_views: list[ApprovalView] = []
+            for approval in records:
+                approval.status = ApprovalStatus.EXPIRED
+                approval.resolved_at = effective_now
+                approval.resolution_reason = self._build_approval_timeout_reason(approval.expires_at)
+
+                run = session.get(RunRecord, approval.run_id)
+                run_status = None
+                if run is not None and run.status == RunStatus.WAITING_APPROVAL:
+                    run.status = RunStatus.SUSPENDED
+                    run_status = run.status.value
+                elif run is not None:
+                    run_status = run.status.value
+
+                session.add(
+                    EventLedgerRecord(
+                        run_id=approval.run_id,
+                        event_type=LedgerEventType.APPROVAL_RESOLVED,
+                        payload={
+                            "approval_id": approval.id,
+                            "status": approval.status.value,
+                            "run_status": run_status,
+                            "resolution_reason": approval.resolution_reason,
+                            "expires_at": approval.expires_at.isoformat() if approval.expires_at else None,
+                            "timeout_applied_at": effective_now.isoformat(),
+                        },
+                    ),
+                )
+                audit = ObservationRecord(
+                    run_id=approval.run_id,
+                    kind=ObservationKind.SYSTEM_AUDIT,
+                    summary="Approval expired and suspended the run.",
+                    details=(
+                        f"Approval {approval.id} expired at {approval.expires_at.isoformat() if approval.expires_at else '-'} "
+                        f"without a founder response. The run moved to {run_status if run_status else 'its current status'} "
+                        "and now requires explicit recovery before work can continue."
+                    ),
+                )
+                session.add(audit)
+                session.flush()
+                session.add(
+                    EventLedgerRecord(
+                        run_id=approval.run_id,
+                        event_type=LedgerEventType.OBSERVATION_RECORDED,
+                        payload={
+                            "observation_id": audit.id,
+                            "kind": audit.kind.value,
+                            "summary": audit.summary,
+                        },
+                    ),
+                )
+                expired_views.append(self._to_approval_view(approval))
+
+            session.flush()
+            return expired_views
 
     def record_decision(
         self,
@@ -360,6 +459,7 @@ class LedgerStore:
                 run_id,
                 mutation_name="observation recording",
                 allow_during_waiting_approval=kind in self._APPROVAL_SAFE_OBSERVATION_KINDS,
+                allow_during_suspended=kind in self._APPROVAL_SAFE_OBSERVATION_KINDS,
             )
             record = ObservationRecord(
                 run_id=run.id,
@@ -1951,6 +2051,13 @@ class LedgerStore:
         return cleaned
 
     @staticmethod
+    def _build_approval_timeout_reason(expires_at) -> str:
+        return (
+            "Approval timed out without a founder response"
+            + (f" by {expires_at.isoformat()}." if expires_at is not None else ".")
+        )
+
+    @staticmethod
     def _sanitize_planner_text(value: str | None, *, limit: int) -> str | None:
         if value is None:
             return None
@@ -2035,6 +2142,7 @@ class LedgerStore:
         *,
         mutation_name: str,
         allow_during_waiting_approval: bool = False,
+        allow_during_suspended: bool = False,
     ) -> RunRecord:
         run = session.get(RunRecord, run_id)
         if run is None:
@@ -2042,6 +2150,10 @@ class LedgerStore:
         if run.status == RunStatus.WAITING_APPROVAL and not allow_during_waiting_approval:
             raise PermissionError(
                 f"Run {run_id} is waiting for approval; {mutation_name} is blocked until approval is resolved.",
+            )
+        if run.status == RunStatus.SUSPENDED and not allow_during_suspended:
+            raise PermissionError(
+                f"Run {run_id} is suspended; {mutation_name} is blocked until the timed-out approval is explicitly recovered.",
             )
         return run
 
@@ -2286,6 +2398,7 @@ class LedgerStore:
                 "approve_effect": record.approve_effect,
                 "reject_effect": record.reject_effect,
                 "requested_at": record.requested_at,
+                "expires_at": record.expires_at,
                 "resolved_at": record.resolved_at,
                 "resolution_reason": record.resolution_reason,
             },
@@ -2464,6 +2577,14 @@ class LedgerStore:
             approval.status == ApprovalStatus.REJECTED for approval in approvals
         ):
             warnings.append("Run is marked rejected but no rejected approval is recorded.")
+
+        if run.status == RunStatus.SUSPENDED and not any(
+            approval.status == ApprovalStatus.EXPIRED for approval in approvals
+        ):
+            warnings.append("Run is marked suspended but no expired approval is recorded.")
+
+        if any(approval.status == ApprovalStatus.EXPIRED for approval in approvals) and run.status != RunStatus.SUSPENDED:
+            warnings.append("An approval expired but the run is not marked suspended.")
 
         for task in tasks:
             if task.task.status == TaskStatus.COMPLETED and str(task.task.id) not in task_completed_ids:

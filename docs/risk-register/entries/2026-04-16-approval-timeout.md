@@ -1,7 +1,7 @@
 # Risk ID: RISK-0001
-Title: Approval timeout / deadlock can leave runs suspended forever
+Title: ~~Approval timeout / deadlock can leave runs suspended forever~~
 Class: Before Scale
-Status: Open
+Status: Resolved
 Owner: Core orchestration
 Observed In: Step 3 approval CLI review
 
@@ -18,14 +18,22 @@ indefinitely if no human resolves the gate.
 
 ## Why This Matters
 
-This is acceptable for the current single-process CLI tracer bullet, but it
-becomes unsafe once background workers or longer-lived run execution are added.
+This is no longer left open for the current CLI substrate. The bounded
+approval loop now records `expires_at`, supports explicit expiry, and moves the
+run into `suspended` when a timeout sweep is applied.
 
 ## Suggested Mitigation
 
 - add `expires_at` to approval state
 - introduce `suspended` or equivalent deterministic timeout outcome
 - add watchdog or sweep logic that applies the timeout policy
+
+This risk is resolved for the current scope because:
+
+- approvals now carry `expires_at`
+- overdue approvals can be expired deterministically via `approval sweep-timeouts`
+- expired approvals resolve with status `expired` and move the run to `suspended`
+- replay and CLI inspection surfaces show timeout state and reason
 
 ## Capability Gate
 - Capability: background worker / long-lived autonomous loop
@@ -46,4 +54,4 @@ becomes unsafe once background workers or longer-lived run execution are added.
 - timeout behavior is visible in CLI replay
 
 ## Last Updated
-- 2026-04-16
+- 2026-04-17

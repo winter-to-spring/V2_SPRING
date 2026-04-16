@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -167,6 +168,36 @@ def test_rejecting_approval_requires_reason_and_records_it(tmp_path: Path) -> No
     assert fetched.status.value == "rejected"
     assert events[-1].event_type == LedgerEventType.APPROVAL_RESOLVED
     assert events[-1].payload["resolution_reason"] == resolved.resolution_reason
+
+
+def test_expiring_overdue_approval_suspends_run_and_records_timeout_evidence(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    run = store.create_run(
+        RunCreateInput(
+            project="demo",
+            goal="Let approval timeout deterministically",
+            urgency="normal",
+            risk="medium",
+        ),
+    )
+    pending_approval = store.list_approvals(status=ApprovalStatus.PENDING)[0]
+
+    expired = store.expire_overdue_approvals(now=pending_approval.expires_at + timedelta(seconds=1))
+    events = store.list_events_for_run(str(run.id))
+    fetched = store.get_run(str(run.id))
+    replay = store.build_run_replay(str(run.id))
+
+    assert len(expired) == 1
+    assert expired[0].status == ApprovalStatus.EXPIRED
+    assert expired[0].resolution_reason is not None
+    assert fetched is not None
+    assert fetched.status == RunStatus.SUSPENDED
+    assert events[-2].event_type == LedgerEventType.APPROVAL_RESOLVED
+    assert events[-2].payload["status"] == ApprovalStatus.EXPIRED.value
+    assert events[-1].event_type == LedgerEventType.OBSERVATION_RECORDED
+    assert replay.run.status == RunStatus.SUSPENDED
+    assert replay.approvals[-1].status == ApprovalStatus.EXPIRED
+    assert "timed out" in (replay.approvals[-1].resolution_reason or "").lower()
 
 
 def test_pending_approval_blocks_new_decision_and_observation_until_resolved(tmp_path: Path) -> None:

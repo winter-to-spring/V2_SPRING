@@ -233,6 +233,106 @@ def test_reject_requires_reason_and_is_visible_in_cli(capsys, monkeypatch, tmp_p
     assert "status:     rejected" in show_output
 
 
+def test_approval_timeout_sweep_is_visible_in_cli_and_replay(capsys, monkeypatch, tmp_path: Path) -> None:
+    database_url = f"sqlite+pysqlite:///{tmp_path / 'cli-approval-timeout.db'}"
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "run",
+            "create",
+            "--project",
+            "demo",
+            "--goal",
+            "Suspend a run by expiring approval",
+            "--urgency",
+            "normal",
+            "--risk",
+            "medium",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    create_output = capsys.readouterr().out
+    created_run_id = create_output.splitlines()[0].split()[-1]
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "approval",
+            "list",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    approval_output = capsys.readouterr().out
+    approval_id = next(
+        line.strip().replace("1. ", "")
+        for line in approval_output.splitlines()
+        if line.startswith("1. ")
+    )
+    expires_at_line = next(
+        line for line in approval_output.splitlines() if "expires_at:" in line
+    )
+    expires_at_value = expires_at_line.split("expires_at:")[1].strip()
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "approval",
+            "sweep-timeouts",
+            "--now",
+            expires_at_value,
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    sweep_output = capsys.readouterr().out
+
+    assert "Approval timeout sweep" in sweep_output
+    assert approval_id in sweep_output
+    assert "approval_status:  expired" in sweep_output
+    assert "run_status:       suspended" in sweep_output
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "run",
+            "show",
+            created_run_id,
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    show_output = capsys.readouterr().out
+    assert "status:     suspended" in show_output
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "run",
+            "replay",
+            created_run_id,
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    replay_output = capsys.readouterr().out
+
+    assert "current approval state: expired" in replay_output
+    assert "status:         suspended" in replay_output
+
+
 def test_bounded_execution_cli_flow(capsys, monkeypatch, tmp_path: Path) -> None:
     database_url = f"sqlite+pysqlite:///{tmp_path / 'cli-step5.db'}"
     workspace = tmp_path / "workspace"
@@ -668,7 +768,7 @@ def test_planner_propose_and_show_cli(capsys, monkeypatch, tmp_path: Path) -> No
     )
     main()
     snapshot_payload = json.loads(capsys.readouterr().out)
-    assert snapshot_payload["policy_version"] == "v1"
+    assert snapshot_payload["policy_version"] == "v2"
     snapshot_hash = snapshot_payload["state_hash"]
 
     monkeypatch.setattr(
@@ -693,7 +793,7 @@ def test_planner_propose_and_show_cli(capsys, monkeypatch, tmp_path: Path) -> No
     main()
     proposal_output = capsys.readouterr().out
     assert "Planner proposal accepted" in proposal_output
-    assert "policy_version:     v1" in proposal_output
+    assert "policy_version:     v2" in proposal_output
     assert "selected_action:    execute_bounded_task" in proposal_output
 
     monkeypatch.setattr(
@@ -703,7 +803,7 @@ def test_planner_propose_and_show_cli(capsys, monkeypatch, tmp_path: Path) -> No
     main()
     show_output = capsys.readouterr().out
     assert "Planner proposals" in show_output
-    assert "policy_version:    v1" in show_output
+    assert "policy_version:    v2" in show_output
     assert "execute_bounded_task" in show_output
 
     monkeypatch.setattr(

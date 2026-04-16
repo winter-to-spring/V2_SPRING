@@ -9,7 +9,7 @@ from v2_spring.domain.snapshot import (
     SnapshotActionState,
 )
 
-POSSIBLE_ACTIONS_ENGINE_VERSION = "v1"
+POSSIBLE_ACTIONS_ENGINE_VERSION = "v2"
 
 
 def evaluate_possible_actions(snapshot: RunSnapshotView) -> PossibleActionEvaluationView:
@@ -65,6 +65,9 @@ def evaluate_possible_actions(snapshot: RunSnapshotView) -> PossibleActionEvalua
     elif snapshot.run.status == RunStatus.RUNNING:
         action_state = SnapshotActionState.BLOCKED
         action_state_reason = "A bounded task is currently running."
+    elif snapshot.run.status == RunStatus.SUSPENDED:
+        action_state = SnapshotActionState.BLOCKED
+        action_state_reason = "The run is suspended because an approval timed out and now requires explicit recovery."
     elif snapshot.run.status == RunStatus.COMPLETED:
         action_state = SnapshotActionState.TERMINAL
         action_state_reason = "The run is already completed; no further mutating action is legal."

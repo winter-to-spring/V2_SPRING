@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 from textwrap import dedent
@@ -238,7 +239,7 @@ def build_parser() -> argparse.ArgumentParser:
     approval_list_parser.add_argument(
         "--status",
         default="pending",
-        choices=["pending", "approved", "rejected", "all"],
+        choices=["pending", "approved", "rejected", "expired", "all"],
         help="Filter approvals by status.",
     )
     approval_list_parser.add_argument(
@@ -261,6 +262,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional structured feedback. Required for --reject.",
     )
     approval_resolve_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Override DATABASE_URL for this invocation.",
+    )
+
+    approval_sweep_parser = approval_subparsers.add_parser(
+        "sweep-timeouts",
+        help="Expire overdue approvals and suspend the affected runs.",
+    )
+    approval_sweep_parser.add_argument(
+        "--now",
+        default=None,
+        help="Optional ISO-8601 timestamp used as the timeout cutoff. Defaults to current UTC time.",
+    )
+    approval_sweep_parser.add_argument(
         "--database-url",
         default=None,
         help="Override DATABASE_URL for this invocation.",
@@ -547,6 +563,15 @@ def _build_store(database_url_override: str | None) -> LedgerStore:
     return LedgerStore(load_config(database_url_override).database_url)
 
 
+def _parse_cli_datetime(value: str | None) -> datetime | None:
+    if value is None:
+        return None
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def _build_planner_transport(
     *,
     args: argparse.Namespace,
@@ -698,6 +723,7 @@ def _render_approvals(store: LedgerStore, status_filter: str) -> str:
                 f"   approve_effect:   {approval.approve_effect}",
                 f"   reject_effect:    {approval.reject_effect}",
                 f"   requested_at:     {approval.requested_at.isoformat()}",
+                f"   expires_at:       {approval.expires_at.isoformat()}",
                 f"   resolved_at:      {approval.resolved_at.isoformat() if approval.resolved_at else '-'}",
                 f"   resolution_reason:{approval.resolution_reason if approval.resolution_reason else '-'}",
             ],
@@ -723,10 +749,40 @@ def _render_resolved_approval(
         new_status:       {approval.status.value}
         requested_action: {approval.requested_action}
         outcome:          {outcome}
+        expires_at:       {approval.expires_at.isoformat()}
         resolution_reason:{approval.resolution_reason if approval.resolution_reason else "-"}
         resolved_at:      {approval.resolved_at.isoformat() if approval.resolved_at else "-"}
         """,
     ).strip()
+
+
+def _render_expired_approvals(approvals, store: LedgerStore, *, sweep_now: datetime) -> str:
+    lines = [
+        "Approval timeout sweep",
+        "----------------------",
+        f"sweep_now:          {sweep_now.isoformat()}",
+    ]
+    if not approvals:
+        lines.append("No pending approvals had reached their expiration time.")
+        return "\n".join(lines)
+
+    lines.append(f"expired_count:      {len(approvals)}")
+    for index, approval in enumerate(approvals, start=1):
+        run = store.get_run(str(approval.run_id))
+        lines.extend(
+            [
+                "",
+                f"{index}. {approval.id}",
+                f"   run_id:           {approval.run_id}",
+                f"   approval_status:  {approval.status.value}",
+                f"   run_status:       {run.status.value if run is not None else '-'}",
+                f"   requested_action: {approval.requested_action}",
+                f"   expires_at:       {approval.expires_at.isoformat()}",
+                f"   resolved_at:      {approval.resolved_at.isoformat() if approval.resolved_at else '-'}",
+                f"   resolution_reason:{approval.resolution_reason if approval.resolution_reason else '-'}",
+            ],
+        )
+    return "\n".join(lines)
 
 
 def _render_tasks(run_id: str, store: LedgerStore) -> str:
@@ -843,6 +899,7 @@ def _render_snapshot(snapshot: RunSnapshotView) -> str:
                 f"id:                  {snapshot.pending_approval.id}",
                 f"requested_action:    {snapshot.pending_approval.requested_action}",
                 f"reason:              {snapshot.pending_approval.reason}",
+                f"expires_at:          {snapshot.pending_approval.expires_at.isoformat()}",
             ],
         )
     if snapshot.pending_founder_escalation is not None:
@@ -1314,6 +1371,7 @@ def _render_replay(replay: RunReplayView, *, verbose: bool) -> str:
             [
                 f"- current approval state: {latest_approval.status.value}",
                 f"- requested action: {latest_approval.requested_action}",
+                f"- expires at: {latest_approval.expires_at.isoformat()}",
                 f"- resolution reason: {latest_approval.resolution_reason if latest_approval.resolution_reason else '-'}",
             ],
         )
@@ -1384,7 +1442,7 @@ def _render_replay(replay: RunReplayView, *, verbose: bool) -> str:
         lines.extend(["", "Detailed approvals", "-----------------"])
         for approval in replay.approvals:
             lines.append(
-                f"- {approval.id}: {approval.status.value} / {approval.requested_action}",
+                f"- {approval.id}: {approval.status.value} / {approval.requested_action} / expires_at={approval.expires_at.isoformat()}",
             )
 
         lines.extend(["", "Detailed decisions", "------------------"])
@@ -1653,6 +1711,17 @@ def main() -> None:
         except (LookupError, PermissionError, ValueError) as exc:
             print(str(exc))
             raise SystemExit(1) from exc
+        return
+
+    if args.command == "approval" and args.approval_command == "sweep-timeouts":
+        store = _build_store(args.database_url)
+        try:
+            sweep_now = _parse_cli_datetime(args.now)
+        except ValueError as exc:
+            print(f"Invalid --now timestamp: {args.now}")
+            raise SystemExit(2) from exc
+        expired = store.expire_overdue_approvals(now=sweep_now)
+        print(_render_expired_approvals(expired, store, sweep_now=sweep_now or datetime.now(timezone.utc)))
         return
 
     if args.command == "planner" and args.planner_command == "propose":

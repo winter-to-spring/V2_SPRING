@@ -64,9 +64,25 @@ The approval barrier still blocks the first class.
 The second class is allowed so the system does not become blind while a human
 is deciding.
 
+## Approval Timeout Closure
+
+Approval wait is no longer an unbounded pause.
+
+The current tracer bullet now adds:
+
+- `expires_at` on every approval record
+- an explicit `expired` approval outcome
+- a deterministic `suspended` run state when an overdue approval is swept
+- `v2-spring approval sweep-timeouts` as the current founder/operator-facing
+  timeout mechanism
+- replay and approval list visibility for expiry state and timeout reason
+
+This keeps the current CLI flow deterministic without pretending we already
+have a background watchdog. A future worker can call the same sweep logic on a
+schedule, but the domain rule now already exists.
+
 ## What We Deliberately Leave For Later
 
-- approval timeout / expires_at / suspended semantics
 - watchdog-driven cleanup for abandoned approvals
 - stronger DB-level or distributed locking for concurrent workers
 
