@@ -9,9 +9,15 @@ from v2_spring.domain.snapshot import (
     SnapshotActionState,
 )
 
+POSSIBLE_ACTIONS_ENGINE_VERSION = "v1"
+
 
 def evaluate_possible_actions(snapshot: RunSnapshotView) -> PossibleActionEvaluationView:
-    """Return legal moves only; do not smuggle planner judgment into this layer."""
+    """Return legal moves only; do not smuggle planner judgment into this layer.
+
+    This function must stay side-effect free so the same engine can safely power
+    both founder-visible menus and planner-side legality checks.
+    """
 
     actions: list[PossibleActionView] = []
 

@@ -15,6 +15,7 @@ from v2_spring.domain.approval import ApprovalStatus, ApprovalView
 from v2_spring.domain.artifact import ArtifactStorageKind, ArtifactType, ArtifactView
 from v2_spring.domain.decision import DecisionKind, DecisionView
 from v2_spring.domain.observation import ObservationKind, ObservationView
+from v2_spring.domain.proposal import PlannerProposalInput, PlannerProposalView
 from v2_spring.domain.replay import ArtifactInspectionView, RunReplayView, TaskReplayView
 from v2_spring.domain.run import RunCreateInput, RunStatus, RunView
 from v2_spring.domain.snapshot import (
@@ -43,6 +44,8 @@ from v2_spring.ledger.models import (
     TaskRecord,
     utc_now,
 )
+from v2_spring.planner.actions import POSSIBLE_ACTIONS_ENGINE_VERSION, evaluate_possible_actions
+from v2_spring.planner.proposals import IllegalPlannerProposalError, StalePlannerProposalError
 
 
 @dataclass(frozen=True)
@@ -256,6 +259,8 @@ class LedgerStore:
         kind: DecisionKind,
         summary: str,
         rationale: str,
+        extra_payload: dict[str, object] | None = None,
+        allow_during_waiting_approval: bool = False,
     ) -> DecisionView:
         self.ensure_schema()
         with self.session() as session:
@@ -263,6 +268,7 @@ class LedgerStore:
                 session,
                 run_id,
                 mutation_name="decision recording",
+                allow_during_waiting_approval=allow_during_waiting_approval,
             )
             record = DecisionRecord(
                 run_id=run.id,
@@ -280,6 +286,8 @@ class LedgerStore:
                         "decision_id": record.id,
                         "kind": record.kind.value,
                         "summary": record.summary,
+                        "rationale": record.rationale,
+                        **(extra_payload or {}),
                     },
                 ),
             )
@@ -550,6 +558,7 @@ class LedgerStore:
             task_summary = self._build_task_status_summary(task_records)
 
             snapshot_payload = {
+                "policy_version": POSSIBLE_ACTIONS_ENGINE_VERSION,
                 "run": self._to_run_view(run_record).model_dump(mode="json"),
                 "pending_approval": pending_approval.model_dump(mode="json") if pending_approval else None,
                 "latest_rejection_reason": latest_rejection_reason,
@@ -564,6 +573,7 @@ class LedgerStore:
 
             return RunSnapshotView(
                 snapshot_timestamp=utc_now(),
+                policy_version=POSSIBLE_ACTIONS_ENGINE_VERSION,
                 state_hash=state_hash,
                 run=self._to_run_view(run_record),
                 action_state=SnapshotActionState.STUCK,
@@ -575,6 +585,118 @@ class LedgerStore:
                 latest_task=latest_task,
                 latest_artifact=latest_artifact,
             )
+
+    def record_planner_proposal(
+        self,
+        *,
+        run_id: str,
+        proposal: PlannerProposalInput,
+    ) -> PlannerProposalView:
+        """Validate and persist one planner proposal against the current legal move set."""
+
+        snapshot = self.build_run_snapshot(run_id)
+        evaluation = evaluate_possible_actions(snapshot)
+        legal_actions = {action.name for action in evaluation.actions}
+        legal_action_descriptions = [
+            {
+                "name": action.name.value,
+                "reason": action.reason,
+                "context_hint": action.context_hint,
+            }
+            for action in evaluation.actions
+        ]
+
+        if proposal.snapshot_hash != evaluation.snapshot.state_hash:
+            self.record_observation(
+                run_id=run_id,
+                kind=ObservationKind.SYSTEM_AUDIT,
+                summary="Planner proposal rejected because the snapshot hash was stale.",
+                details=(
+                    f"Selected action={proposal.selected_action.value}; "
+                    f"policy_version={evaluation.snapshot.policy_version}; "
+                    f"provided_hash={proposal.snapshot_hash}; "
+                    f"current_hash={evaluation.snapshot.state_hash}."
+                ),
+            )
+            raise StalePlannerProposalError(
+                "Planner proposal snapshot hash is stale; refresh the run snapshot before proposing again. "
+                f"Provided={proposal.snapshot_hash}, current={evaluation.snapshot.state_hash}.",
+            )
+        if proposal.selected_action not in legal_actions:
+            self.record_observation(
+                run_id=run_id,
+                kind=ObservationKind.SYSTEM_AUDIT,
+                summary="Planner proposal rejected because the selected action was not legal.",
+                details=(
+                    f"Selected action={proposal.selected_action.value}; "
+                    f"action_state={evaluation.snapshot.action_state.value}; "
+                    f"action_state_reason={evaluation.snapshot.action_state_reason}; "
+                    f"legal_actions={legal_action_descriptions}."
+                ),
+            )
+            legal_action_summary = ", ".join(
+                f"{action['name']} ({action['reason']})" for action in legal_action_descriptions
+            )
+            raise IllegalPlannerProposalError(
+                f"Planner action {proposal.selected_action.value} is not legal for run {run_id} under the current snapshot. "
+                f"Current action_state={evaluation.snapshot.action_state.value} "
+                f"({evaluation.snapshot.action_state_reason}). "
+                f"Legal actions: {legal_action_summary if legal_action_summary else 'none'}.",
+            )
+
+        decision = self.record_decision(
+            run_id=run_id,
+            kind=DecisionKind.PLANNER_PROPOSAL_ACCEPTED,
+            summary=f"Planner selected {proposal.selected_action.value}.",
+            rationale=proposal.rationale,
+            allow_during_waiting_approval=True,
+            extra_payload={
+                "policy_version": evaluation.snapshot.policy_version,
+                "snapshot_hash": proposal.snapshot_hash,
+                "selected_action": proposal.selected_action.value,
+                "expected_outcome": proposal.expected_outcome,
+                "legal_actions": [action.name.value for action in evaluation.actions],
+                "legal_action_details": legal_action_descriptions,
+                "action_state": evaluation.snapshot.action_state.value,
+                "action_state_reason": evaluation.snapshot.action_state_reason,
+            },
+        )
+
+        return PlannerProposalView(
+            decision_id=decision.id,
+            run_id=decision.run_id,
+            policy_version=evaluation.snapshot.policy_version,
+            snapshot_hash=proposal.snapshot_hash,
+            selected_action=proposal.selected_action,
+            rationale=proposal.rationale,
+            expected_outcome=proposal.expected_outcome,
+            created_at=decision.created_at,
+        )
+
+    def list_planner_proposals_for_run(self, run_id: str) -> list[PlannerProposalView]:
+        """Return accepted planner proposals recorded for one run."""
+
+        proposals: list[PlannerProposalView] = []
+        for event in self.list_events_for_run(run_id):
+            if event.event_type != LedgerEventType.DECISION_RECORDED:
+                continue
+            if event.payload.get("kind") != DecisionKind.PLANNER_PROPOSAL_ACCEPTED.value:
+                continue
+            proposals.append(
+                PlannerProposalView.model_validate(
+                    {
+                        "decision_id": event.payload["decision_id"],
+                        "run_id": run_id,
+                        "policy_version": event.payload.get("policy_version", POSSIBLE_ACTIONS_ENGINE_VERSION),
+                        "snapshot_hash": event.payload["snapshot_hash"],
+                        "selected_action": event.payload["selected_action"],
+                        "rationale": event.payload["rationale"],
+                        "expected_outcome": event.payload["expected_outcome"],
+                        "created_at": event.recorded_at,
+                    },
+                ),
+            )
+        return proposals
 
     def execute_bounded_task(
         self,

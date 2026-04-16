@@ -102,3 +102,6 @@ Observed In:
 - [RISK-0004 Service-level approval barrier race window](entries/2026-04-16-service-level-barrier-race-window.md)
 - [RISK-0005 RunSnapshot staleness under concurrent writes](entries/2026-04-16-run-snapshot-staleness.md)
 - [RISK-0006 Snapshot/action read-model growth](entries/2026-04-16-snapshot-read-model-growth.md)
+- [RISK-0007 Possible-actions engine purity drift](entries/2026-04-16-possible-actions-engine-purity.md)
+- [RISK-0008 Planner proposal loop lacks retry bounds and idempotency policy](entries/2026-04-16-planner-proposal-loop-control.md)
+- [RISK-0009 Planner-facing audit payload hygiene](entries/2026-04-16-planner-audit-payload-hygiene.md)

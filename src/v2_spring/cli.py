@@ -9,10 +9,12 @@ from pydantic import ValidationError
 
 from v2_spring.config import load_config
 from v2_spring.domain.approval import ApprovalStatus
+from v2_spring.domain.proposal import PlannerProposalInput, PlannerProposalView
 from v2_spring.domain.replay import ArtifactInspectionView, RunReplayView, TaskReplayView
-from v2_spring.domain.snapshot import PossibleActionEvaluationView, RunSnapshotView
+from v2_spring.domain.snapshot import PossibleActionEvaluationView, PossibleActionName, RunSnapshotView
 from v2_spring.ledger.store import BoundedExecutionResult, LedgerStore
 from v2_spring.planner.actions import evaluate_possible_actions
+from v2_spring.planner.proposals import IllegalPlannerProposalError, StalePlannerProposalError
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -231,6 +233,64 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional structured feedback. Required for --reject.",
     )
     approval_resolve_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Override DATABASE_URL for this invocation.",
+    )
+
+    planner_parser = subparsers.add_parser("planner", help="Validate and inspect planner proposals.")
+    planner_subparsers = planner_parser.add_subparsers(dest="planner_command")
+
+    planner_propose_parser = planner_subparsers.add_parser(
+        "propose",
+        help="Submit one planner proposal against the current legal move set.",
+    )
+    planner_propose_parser.add_argument("run_id", help="Run id to target.")
+    planner_propose_parser.add_argument(
+        "--snapshot-hash",
+        required=True,
+        help="Snapshot hash returned by `v2-spring run snapshot` or `run actions`.",
+    )
+    planner_propose_parser.add_argument(
+        "--action",
+        required=True,
+        choices=[action.value for action in PossibleActionName],
+        help="Selected legal move.",
+    )
+    planner_propose_parser.add_argument(
+        "--rationale",
+        required=True,
+        help="Why this action should be selected now.",
+    )
+    planner_propose_parser.add_argument(
+        "--expected-outcome",
+        required=True,
+        help="What the planner expects to happen if this action is executed.",
+    )
+    planner_propose_parser.add_argument(
+        "--format",
+        default="pretty",
+        choices=["pretty", "json"],
+        help="Output format. Defaults to pretty.",
+    )
+    planner_propose_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Override DATABASE_URL for this invocation.",
+    )
+
+    planner_show_parser = planner_subparsers.add_parser(
+        "show",
+        help="Show accepted planner proposals for one run.",
+    )
+    planner_show_parser.add_argument("run_id", help="Run id to inspect.")
+    planner_show_parser.add_argument(
+        "--format",
+        default="pretty",
+        choices=["pretty", "json"],
+        help="Output format. Defaults to pretty.",
+    )
+    planner_show_parser.add_argument(
         "--database-url",
         default=None,
         help="Override DATABASE_URL for this invocation.",
@@ -466,6 +526,7 @@ def _render_snapshot(snapshot: RunSnapshotView) -> str:
         "------------",
         f"run_id:              {snapshot.run.id}",
         f"snapshot_timestamp:  {snapshot.snapshot_timestamp.isoformat()}",
+        f"policy_version:      {snapshot.policy_version}",
         f"state_hash:          {snapshot.state_hash}",
         f"status:              {snapshot.run.status.value}",
         f"action_state:        {snapshot.action_state.value}",
@@ -528,6 +589,7 @@ def _render_actions(evaluation: PossibleActionEvaluationView) -> str:
         "-----------",
         f"run_id:              {evaluation.snapshot.run.id}",
         f"snapshot_timestamp:  {evaluation.snapshot.snapshot_timestamp.isoformat()}",
+        f"policy_version:      {evaluation.snapshot.policy_version}",
         f"state_hash:          {evaluation.snapshot.state_hash}",
         f"action_state:        {evaluation.snapshot.action_state.value}",
         f"action_state_reason: {evaluation.snapshot.action_state_reason}",
@@ -543,6 +605,45 @@ def _render_actions(evaluation: PossibleActionEvaluationView) -> str:
                 f"{index}. {action.name.value}",
                 f"   reason:       {action.reason}",
                 f"   context_hint: {action.context_hint if action.context_hint else '-'}",
+            ],
+        )
+    return "\n".join(lines)
+
+
+def _render_planner_proposal(proposal: PlannerProposalView) -> str:
+    return dedent(
+        f"""\
+        Planner proposal accepted
+        -------------------------
+        decision_id:        {proposal.decision_id}
+        run_id:             {proposal.run_id}
+        policy_version:     {proposal.policy_version}
+        snapshot_hash:      {proposal.snapshot_hash}
+        selected_action:    {proposal.selected_action.value}
+        rationale:          {proposal.rationale}
+        expected_outcome:   {proposal.expected_outcome}
+        created_at:         {proposal.created_at.isoformat()}
+        """,
+    ).strip()
+
+
+def _render_planner_proposals(proposals: list[PlannerProposalView], *, run_id: str) -> str:
+    lines = ["Planner proposals", "-----------------", f"run_id: {run_id}"]
+    if not proposals:
+        lines.append("No accepted planner proposals are recorded for this run yet.")
+        return "\n".join(lines)
+
+    for index, proposal in enumerate(proposals, start=1):
+        lines.extend(
+            [
+                "",
+                f"{index}. {proposal.decision_id}",
+                f"   action:            {proposal.selected_action.value}",
+                f"   policy_version:    {proposal.policy_version}",
+                f"   snapshot_hash:     {proposal.snapshot_hash}",
+                f"   rationale:         {proposal.rationale}",
+                f"   expected_outcome:  {proposal.expected_outcome}",
+                f"   created_at:        {proposal.created_at.isoformat()}",
             ],
         )
     return "\n".join(lines)
@@ -866,6 +967,43 @@ def main() -> None:
         except (LookupError, PermissionError, ValueError) as exc:
             print(str(exc))
             raise SystemExit(1) from exc
+        return
+
+    if args.command == "planner" and args.planner_command == "propose":
+        store = _build_store(args.database_url)
+        try:
+            proposal = PlannerProposalInput(
+                snapshot_hash=args.snapshot_hash,
+                selected_action=args.action,
+                rationale=args.rationale,
+                expected_outcome=args.expected_outcome,
+            )
+        except ValidationError as exc:
+            print("Planner proposal failed validation.")
+            print(exc)
+            raise SystemExit(2) from exc
+
+        try:
+            recorded = store.record_planner_proposal(run_id=args.run_id, proposal=proposal)
+            if args.format == "json":
+                print(json.dumps(recorded.model_dump(mode="json"), indent=2, ensure_ascii=False))
+            else:
+                print(_render_planner_proposal(recorded))
+        except (LookupError, IllegalPlannerProposalError, StalePlannerProposalError, PermissionError, ValueError) as exc:
+            print(str(exc))
+            raise SystemExit(1) from exc
+        return
+
+    if args.command == "planner" and args.planner_command == "show":
+        store = _build_store(args.database_url)
+        if store.get_run(args.run_id) is None:
+            print(f"Run {args.run_id} was not found.")
+            raise SystemExit(1)
+        proposals = store.list_planner_proposals_for_run(args.run_id)
+        if args.format == "json":
+            print(json.dumps([proposal.model_dump(mode="json") for proposal in proposals], indent=2, ensure_ascii=False))
+        else:
+            print(_render_planner_proposals(proposals, run_id=args.run_id))
         return
 
     parser.print_help()

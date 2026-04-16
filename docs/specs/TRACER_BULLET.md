@@ -185,6 +185,8 @@ Optional but helpful:
 - `v2 artifact list`
 - `v2 run snapshot`
 - `v2 run actions`
+- `v2 planner propose`
+- `v2 planner show`
 
 ## Acceptance Criteria
 
