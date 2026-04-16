@@ -32,9 +32,11 @@ actions) for another (constant escalation).
 ## Suggested Mitigation
 
 - add escalation policy guidance to the planner prompt
-- consider escalation quotas or cooldown rules
+- use **phase-scoped escalation quotas** instead of time-based cooldowns
 - record duplicate escalation fingerprints explicitly
 - define stronger founder reply semantics before opening richer planner loops
+- if a planner burns the founder-hint quota for the current phase, transition the
+  current loop into a bounded exhausted state instead of allowing endless ping-pong
 
 ## Capability Gate
 - Capability: planner-backed tracer bullet / founder hint loop
@@ -42,7 +44,7 @@ actions) for another (constant escalation).
 - Blocked until: escalation behavior is bounded enough to avoid thrash
 
 ## Issue Link
-- GitHub Issue: #19
+- GitHub Issue: #22
 
 ## Doc Links
 - ADR: ../../adr/0007-planner-decision-output-contract.md
@@ -52,6 +54,7 @@ actions) for another (constant escalation).
 
 - repeated escalations cannot silently stall the system
 - planner prompt and governance make escalation a last-resort path rather than a default move
+- founder hint / escalation ping-pong is bounded per phase
 
 ## Last Updated
 - 2026-04-17
