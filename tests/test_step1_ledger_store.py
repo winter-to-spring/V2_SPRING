@@ -9,13 +9,15 @@ from v2_spring.domain.artifact import ArtifactStorageKind, ArtifactType
 from v2_spring.domain.approval import ApprovalStatus
 from v2_spring.domain.decision import DecisionKind
 from v2_spring.domain.observation import ObservationKind
-from v2_spring.domain.run import RunCreateInput
+from v2_spring.domain.proposal import PlannerProposalInput
+from v2_spring.domain.run import RunCreateInput, RunStatus
 from v2_spring.domain.snapshot import PossibleActionName, SnapshotActionState
 from v2_spring.domain.task import TaskKind, TaskStatus
 from v2_spring.planner.actions import evaluate_possible_actions
 from v2_spring.executor.bounded import BoundedExecutorTimeout
 from v2_spring.ledger.models import LedgerEventType
 from v2_spring.ledger.store import LedgerStore
+from v2_spring.planner.proposals import IllegalPlannerProposalError, StalePlannerProposalError
 
 
 def make_store(tmp_path: Path) -> LedgerStore:
@@ -418,3 +420,109 @@ def test_run_snapshot_and_possible_actions_capture_rejection_feedback(tmp_path: 
     assert actions.snapshot.action_state == SnapshotActionState.AVAILABLE
     assert actions.actions[0].name == PossibleActionName.REPLAN_WITH_REJECTION_FEEDBACK
     assert actions.actions[0].context_hint == snapshot.latest_rejection_reason
+
+
+def test_planner_proposal_accepts_only_current_legal_moves(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    run = store.create_run(
+        RunCreateInput(
+            project="demo",
+            goal="Prepare planner contract proof",
+            urgency="normal",
+            risk="medium",
+        ),
+    )
+    approval = store.list_approvals(status=ApprovalStatus.PENDING)[0]
+    store.resolve_approval(str(approval.id), approved=True)
+
+    snapshot = store.build_run_snapshot(str(run.id))
+    proposal = PlannerProposalInput(
+        snapshot_hash=snapshot.state_hash,
+        selected_action=PossibleActionName.EXECUTE_BOUNDED_TASK,
+        rationale="The run is ready and has no bounded execution evidence yet.",
+        expected_outcome="One bounded execution task should be recorded for the run.",
+    )
+
+    recorded = store.record_planner_proposal(run_id=str(run.id), proposal=proposal)
+    proposals = store.list_planner_proposals_for_run(str(run.id))
+    decisions = store.list_decisions_for_run(str(run.id))
+
+    assert recorded.selected_action == PossibleActionName.EXECUTE_BOUNDED_TASK
+    assert proposals[-1].decision_id == recorded.decision_id
+    assert decisions[-1].kind == DecisionKind.PLANNER_PROPOSAL_ACCEPTED
+
+
+def test_planner_proposal_can_record_pending_approval_resolution_as_non_mutating_evidence(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    run = store.create_run(
+        RunCreateInput(
+            project="demo",
+            goal="Record a legal proposal while approval is pending",
+            urgency="normal",
+            risk="medium",
+        ),
+    )
+    snapshot = store.build_run_snapshot(str(run.id))
+
+    recorded = store.record_planner_proposal(
+        run_id=str(run.id),
+        proposal=PlannerProposalInput(
+            snapshot_hash=snapshot.state_hash,
+            selected_action=PossibleActionName.RESOLVE_PENDING_APPROVAL,
+            rationale="The run cannot proceed until a human resolves the approval gate.",
+            expected_outcome="The founder should approve or reject the pending request.",
+        ),
+    )
+
+    fetched = store.get_run(str(run.id))
+    assert fetched is not None
+    assert fetched.status == RunStatus.WAITING_APPROVAL
+    assert recorded.selected_action == PossibleActionName.RESOLVE_PENDING_APPROVAL
+
+
+def test_planner_proposal_rejects_stale_hash_and_illegal_action(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    run = store.create_run(
+        RunCreateInput(
+            project="demo",
+            goal="Reject stale and illegal planner proposals",
+            urgency="normal",
+            risk="medium",
+        ),
+    )
+    waiting_snapshot = store.build_run_snapshot(str(run.id))
+
+    with pytest.raises(IllegalPlannerProposalError):
+        store.record_planner_proposal(
+            run_id=str(run.id),
+            proposal=PlannerProposalInput(
+                snapshot_hash=waiting_snapshot.state_hash,
+                selected_action=PossibleActionName.EXECUTE_BOUNDED_TASK,
+                rationale="This should fail because approval is still pending.",
+                expected_outcome="Execution should not be allowed.",
+            ),
+        )
+    illegal_observation = store.list_observations_for_run(str(run.id))[-1]
+    assert illegal_observation.kind == ObservationKind.SYSTEM_AUDIT
+    assert "selected action was not legal" in illegal_observation.summary.lower()
+    assert not any(
+        decision.kind == DecisionKind.PLANNER_PROPOSAL_ACCEPTED
+        for decision in store.list_decisions_for_run(str(run.id))
+    )
+
+    approval = store.list_approvals(status=ApprovalStatus.PENDING)[0]
+    store.resolve_approval(str(approval.id), approved=True)
+
+    with pytest.raises(StalePlannerProposalError):
+        store.record_planner_proposal(
+            run_id=str(run.id),
+            proposal=PlannerProposalInput(
+                snapshot_hash=waiting_snapshot.state_hash,
+                selected_action=PossibleActionName.EXECUTE_BOUNDED_TASK,
+                rationale="The hash is stale because approval already changed the run.",
+                expected_outcome="The proposal should be rejected as stale.",
+            ),
+        )
+    stale_observation = store.list_observations_for_run(str(run.id))[-1]
+    assert stale_observation.kind == ObservationKind.SYSTEM_AUDIT
+    assert "snapshot hash was stale" in stale_observation.summary.lower()

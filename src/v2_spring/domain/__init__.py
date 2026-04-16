@@ -3,6 +3,7 @@ from v2_spring.domain.approval import ApprovalStatus, ApprovalView
 from v2_spring.domain.artifact import ArtifactStorageKind, ArtifactType, ArtifactView
 from v2_spring.domain.decision import DecisionKind, DecisionView
 from v2_spring.domain.observation import ObservationKind, ObservationView
+from v2_spring.domain.proposal import PlannerProposalInput, PlannerProposalView
 from v2_spring.domain.replay import ArtifactInspectionView, RunReplayView, TaskReplayView
 from v2_spring.domain.run import RiskLevel, RunCreateInput, RunStatus, RunView, UrgencyLevel
 from v2_spring.domain.snapshot import (
@@ -28,6 +29,8 @@ __all__ = [
     "DecisionView",
     "ObservationKind",
     "ObservationView",
+    "PlannerProposalInput",
+    "PlannerProposalView",
     "PossibleActionEvaluationView",
     "PossibleActionName",
     "PossibleActionView",

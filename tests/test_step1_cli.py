@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 import json
 
+import pytest
+
 from v2_spring.cli import main
 
 
@@ -596,3 +598,129 @@ def test_run_snapshot_and_actions_cli(capsys, monkeypatch, tmp_path: Path) -> No
     actions_payload = json.loads(capsys.readouterr().out)
     assert actions_payload["snapshot"]["run"]["id"] == run_id
     assert actions_payload["actions"][0]["name"] == "resolve_pending_approval"
+
+
+def test_planner_propose_and_show_cli(capsys, monkeypatch, tmp_path: Path) -> None:
+    database_url = f"sqlite+pysqlite:///{tmp_path / 'cli-step8.db'}"
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "run",
+            "create",
+            "--project",
+            "demo",
+            "--goal",
+            "Validate planner proposal contract",
+            "--urgency",
+            "normal",
+            "--risk",
+            "medium",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    run_id = capsys.readouterr().out.splitlines()[0].split()[-1]
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["v2-spring", "approval", "list", "--database-url", database_url],
+    )
+    main()
+    approval_output = capsys.readouterr().out
+    approval_id = next(
+        line.strip().replace("1. ", "")
+        for line in approval_output.splitlines()
+        if line.startswith("1. ")
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "approval",
+            "resolve",
+            approval_id,
+            "--approve",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    capsys.readouterr()
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "run",
+            "snapshot",
+            run_id,
+            "--format",
+            "json",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    snapshot_payload = json.loads(capsys.readouterr().out)
+    snapshot_hash = snapshot_payload["state_hash"]
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "planner",
+            "propose",
+            run_id,
+            "--snapshot-hash",
+            snapshot_hash,
+            "--action",
+            "execute_bounded_task",
+            "--rationale",
+            "The run is approved and has not executed any bounded task yet.",
+            "--expected-outcome",
+            "One legal bounded execution should be ready for the next executor step.",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    proposal_output = capsys.readouterr().out
+    assert "Planner proposal accepted" in proposal_output
+    assert "selected_action:    execute_bounded_task" in proposal_output
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["v2-spring", "planner", "show", run_id, "--database-url", database_url],
+    )
+    main()
+    show_output = capsys.readouterr().out
+    assert "Planner proposals" in show_output
+    assert "execute_bounded_task" in show_output
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "planner",
+            "propose",
+            run_id,
+            "--snapshot-hash",
+            "0" * 64,
+            "--action",
+            "execute_bounded_task",
+            "--rationale",
+            "This should fail because the snapshot hash is stale.",
+            "--expected-outcome",
+            "Nothing should be recorded.",
+            "--database-url",
+            database_url,
+        ],
+    )
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 1
+    stale_output = capsys.readouterr().out
+    assert "snapshot hash is stale" in stale_output
