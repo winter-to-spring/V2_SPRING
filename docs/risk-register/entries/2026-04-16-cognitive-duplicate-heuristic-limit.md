@@ -17,11 +17,17 @@ That is a good deterministic baseline, but it does not yet detect
 semantically-equivalent retries where the planner changes wording while keeping
 the same underlying move.
 
+Examples:
+
+- "Inspect the database schema before continuing"
+- "Review the DB schema first"
+
 ## Impact
 
 - planner loops may still waste budget on near-identical retries
 - analytics may underestimate repeated reasoning failure
 - future cost controls may need additional heuristics
+- a real LLM may evade exact duplicate detection by paraphrasing the same move
 
 ## Why This Matters
 

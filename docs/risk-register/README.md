@@ -119,3 +119,5 @@ Observed In:
 - [RISK-0010 Phase budget reset abuse may refresh planner retries without meaningful progress](entries/2026-04-16-phase-budget-reset-abuse.md)
 - [RISK-0011 Manual recharge lacks environment preflight and misuse guardrails](entries/2026-04-16-manual-recharge-misuse.md)
 - [RISK-0012 Cognitive duplicate detection remains exact-fingerprint only](entries/2026-04-16-cognitive-duplicate-heuristic-limit.md)
+- [RISK-0013 Accepted legal proposals may loop through repeated execution failure without planner budget pressure](entries/2026-04-16-execution-failure-loop-escape.md)
+- [RISK-0014 Stale planner proposals currently consume phase budget even when the fault is systemic timing drift](entries/2026-04-16-stale-budget-penalty-fairness.md)

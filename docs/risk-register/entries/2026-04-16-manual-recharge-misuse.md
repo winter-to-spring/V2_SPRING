@@ -18,11 +18,15 @@ That is useful, but the current implementation only requires:
 It does not yet check whether the underlying environment, provider health, or
 external dependency state has actually changed enough to justify another try.
 
+It also does not yet prevent repeated founder-triggered recharge from becoming
+an infinite operational loop that pollutes replay with many low-value retries.
+
 ## Impact
 
 - founders may repeatedly recharge a phase that cannot succeed yet
 - exhausted runs may churn without improving their operating context
 - later scaling could turn manual recharge into accidental token waste
+- replay and audit trails may accumulate large volumes of low-signal recharge noise
 
 ## Why This Matters
 
@@ -37,6 +41,7 @@ good faith but still keep the system stuck.
 - add recharge preflight hints before scale
 - surface the latest failure / rejection context alongside recharge guidance
 - consider requiring explicit acknowledgement of unchanged environment state
+- consider a future recharge cap or stronger escalation policy if recharge is used repeatedly without new evidence
 
 ## Capability Gate
 - Capability: higher run volume / founder-facing UI recharge controls
