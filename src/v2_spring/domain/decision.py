@@ -12,6 +12,7 @@ class DecisionKind(StrEnum):
     FOLLOW_UP = "follow_up"
     BOUNDED_TASK_SELECTED = "bounded_task_selected"
     PLANNER_PROPOSAL_ACCEPTED = "planner_proposal_accepted"
+    FOUNDER_OVERRIDE_ACCEPTED = "founder_override_accepted"
 
 
 class DecisionView(BaseModel):

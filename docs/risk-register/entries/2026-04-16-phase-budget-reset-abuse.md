@@ -1,7 +1,7 @@
 # Risk ID: RISK-0010
 Title: Phase budget reset abuse may refresh planner retries without meaningful progress
 Class: Before Next Phase
-Status: Open
+Status: Mitigating
 Owner: Core / Planner governance
 Observed In: Step 9 - bounded replanning governance review
 
@@ -33,6 +33,8 @@ layer becomes cosmetic instead of protective.
 
 - keep `planner_phase_key` tied only to meaningful state advancement signals
 - explicitly exclude planner-only decision summaries from phase advancement
+- exclude founder-help bookkeeping from phase advancement so hint/escalation
+  traces cannot silently refresh planner budget
 - define future advancement rules per task/module class before opening larger
   replanning loops
 - add regression tests when new advancement signals are introduced
@@ -43,11 +45,11 @@ layer becomes cosmetic instead of protective.
 - Blocked until: meaningful state advancement is defined per new execution mode
 
 ## Issue Link
-- GitHub Issue: none yet
+- GitHub Issue: #22
 
 ## Doc Links
 - ADR: ../../adr/0006-bounded-replanning-governance.md
-- Design note: ../../implementation-notes/STEP_9_BOUNDED_REPLANNING_AND_PLANNER_GOVERNANCE.md
+- Design note: ../../implementation-notes/STEP_10B_FOUNDER_REPLY_CONTRACT.md
 
 ## Exit Criteria
 
@@ -55,4 +57,4 @@ layer becomes cosmetic instead of protective.
 - budget cannot reset because of planner-only bookkeeping
 
 ## Last Updated
-- 2026-04-16
+- 2026-04-17
