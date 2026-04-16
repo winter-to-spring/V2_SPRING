@@ -6,16 +6,19 @@ from typing import Iterator
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from v2_spring.domain.approval import ApprovalStatus, ApprovalView
 from v2_spring.domain.decision import DecisionKind, DecisionView
 from v2_spring.domain.observation import ObservationKind, ObservationView
-from v2_spring.domain.run import RunCreateInput, RunView
+from v2_spring.domain.run import RunCreateInput, RunStatus, RunView
 from v2_spring.ledger.models import (
+    ApprovalRecord,
     Base,
     DecisionRecord,
     EventLedgerRecord,
     LedgerEventType,
     ObservationRecord,
     RunRecord,
+    utc_now,
 )
 
 
@@ -54,6 +57,7 @@ class LedgerStore:
                 goal=run_input.goal,
                 urgency=run_input.urgency,
                 risk=run_input.risk,
+                status=RunStatus.WAITING_APPROVAL,
             )
             session.add(record)
             session.flush()
@@ -102,6 +106,31 @@ class LedgerStore:
                         "decision_id": decision.id,
                         "kind": decision.kind.value,
                         "summary": decision.summary,
+                    },
+                ),
+            )
+
+            approval = ApprovalRecord(
+                run_id=record.id,
+                status=ApprovalStatus.PENDING,
+                requested_action="Approve the tracer bullet to continue beyond intake.",
+                reason=(
+                    "The first bounded loop is intentionally semi-automatic. "
+                    "A human must explicitly allow the run to continue after intake evidence is recorded."
+                ),
+                approve_effect="The run moves from waiting approval to ready for the next bounded step.",
+                reject_effect="The run is marked rejected and remains stopped until a new decision is made.",
+            )
+            session.add(approval)
+            session.flush()
+            session.add(
+                EventLedgerRecord(
+                    run_id=record.id,
+                    event_type=LedgerEventType.APPROVAL_REQUESTED,
+                    payload={
+                        "approval_id": approval.id,
+                        "status": approval.status.value,
+                        "requested_action": approval.requested_action,
                     },
                 ),
             )
@@ -163,6 +192,48 @@ class LedgerStore:
             )
             return list(session.scalars(statement).all())
 
+    def list_approvals(self, status: ApprovalStatus | None = None) -> list[ApprovalView]:
+        self.ensure_schema()
+        with self.session() as session:
+            statement = select(ApprovalRecord).order_by(ApprovalRecord.requested_at.asc())
+            if status is not None:
+                statement = statement.where(ApprovalRecord.status == status)
+            records = list(session.scalars(statement).all())
+            return [self._to_approval_view(record) for record in records]
+
+    def resolve_approval(self, approval_id: str, *, approved: bool) -> ApprovalView:
+        self.ensure_schema()
+        with self.session() as session:
+            approval = session.get(ApprovalRecord, approval_id)
+            if approval is None:
+                raise LookupError(f"Approval {approval_id} was not found.")
+            if approval.status != ApprovalStatus.PENDING:
+                raise ValueError(
+                    f"Approval {approval_id} is already {approval.status.value} and cannot be resolved again.",
+                )
+
+            approval.status = ApprovalStatus.APPROVED if approved else ApprovalStatus.REJECTED
+            approval.resolved_at = utc_now()
+
+            run = session.get(RunRecord, approval.run_id)
+            if run is None:
+                raise LookupError(f"Run {approval.run_id} was not found for approval {approval_id}.")
+            run.status = RunStatus.READY if approved else RunStatus.REJECTED
+
+            session.add(
+                EventLedgerRecord(
+                    run_id=approval.run_id,
+                    event_type=LedgerEventType.APPROVAL_RESOLVED,
+                    payload={
+                        "approval_id": approval.id,
+                        "status": approval.status.value,
+                        "run_status": run.status.value,
+                    },
+                ),
+            )
+            session.flush()
+            return self._to_approval_view(approval)
+
     def list_decisions_for_run(self, run_id: str) -> list[DecisionView]:
         self.ensure_schema()
         with self.session() as session:
@@ -208,3 +279,19 @@ class LedgerStore:
                 )
                 for record in records
             ]
+
+    @staticmethod
+    def _to_approval_view(record: ApprovalRecord) -> ApprovalView:
+        return ApprovalView.model_validate(
+            {
+                "id": record.id,
+                "run_id": record.run_id,
+                "status": record.status,
+                "requested_action": record.requested_action,
+                "reason": record.reason,
+                "approve_effect": record.approve_effect,
+                "reject_effect": record.reject_effect,
+                "requested_at": record.requested_at,
+                "resolved_at": record.resolved_at,
+            },
+        )

@@ -41,6 +41,7 @@ Expected result:
 - an initial `Observation` is recorded
 - an initial `Decision` record explains that the run entered planning
 - the append-only ledger captures all three bootstrap events
+- a pending `Approval` is created so the human can explicitly continue or stop the loop
 
 ### Step 2. Build a state snapshot
 
