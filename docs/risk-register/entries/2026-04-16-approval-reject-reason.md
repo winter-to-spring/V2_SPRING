@@ -1,7 +1,7 @@
 # Risk ID: RISK-0002
 Title: Rejecting approval without feedback causes blind replanning
 Class: Before Next Phase
-Status: Mitigating
+Status: Resolved
 Owner: Core orchestration
 Observed In: Step 3 approval CLI review
 

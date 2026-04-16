@@ -25,6 +25,9 @@ from v2_spring.ledger.models import (
 class LedgerStore:
     """Typed persistence boundary for Step 1 state and events."""
 
+    # Approval should pause stateful progression, not blind the system.
+    _APPROVAL_SAFE_OBSERVATION_KINDS = frozenset({ObservationKind.SYSTEM_AUDIT})
+
     def __init__(self, database_url: str) -> None:
         self._engine = create_engine(database_url, future=True)
         self._session_factory = sessionmaker(
@@ -311,6 +314,7 @@ class LedgerStore:
                 session,
                 run_id,
                 mutation_name="observation recording",
+                allow_during_waiting_approval=kind in self._APPROVAL_SAFE_OBSERVATION_KINDS,
             )
             record = ObservationRecord(
                 run_id=run.id,

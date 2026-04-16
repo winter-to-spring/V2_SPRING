@@ -12,6 +12,8 @@ This slice adds:
 - a shared risk register so future work can inherit unresolved risks instead of
   depending on individual memory
 - explicit failure semantics when a blocked write crosses an approval barrier
+- a narrow exception for passive audit observations that preserve visibility
+  without reopening execution
 
 ## Why This Matters
 
@@ -41,6 +43,26 @@ Today the CLI surfaces this as a non-zero exit with a clear error message.
 When an HTTP surface is introduced, this same domain rule should map to an
 explicit API error such as `423 Locked` or `409 Conflict`, together with a
 machine-readable error code.
+
+## Observation Boundary
+
+Not every write during `waiting_approval` should be treated the same.
+
+Two classes now exist:
+
+- **stateful or planner-driving writes**
+  - decisions
+  - follow-up observations
+  - anything that implies the run progressed
+- **passive audit observations**
+  - operational notes
+  - external checks
+  - error visibility that does not move the run forward
+
+The approval barrier still blocks the first class.
+
+The second class is allowed so the system does not become blind while a human
+is deciding.
 
 ## What We Deliberately Leave For Later
 

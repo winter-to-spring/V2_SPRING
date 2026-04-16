@@ -7,6 +7,7 @@ Step 3에서 approval list / resolve CLI까지는 만들었지만, human-in-the-
 
 - 반려 사유가 남아야 합니다.
 - approval 대기 중에는 non-approval write가 막혀야 합니다.
+- 다만 순수 audit/log 관찰까지 막으면 시스템이 approval 대기 중에 장님이 됩니다.
 
 지금 이 둘이 없으면 approval은 존재하지만, 다음 planner loop에 학습을
 남기지 못하고, pending 상태에서도 run이 계속 변할 수 있습니다.
@@ -17,6 +18,8 @@ Step 3에서 approval list / resolve CLI까지는 만들었지만, human-in-the-
 2. pending approval 동안 non-approval write를 service layer에서 막습니다.
 3. 다음 planner/replanner 단계로 넘어가기 전에 approval semantics를 더
    단단하게 만듭니다.
+4. passive audit observation은 허용하고, planner-driving follow-up write만
+   막는 경계선을 명확히 합니다.
 
 ## 구현 범위
 
@@ -25,6 +28,7 @@ Step 3에서 approval list / resolve CLI까지는 만들었지만, human-in-the-
 - approval resolution ledger payload 강화
 - service-level pending approval write barrier
 - barrier 위반 시 silent drop 금지, explicit error 정책 명시
+- passive audit observation 허용 규칙 명시
 - barrier 검증 테스트
 - risk register와 implementation note 갱신
 
@@ -41,5 +45,6 @@ Step 3에서 approval list / resolve CLI까지는 만들었지만, human-in-the-
 - rejection reason is visible in approval state and ledger events
 - pending approval blocks new non-approval writes
 - blocked writes fail explicitly instead of being silently ignored
+- passive audit observations can still be recorded during approval wait
 - approval resolution remains allowed while pending
 - tests and CLI proof both pass
