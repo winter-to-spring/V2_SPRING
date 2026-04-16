@@ -406,6 +406,7 @@ def test_run_snapshot_and_possible_actions_cover_ready_and_terminal_paths(tmp_pa
 
     waiting_snapshot = store.build_run_snapshot(str(run.id))
     waiting_actions = evaluate_possible_actions(waiting_snapshot)
+    waiting_phase_key = waiting_snapshot.planner_phase_key
     assert waiting_snapshot.pending_approval is not None
     assert waiting_snapshot.policy_version == POSSIBLE_ACTIONS_ENGINE_VERSION
     assert len(waiting_snapshot.state_hash) == 64
@@ -417,10 +418,12 @@ def test_run_snapshot_and_possible_actions_cover_ready_and_terminal_paths(tmp_pa
 
     ready_snapshot = store.build_run_snapshot(str(run.id))
     ready_actions = evaluate_possible_actions(ready_snapshot)
+    ready_phase_key = ready_snapshot.planner_phase_key
     assert ready_snapshot.pending_approval is None
     assert ready_snapshot.task_summary.created == 0
     assert ready_actions.snapshot.action_state == SnapshotActionState.AVAILABLE
     assert ready_actions.actions[0].name == PossibleActionName.EXECUTE_BOUNDED_TASK
+    assert ready_phase_key != waiting_phase_key
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -437,6 +440,7 @@ def test_run_snapshot_and_possible_actions_cover_ready_and_terminal_paths(tmp_pa
     assert completed_snapshot.latest_artifact is not None
     assert completed_actions.snapshot.action_state == SnapshotActionState.TERMINAL
     assert completed_actions.actions == []
+    assert completed_snapshot.planner_phase_key != ready_phase_key
 
 
 def test_run_snapshot_and_possible_actions_capture_rejection_feedback(tmp_path: Path) -> None:
@@ -1170,6 +1174,7 @@ def test_repeated_deterministic_execution_failure_opens_founder_escalation_lane(
     assert snapshot_after.pending_founder_escalation is not None
     assert "repeated deterministic execution failure" in snapshot_after.pending_founder_escalation.summary.lower()
     assert "failure_error_code=permission_denied" in snapshot_after.pending_founder_escalation.details
+    assert snapshot_after.planner_phase_key == snapshot_before.planner_phase_key
 
 
 @pytest.mark.parametrize(
@@ -1252,6 +1257,7 @@ def test_founder_hint_clears_pending_escalation_and_reopens_planner_lane(tmp_pat
 
     assert intervention.reply_kind == FounderReplyKind.HINT
     assert blocked_snapshot.pending_founder_escalation is not None
+    assert blocked_snapshot.planner_phase_key == initial_snapshot.planner_phase_key
     assert reopened_snapshot.pending_founder_escalation is None
     assert reopened_snapshot.planner_phase_exhausted is False
     assert reopened_snapshot.planner_phase_key == initial_snapshot.planner_phase_key

@@ -1,7 +1,7 @@
 # Risk ID: RISK-0010
-Title: Phase budget reset abuse may refresh planner retries without meaningful progress
+Title: ~~Phase budget reset abuse may refresh planner retries without meaningful progress~~
 Class: Before Next Phase
-Status: Mitigating
+Status: Resolved
 Owner: Core / Planner governance
 Observed In: Step 9 - bounded replanning governance review
 
@@ -39,6 +39,18 @@ layer becomes cosmetic instead of protective.
   replanning loops
 - add regression tests when new advancement signals are introduced
 
+Current resolution:
+
+- `planner_phase_key` remains derived only from run status, approval state,
+  rejection feedback, task summary, latest task headline, and latest artifact
+  headline
+- planner attempts, planner escalations, founder-help lane markers, founder
+  interventions, and manual recharge records do not advance the phase
+- regression tests now prove both sides of the rule:
+  - approval resolution and bounded task completion advance the phase
+  - founder-help bookkeeping and repeated deterministic failure escalations do
+    not
+
 ## Capability Gate
 - Capability: multi-step replanning loop / richer task graph
 - Gate mode: Before Next Phase
@@ -55,6 +67,8 @@ layer becomes cosmetic instead of protective.
 
 - phase advancement rules are documented for each new planner-visible state
 - budget cannot reset because of planner-only bookkeeping
+- bounded planner lanes have regression tests that lock the phase boundary
 
 ## Last Updated
 - 2026-04-17
+- 2026-04-17 (resolved for current bounded planner lanes)

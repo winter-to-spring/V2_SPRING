@@ -31,7 +31,15 @@ planner-attempt ledger.
   - task summary
   - latest task headline
   - latest artifact headline
-- Planner-only traces such as accepted decisions must **not** advance the phase.
+- Planner-only traces must **not** advance the phase:
+  - accepted planner decisions
+  - planner escalation records
+  - founder-help lane markers
+  - founder hint / reject / override bookkeeping
+  - manual recharge records
+- Examples:
+  - resolving approval or completing a bounded task may advance the phase
+  - opening or clearing a founder escalation must not advance the phase by itself
 
 ## Attempt Budget Policy
 
