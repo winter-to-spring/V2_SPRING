@@ -14,6 +14,7 @@ from v2_spring.domain.approval import ApprovalStatus, ApprovalView
 from v2_spring.domain.artifact import ArtifactStorageKind, ArtifactType, ArtifactView
 from v2_spring.domain.decision import DecisionKind, DecisionView
 from v2_spring.domain.observation import ObservationKind, ObservationView
+from v2_spring.domain.replay import ArtifactInspectionView, RunReplayView, TaskReplayView
 from v2_spring.domain.run import RunCreateInput, RunStatus, RunView
 from v2_spring.domain.task import TaskKind, TaskStatus, TaskView
 from v2_spring.executor.bounded import (
@@ -177,14 +178,14 @@ class LedgerStore:
             statement = (
                 select(EventLedgerRecord)
                 .where(EventLedgerRecord.run_id == run_id)
-                .order_by(EventLedgerRecord.recorded_at.asc())
+                .order_by(EventLedgerRecord.recorded_at.asc(), EventLedgerRecord.id.asc())
             )
             return list(session.scalars(statement).all())
 
     def list_approvals(self, status: ApprovalStatus | None = None) -> list[ApprovalView]:
         self.ensure_schema()
         with self.session() as session:
-            statement = select(ApprovalRecord).order_by(ApprovalRecord.requested_at.asc())
+            statement = select(ApprovalRecord).order_by(ApprovalRecord.requested_at.asc(), ApprovalRecord.id.asc())
             if status is not None:
                 statement = statement.where(ApprovalRecord.status == status)
             records = list(session.scalars(statement).all())
@@ -321,7 +322,7 @@ class LedgerStore:
             statement = (
                 select(DecisionRecord)
                 .where(DecisionRecord.run_id == run_id)
-                .order_by(DecisionRecord.created_at.asc())
+                .order_by(DecisionRecord.created_at.asc(), DecisionRecord.id.asc())
             )
             records = list(session.scalars(statement).all())
             return [self._to_decision_view(record) for record in records]
@@ -332,7 +333,7 @@ class LedgerStore:
             statement = (
                 select(ObservationRecord)
                 .where(ObservationRecord.run_id == run_id)
-                .order_by(ObservationRecord.created_at.asc())
+                .order_by(ObservationRecord.created_at.asc(), ObservationRecord.id.asc())
             )
             records = list(session.scalars(statement).all())
             return [self._to_observation_view(record) for record in records]
@@ -343,7 +344,7 @@ class LedgerStore:
             statement = (
                 select(TaskRecord)
                 .where(TaskRecord.run_id == run_id)
-                .order_by(TaskRecord.created_at.asc())
+                .order_by(TaskRecord.created_at.asc(), TaskRecord.id.asc())
             )
             records = list(session.scalars(statement).all())
             return [self._to_task_view(record) for record in records]
@@ -354,10 +355,130 @@ class LedgerStore:
             statement = (
                 select(ArtifactRecord)
                 .where(ArtifactRecord.run_id == run_id)
-                .order_by(ArtifactRecord.created_at.asc())
+                .order_by(ArtifactRecord.created_at.asc(), ArtifactRecord.id.asc())
             )
             records = list(session.scalars(statement).all())
             return [self._to_artifact_view(record) for record in records]
+
+    def get_task(self, task_id: str) -> TaskView | None:
+        self.ensure_schema()
+        with self.session() as session:
+            record = session.get(TaskRecord, task_id)
+            if record is None:
+                return None
+            return self._to_task_view(record)
+
+    def get_artifact(self, artifact_id: str) -> ArtifactInspectionView | None:
+        self.ensure_schema()
+        with self.session() as session:
+            record = session.get(ArtifactRecord, artifact_id)
+            if record is None:
+                return None
+            return self._inspect_artifact(record)
+
+    def build_run_replay(self, run_id: str) -> RunReplayView:
+        """Build a fixed-query replay projection for one run."""
+
+        self.ensure_schema()
+        with self.session() as session:
+            run_record = session.get(RunRecord, run_id)
+            if run_record is None:
+                raise LookupError(f"Run {run_id} was not found.")
+
+            approvals = [
+                self._to_approval_view(record)
+                for record in session.scalars(
+                    select(ApprovalRecord)
+                    .where(ApprovalRecord.run_id == run_id)
+                    .order_by(ApprovalRecord.requested_at.asc(), ApprovalRecord.id.asc()),
+                ).all()
+            ]
+            decisions = [
+                self._to_decision_view(record)
+                for record in session.scalars(
+                    select(DecisionRecord)
+                    .where(DecisionRecord.run_id == run_id)
+                    .order_by(DecisionRecord.created_at.asc(), DecisionRecord.id.asc()),
+                ).all()
+            ]
+            observations = [
+                self._to_observation_view(record)
+                for record in session.scalars(
+                    select(ObservationRecord)
+                    .where(ObservationRecord.run_id == run_id)
+                    .order_by(ObservationRecord.created_at.asc(), ObservationRecord.id.asc()),
+                ).all()
+            ]
+            task_records = list(
+                session.scalars(
+                    select(TaskRecord)
+                    .where(TaskRecord.run_id == run_id)
+                    .order_by(TaskRecord.created_at.asc(), TaskRecord.id.asc()),
+                ).all(),
+            )
+            artifact_records = list(
+                session.scalars(
+                    select(ArtifactRecord)
+                    .where(ArtifactRecord.run_id == run_id)
+                    .order_by(ArtifactRecord.created_at.asc(), ArtifactRecord.id.asc()),
+                ).all(),
+            )
+            ledger_events = list(
+                session.scalars(
+                    select(EventLedgerRecord)
+                    .where(EventLedgerRecord.run_id == run_id)
+                    .order_by(EventLedgerRecord.recorded_at.asc(), EventLedgerRecord.id.asc()),
+                ).all(),
+            )
+
+            decision_map = {str(decision.id): decision for decision in decisions}
+            task_map = {record.id: self._to_task_view(record) for record in task_records}
+            observation_by_task: dict[str, list[ObservationView]] = {}
+            for observation in observations:
+                if observation.kind != ObservationKind.TASK_EXECUTION:
+                    continue
+                for task_id in task_map:
+                    if task_id in observation.details:
+                        observation_by_task.setdefault(task_id, []).append(observation)
+
+            artifact_by_task: dict[str, list[ArtifactInspectionView]] = {}
+            for record in artifact_records:
+                artifact_by_task.setdefault(record.task_id, []).append(self._inspect_artifact(record))
+
+            task_replays: list[TaskReplayView] = []
+            for task_record in task_records:
+                task_view = task_map[task_record.id]
+                task_replays.append(
+                    TaskReplayView(
+                        task=task_view,
+                        decision=decision_map.get(task_record.decision_id) if task_record.decision_id else None,
+                        artifacts=artifact_by_task.get(task_record.id, []),
+                        observations=observation_by_task.get(task_record.id, []),
+                    ),
+                )
+
+            orphan_artifacts = [
+                inspection
+                for task_id, inspections in artifact_by_task.items()
+                if task_id not in task_map
+                for inspection in inspections
+            ]
+
+            return RunReplayView(
+                run=self._to_run_view(run_record),
+                approvals=approvals,
+                decisions=decisions,
+                tasks=task_replays,
+                observations=observations,
+                orphan_artifacts=orphan_artifacts,
+                consistency_warnings=self._build_consistency_warnings(
+                    run=self._to_run_view(run_record),
+                    approvals=approvals,
+                    tasks=task_replays,
+                    orphan_artifacts=orphan_artifacts,
+                    ledger_events=ledger_events,
+                ),
+            )
 
     def execute_bounded_task(
         self,
@@ -809,3 +930,92 @@ class LedgerStore:
                 "created_at": record.created_at,
             },
         )
+
+    @staticmethod
+    def _inspect_artifact(record: ArtifactRecord) -> ArtifactInspectionView:
+        artifact = LedgerStore._to_artifact_view(record)
+        artifact_path = Path(artifact.path)
+        if not artifact_path.exists():
+            return ArtifactInspectionView(
+                artifact=artifact,
+                file_exists=False,
+                hash_matches=None,
+            )
+        current_hash = sha256(artifact_path.read_bytes()).hexdigest()
+        return ArtifactInspectionView(
+            artifact=artifact,
+            file_exists=True,
+            hash_matches=current_hash == artifact.sha256,
+        )
+
+    @staticmethod
+    def _build_consistency_warnings(
+        *,
+        run: RunView,
+        approvals: list[ApprovalView],
+        tasks: list[TaskReplayView],
+        orphan_artifacts: list[ArtifactInspectionView],
+        ledger_events: list[EventLedgerRecord],
+    ) -> list[str]:
+        warnings: list[str] = []
+        task_completed_ids = {
+            str(event.payload.get("task_id"))
+            for event in ledger_events
+            if event.event_type == LedgerEventType.TASK_COMPLETED
+        }
+        task_failed_ids = {
+            str(event.payload.get("task_id"))
+            for event in ledger_events
+            if event.event_type == LedgerEventType.TASK_FAILED
+        }
+        artifact_recorded_ids = {
+            str(event.payload.get("artifact_id"))
+            for event in ledger_events
+            if event.event_type == LedgerEventType.ARTIFACT_RECORDED
+        }
+
+        if orphan_artifacts:
+            warnings.append("At least one artifact is not linked to a known task.")
+
+        if run.status == RunStatus.COMPLETED and not any(
+            task.task.status == TaskStatus.COMPLETED for task in tasks
+        ):
+            warnings.append("Run is marked completed but no completed task is present.")
+
+        if run.status == RunStatus.FAILED and not any(
+            task.task.status == TaskStatus.FAILED for task in tasks
+        ):
+            warnings.append("Run is marked failed but no failed task is present.")
+
+        if run.status == RunStatus.REJECTED and not any(
+            approval.status == ApprovalStatus.REJECTED for approval in approvals
+        ):
+            warnings.append("Run is marked rejected but no rejected approval is recorded.")
+
+        for task in tasks:
+            if task.task.status == TaskStatus.COMPLETED and str(task.task.id) not in task_completed_ids:
+                warnings.append(
+                    f"Task {task.task.id} is completed in state but missing TASK_COMPLETED in the ledger.",
+                )
+            if task.task.status == TaskStatus.FAILED and str(task.task.id) not in task_failed_ids:
+                warnings.append(
+                    f"Task {task.task.id} is failed in state but missing TASK_FAILED in the ledger.",
+                )
+            if task.task.status == TaskStatus.COMPLETED and not task.artifacts:
+                warnings.append(
+                    f"Task {task.task.id} completed without a linked artifact.",
+                )
+            for artifact in task.artifacts:
+                if not artifact.file_exists:
+                    warnings.append(
+                        f"Artifact {artifact.artifact.id} is missing from the filesystem path recorded in the ledger.",
+                    )
+                if artifact.hash_matches is False:
+                    warnings.append(
+                        f"Artifact {artifact.artifact.id} exists but its contents no longer match the stored sha256.",
+                    )
+                if str(artifact.artifact.id) not in artifact_recorded_ids:
+                    warnings.append(
+                        f"Artifact {artifact.artifact.id} exists in state but is missing ARTIFACT_RECORDED in the ledger.",
+                    )
+        return warnings
