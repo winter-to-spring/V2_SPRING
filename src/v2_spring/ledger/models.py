@@ -177,6 +177,7 @@ class ApprovalRecord(Base):
         nullable=False,
         default=utc_now,
     )
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     resolution_reason: Mapped[str | None] = mapped_column(String(4000), nullable=True)
 

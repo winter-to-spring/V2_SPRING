@@ -6,6 +6,9 @@ import json
 import pytest
 
 from v2_spring.cli import main
+from v2_spring.adapters.langgraph_planner import PlannerTransportCancelledError, StructuredTransportResponse
+from v2_spring.ledger.store import LedgerStore
+from v2_spring.domain.planner_adapter import PlannerTransportProvider
 
 
 def test_run_create_and_show_cli_flow(capsys, monkeypatch, tmp_path: Path) -> None:
@@ -228,6 +231,106 @@ def test_reject_requires_reason_and_is_visible_in_cli(capsys, monkeypatch, tmp_p
     show_output = capsys.readouterr().out
 
     assert "status:     rejected" in show_output
+
+
+def test_approval_timeout_sweep_is_visible_in_cli_and_replay(capsys, monkeypatch, tmp_path: Path) -> None:
+    database_url = f"sqlite+pysqlite:///{tmp_path / 'cli-approval-timeout.db'}"
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "run",
+            "create",
+            "--project",
+            "demo",
+            "--goal",
+            "Suspend a run by expiring approval",
+            "--urgency",
+            "normal",
+            "--risk",
+            "medium",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    create_output = capsys.readouterr().out
+    created_run_id = create_output.splitlines()[0].split()[-1]
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "approval",
+            "list",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    approval_output = capsys.readouterr().out
+    approval_id = next(
+        line.strip().replace("1. ", "")
+        for line in approval_output.splitlines()
+        if line.startswith("1. ")
+    )
+    expires_at_line = next(
+        line for line in approval_output.splitlines() if "expires_at:" in line
+    )
+    expires_at_value = expires_at_line.split("expires_at:")[1].strip()
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "approval",
+            "sweep-timeouts",
+            "--now",
+            expires_at_value,
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    sweep_output = capsys.readouterr().out
+
+    assert "Approval timeout sweep" in sweep_output
+    assert approval_id in sweep_output
+    assert "approval_status:  expired" in sweep_output
+    assert "run_status:       suspended" in sweep_output
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "run",
+            "show",
+            created_run_id,
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    show_output = capsys.readouterr().out
+    assert "status:     suspended" in show_output
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "run",
+            "replay",
+            created_run_id,
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    replay_output = capsys.readouterr().out
+
+    assert "current approval state: expired" in replay_output
+    assert "status:         suspended" in replay_output
 
 
 def test_bounded_execution_cli_flow(capsys, monkeypatch, tmp_path: Path) -> None:
@@ -665,7 +768,7 @@ def test_planner_propose_and_show_cli(capsys, monkeypatch, tmp_path: Path) -> No
     )
     main()
     snapshot_payload = json.loads(capsys.readouterr().out)
-    assert snapshot_payload["policy_version"] == "v1"
+    assert snapshot_payload["policy_version"] == "v2"
     snapshot_hash = snapshot_payload["state_hash"]
 
     monkeypatch.setattr(
@@ -690,7 +793,7 @@ def test_planner_propose_and_show_cli(capsys, monkeypatch, tmp_path: Path) -> No
     main()
     proposal_output = capsys.readouterr().out
     assert "Planner proposal accepted" in proposal_output
-    assert "policy_version:     v1" in proposal_output
+    assert "policy_version:     v2" in proposal_output
     assert "selected_action:    execute_bounded_task" in proposal_output
 
     monkeypatch.setattr(
@@ -700,7 +803,7 @@ def test_planner_propose_and_show_cli(capsys, monkeypatch, tmp_path: Path) -> No
     main()
     show_output = capsys.readouterr().out
     assert "Planner proposals" in show_output
-    assert "policy_version:    v1" in show_output
+    assert "policy_version:    v2" in show_output
     assert "execute_bounded_task" in show_output
 
     monkeypatch.setattr(
@@ -801,6 +904,7 @@ def test_planner_invoke_cli_accepts_action_and_escalation(capsys, monkeypatch, t
     main()
     invoke_output = capsys.readouterr().out
     assert "Planner invocation" in invoke_output
+    assert "provider:             scripted" in invoke_output
     assert "selected_action:     execute_bounded_task" in invoke_output
 
     monkeypatch.setattr(
@@ -850,6 +954,7 @@ def test_planner_invoke_cli_accepts_action_and_escalation(capsys, monkeypatch, t
     )
     main()
     escalation_output = capsys.readouterr().out
+    assert "provider:             scripted" in escalation_output
     assert "kind:                escalation" in escalation_output
     assert "help_kind:           policy_decision" in escalation_output
 
@@ -919,6 +1024,303 @@ def test_planner_invoke_cli_records_format_failure(capsys, monkeypatch, tmp_path
     assert exc.value.code == 1
     output = capsys.readouterr().out
     assert "could not parse a schema-valid structured response" in output
+
+
+def test_planner_invoke_cli_accepts_openai_provider_path_without_network(
+    capsys,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    database_url = f"sqlite+pysqlite:///{tmp_path / 'cli-step10c-openai.db'}"
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("PLANNER_OPENAI_MODEL", "gpt-4o-test")
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "run",
+            "create",
+            "--project",
+            "demo",
+            "--goal",
+            "Exercise the openai transport seam without a real network call",
+            "--urgency",
+            "normal",
+            "--risk",
+            "medium",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    run_id = capsys.readouterr().out.splitlines()[0].split()[-1]
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["v2-spring", "approval", "list", "--database-url", database_url],
+    )
+    main()
+    approval_output = capsys.readouterr().out
+    approval_id = next(line.strip().replace("1. ", "") for line in approval_output.splitlines() if line.startswith("1. "))
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "approval",
+            "resolve",
+            approval_id,
+            "--approve",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    capsys.readouterr()
+
+    class FakeOpenAITransport:
+        def __init__(self, **kwargs) -> None:
+            self.model = kwargs["model"]
+
+        def invoke(self, *, system_prompt: str, user_prompt: str, output_schema: dict[str, object]):
+            return StructuredTransportResponse(
+                raw_response=json.dumps(
+                    {
+                        "kind": "action",
+                        "analysis_summary": "The openai seam should still choose bounded execution.",
+                        "confidence": "medium",
+                        "selected_action": "execute_bounded_task",
+                        "expected_outcome": "One accepted proposal should be recorded without a network call.",
+                    },
+                ),
+                provider=PlannerTransportProvider.OPENAI,
+                model=self.model,
+                response_id="resp_test_openai",
+                retry_count=1,
+                input_tokens=50,
+                output_tokens=20,
+                total_tokens=70,
+            )
+
+    monkeypatch.setattr("v2_spring.cli.OpenAIStructuredPlannerTransport", FakeOpenAITransport)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "planner",
+            "invoke",
+            run_id,
+            "--provider",
+            "openai",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    output = capsys.readouterr().out
+    assert "provider:             openai" in output
+    assert "model:                gpt-4o-test" in output
+    assert "selected_action:     execute_bounded_task" in output
+
+
+def test_planner_invoke_cli_accepts_anthropic_provider_path_without_network(
+    capsys,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    database_url = f"sqlite+pysqlite:///{tmp_path / 'cli-step10c-anthropic.db'}"
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv("PLANNER_ANTHROPIC_MODEL", "claude-3-5-test")
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "run",
+            "create",
+            "--project",
+            "demo",
+            "--goal",
+            "Exercise the anthropic transport seam without a real network call",
+            "--urgency",
+            "normal",
+            "--risk",
+            "medium",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    run_id = capsys.readouterr().out.splitlines()[0].split()[-1]
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["v2-spring", "approval", "list", "--database-url", database_url],
+    )
+    main()
+    approval_output = capsys.readouterr().out
+    approval_id = next(line.strip().replace("1. ", "") for line in approval_output.splitlines() if line.startswith("1. "))
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "approval",
+            "resolve",
+            approval_id,
+            "--approve",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    capsys.readouterr()
+
+    class FakeAnthropicTransport:
+        def __init__(self, **kwargs) -> None:
+            self.model = kwargs["model"]
+
+        def invoke(self, *, system_prompt: str, user_prompt: str, output_schema: dict[str, object]):
+            return StructuredTransportResponse(
+                raw_response={
+                    "kind": "escalation",
+                    "analysis_summary": "The anthropic seam can request bounded founder help without a network call.",
+                    "confidence": "low_needs_review",
+                    "escalation_target": "founder",
+                    "help_kind": "clarification",
+                    "blocking_reason": "A precise founder hint is still needed here.",
+                    "requested_help": "Clarify whether approval should still be resolved first.",
+                },
+                provider=PlannerTransportProvider.ANTHROPIC,
+                model=self.model,
+                response_id="resp_test_anthropic",
+                retry_count=0,
+                input_tokens=44,
+                output_tokens=16,
+                total_tokens=60,
+            )
+
+    monkeypatch.setattr("v2_spring.cli.AnthropicStructuredPlannerTransport", FakeAnthropicTransport)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "planner",
+            "invoke",
+            run_id,
+            "--provider",
+            "anthropic",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    output = capsys.readouterr().out
+    assert "provider:             anthropic" in output
+    assert "model:                claude-3-5-test" in output
+    assert "kind:                escalation" in output
+
+
+def test_planner_invoke_cli_records_local_cancel_with_orphan_risk_metadata(
+    capsys,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    database_url = f"sqlite+pysqlite:///{tmp_path / 'cli-step10c-cancel.db'}"
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("PLANNER_OPENAI_MODEL", "gpt-4o-test")
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "run",
+            "create",
+            "--project",
+            "demo",
+            "--goal",
+            "Surface local cancellation as bounded orphan-risk audit evidence",
+            "--urgency",
+            "normal",
+            "--risk",
+            "medium",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    run_id = capsys.readouterr().out.splitlines()[0].split()[-1]
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["v2-spring", "approval", "list", "--database-url", database_url],
+    )
+    main()
+    approval_output = capsys.readouterr().out
+    approval_id = next(line.strip().replace("1. ", "") for line in approval_output.splitlines() if line.startswith("1. "))
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "approval",
+            "resolve",
+            approval_id,
+            "--approve",
+            "--database-url",
+            database_url,
+        ],
+    )
+    main()
+    capsys.readouterr()
+
+    class CancelledOpenAITransport:
+        def __init__(self, **kwargs) -> None:
+            self.model = kwargs["model"]
+
+        def invoke(self, *, system_prompt: str, user_prompt: str, output_schema: dict[str, object]):
+            raise PlannerTransportCancelledError(
+                "Planner provider invocation was interrupted locally before completion.",
+                code="cancelled",
+                provider=PlannerTransportProvider.OPENAI,
+                model=self.model,
+                retryable=False,
+                retry_count=0,
+                timeout_seconds=19,
+                orphan_risk_possible=True,
+            )
+
+    monkeypatch.setattr("v2_spring.cli.OpenAIStructuredPlannerTransport", CancelledOpenAITransport)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "v2-spring",
+            "planner",
+            "invoke",
+            run_id,
+            "--provider",
+            "openai",
+            "--database-url",
+            database_url,
+        ],
+    )
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 1
+    output = capsys.readouterr().out
+    assert "interrupted locally before completion" in output
+
+    store = LedgerStore(database_url)
+    observations = store.list_observations_for_run(run_id)
+    audit = observations[-1]
+    assert "error_code=cancelled" in audit.details
+    assert "orphan_risk_possible=True" in audit.details
+    assert "timeout_seconds=19" in audit.details
+    assert "cancellation_scope=local_cli_only" in audit.details
 
 
 def test_founder_hint_cli_reopens_pending_escalation_and_lists_interventions(

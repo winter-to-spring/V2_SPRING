@@ -2,13 +2,15 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import timedelta
 from hashlib import sha256
 import json
 from pathlib import Path
+import re
 from typing import Iterator
 from uuid import uuid4
 
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, inspect, select, text, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from v2_spring.domain.approval import ApprovalStatus, ApprovalView
@@ -34,6 +36,8 @@ from v2_spring.domain.planner_attempt import (
     PlannerAttemptOutcome,
     PlannerAttemptView,
     PlannerGovernanceView,
+    PlannerRechargeCautionCode,
+    PlannerRechargePreflightView,
 )
 from v2_spring.domain.proposal import PlannerProposalInput, PlannerProposalView
 from v2_spring.domain.replay import ArtifactInspectionView, RunReplayView, TaskReplayView
@@ -93,6 +97,7 @@ class BoundedExecutionResult:
 class LedgerStore:
     """Typed persistence boundary for V2_SPRING tracer-bullet state and events."""
 
+    _DEFAULT_APPROVAL_TIMEOUT = timedelta(hours=24)
     # Approval should pause stateful progression, not blind the system.
     _APPROVAL_SAFE_OBSERVATION_KINDS = frozenset(
         {
@@ -122,6 +127,31 @@ class LedgerStore:
 
     def ensure_schema(self) -> None:
         Base.metadata.create_all(self._engine)
+        self._ensure_schema_columns()
+        self._backfill_approval_expirations()
+
+    def _ensure_schema_columns(self) -> None:
+        with self._engine.begin() as connection:
+            inspector = inspect(connection)
+            if "approvals" not in inspector.get_table_names():
+                return
+            approval_columns = {column["name"] for column in inspector.get_columns("approvals")}
+            if "expires_at" not in approval_columns:
+                connection.execute(text("ALTER TABLE approvals ADD COLUMN expires_at DATETIME"))
+
+    def _backfill_approval_expirations(self) -> None:
+        with self.session() as session:
+            records = list(
+                session.scalars(
+                    select(ApprovalRecord).where(ApprovalRecord.expires_at.is_(None)),
+                ).all(),
+            )
+            changed = False
+            for record in records:
+                record.expires_at = record.requested_at + self._DEFAULT_APPROVAL_TIMEOUT
+                changed = True
+            if changed:
+                session.flush()
 
     @contextmanager
     def session(self) -> Iterator[Session]:
@@ -206,6 +236,7 @@ class LedgerStore:
                 ),
                 approve_effect="The run moves from waiting approval to ready for the next bounded step.",
                 reject_effect="The run is marked rejected and remains stopped until a new decision is made.",
+                expires_at=utc_now() + self._DEFAULT_APPROVAL_TIMEOUT,
             )
             session.add(approval)
             session.flush()
@@ -217,6 +248,7 @@ class LedgerStore:
                         "approval_id": approval.id,
                         "status": approval.status.value,
                         "requested_action": approval.requested_action,
+                        "expires_at": approval.expires_at.isoformat() if approval.expires_at else None,
                     },
                 ),
             )
@@ -294,11 +326,81 @@ class LedgerStore:
                         "status": approval.status.value,
                         "run_status": run.status.value,
                         "resolution_reason": approval.resolution_reason,
+                        "expires_at": approval.expires_at.isoformat() if approval.expires_at else None,
                     },
                 ),
             )
             session.flush()
             return self._to_approval_view(approval)
+
+    def expire_overdue_approvals(self, *, now=None) -> list[ApprovalView]:
+        self.ensure_schema()
+        effective_now = now or utc_now()
+        with self.session() as session:
+            records = list(
+                session.scalars(
+                    select(ApprovalRecord)
+                    .where(ApprovalRecord.status == ApprovalStatus.PENDING)
+                    .where(ApprovalRecord.expires_at.is_not(None))
+                    .where(ApprovalRecord.expires_at <= effective_now)
+                    .order_by(ApprovalRecord.expires_at.asc(), ApprovalRecord.id.asc()),
+                ).all(),
+            )
+            expired_views: list[ApprovalView] = []
+            for approval in records:
+                approval.status = ApprovalStatus.EXPIRED
+                approval.resolved_at = effective_now
+                approval.resolution_reason = self._build_approval_timeout_reason(approval.expires_at)
+
+                run = session.get(RunRecord, approval.run_id)
+                run_status = None
+                if run is not None and run.status == RunStatus.WAITING_APPROVAL:
+                    run.status = RunStatus.SUSPENDED
+                    run_status = run.status.value
+                elif run is not None:
+                    run_status = run.status.value
+
+                session.add(
+                    EventLedgerRecord(
+                        run_id=approval.run_id,
+                        event_type=LedgerEventType.APPROVAL_RESOLVED,
+                        payload={
+                            "approval_id": approval.id,
+                            "status": approval.status.value,
+                            "run_status": run_status,
+                            "resolution_reason": approval.resolution_reason,
+                            "expires_at": approval.expires_at.isoformat() if approval.expires_at else None,
+                            "timeout_applied_at": effective_now.isoformat(),
+                        },
+                    ),
+                )
+                audit = ObservationRecord(
+                    run_id=approval.run_id,
+                    kind=ObservationKind.SYSTEM_AUDIT,
+                    summary="Approval expired and suspended the run.",
+                    details=(
+                        f"Approval {approval.id} expired at {approval.expires_at.isoformat() if approval.expires_at else '-'} "
+                        f"without a founder response. The run moved to {run_status if run_status else 'its current status'} "
+                        "and now requires explicit recovery before work can continue."
+                    ),
+                )
+                session.add(audit)
+                session.flush()
+                session.add(
+                    EventLedgerRecord(
+                        run_id=approval.run_id,
+                        event_type=LedgerEventType.OBSERVATION_RECORDED,
+                        payload={
+                            "observation_id": audit.id,
+                            "kind": audit.kind.value,
+                            "summary": audit.summary,
+                        },
+                    ),
+                )
+                expired_views.append(self._to_approval_view(approval))
+
+            session.flush()
+            return expired_views
 
     def record_decision(
         self,
@@ -357,6 +459,7 @@ class LedgerStore:
                 run_id,
                 mutation_name="observation recording",
                 allow_during_waiting_approval=kind in self._APPROVAL_SAFE_OBSERVATION_KINDS,
+                allow_during_suspended=kind in self._APPROVAL_SAFE_OBSERVATION_KINDS,
             )
             record = ObservationRecord(
                 run_id=run.id,
@@ -784,6 +887,11 @@ class LedgerStore:
             rationale=proposal.rationale,
             expected_outcome=proposal.expected_outcome,
         )
+        proposal_intent_signature = self._build_planner_proposal_intent_signature(
+            selected_action=proposal.selected_action,
+            rationale=proposal.rationale,
+            expected_outcome=proposal.expected_outcome,
+        )
 
         if governance.exhausted:
             raise PlannerPhaseExhaustedError(
@@ -794,6 +902,12 @@ class LedgerStore:
             raise PermissionError(
                 "Founder reply is still required for the current planner escalation before new proposals are allowed. "
                 f"Pending escalation={snapshot.pending_founder_escalation.observation_id}.",
+            )
+        repeated_failure_escalation = self.open_repeated_failure_founder_escalation_if_needed(run_id)
+        if repeated_failure_escalation is not None:
+            raise PermissionError(
+                "Founder review is now required because deterministic execution failure repeated without state advancement. "
+                f"Pending escalation={repeated_failure_escalation.observation_id}.",
             )
 
         if proposal.submission_key is not None:
@@ -811,14 +925,15 @@ class LedgerStore:
                     phase_key=governance.phase_key,
                     policy_version=governance.policy_version,
                     snapshot_hash=evaluation.snapshot.state_hash,
-                    selected_action=proposal.selected_action,
-                    submission_key=proposal.submission_key,
-                    proposal_fingerprint=proposal_fingerprint,
-                    outcome=PlannerAttemptOutcome.REJECTED_DUPLICATE_TRANSPORT,
-                    outcome_reason=(
-                        f"Submission key {proposal.submission_key} already exists for this phase; "
-                        "transport-level duplicates are rejected explicitly."
-                    ),
+                selected_action=proposal.selected_action,
+                submission_key=proposal.submission_key,
+                proposal_fingerprint=proposal_fingerprint,
+                proposal_intent_signature=proposal_intent_signature,
+                outcome=PlannerAttemptOutcome.REJECTED_DUPLICATE_TRANSPORT,
+                outcome_reason=(
+                    f"Submission key {proposal.submission_key} already exists for this phase; "
+                    "transport-level duplicates are rejected explicitly."
+                ),
                     budget_used=governance.budget_used,
                     budget_limit=governance.budget_limit,
                     consume_budget=False,
@@ -838,6 +953,7 @@ class LedgerStore:
                 selected_action=proposal.selected_action,
                 submission_key=proposal.submission_key,
                 proposal_fingerprint=proposal_fingerprint,
+                proposal_intent_signature=proposal_intent_signature,
                 outcome=PlannerAttemptOutcome.REJECTED_STALE,
                 outcome_reason=(
                     f"Provided snapshot hash {proposal.snapshot_hash} does not match current "
@@ -869,6 +985,93 @@ class LedgerStore:
                 f"Provided={proposal.snapshot_hash}, current={evaluation.snapshot.state_hash}. "
                 f"Stale quota {stale_used}/{governance.stale_quota_limit}.",
             )
+        existing_accepted = next(
+            (
+                attempt
+                for attempt in current_attempts
+                if attempt.outcome == PlannerAttemptOutcome.ACCEPTED and attempt.selected_action is not None
+            ),
+            None,
+        )
+        duplicate_cognitive = next(
+            (
+                attempt
+                for attempt in current_attempts
+                if attempt.proposal_fingerprint == proposal_fingerprint
+                and attempt.outcome
+                in {
+                    PlannerAttemptOutcome.ACCEPTED,
+                    PlannerAttemptOutcome.REJECTED_DUPLICATE_COGNITIVE,
+                }
+            ),
+            None,
+        )
+        semantic_duplicate = next(
+            (
+                event.payload
+                for event in self.list_events_for_run(run_id)
+                if event.event_type == LedgerEventType.PLANNER_ATTEMPT_RECORDED
+                and event.payload.get("phase_key") == governance.phase_key
+                and event.payload.get("selected_action") == proposal.selected_action.value
+                and event.payload.get("proposal_intent_signature") == proposal_intent_signature
+                and event.payload.get("outcome")
+                in {
+                    PlannerAttemptOutcome.ACCEPTED.value,
+                    PlannerAttemptOutcome.REJECTED_ILLEGAL.value,
+                    PlannerAttemptOutcome.REJECTED_DUPLICATE_COGNITIVE.value,
+                }
+            ),
+            None,
+        )
+        if existing_accepted is not None or duplicate_cognitive is not None or semantic_duplicate is not None:
+            duplicate_reason = (
+                "The current phase already has an accepted planner proposal and state has not advanced yet."
+                if existing_accepted is not None
+                else (
+                    "The planner repeated the same proposal fingerprint inside the current phase."
+                    if duplicate_cognitive is not None
+                    else "The planner repeated the same normalized proposal intent inside the current phase."
+                )
+            )
+            budget_used = governance.budget_used + 1
+            self._record_planner_attempt(
+                run_id=run_id,
+                phase_key=governance.phase_key,
+                policy_version=governance.policy_version,
+                snapshot_hash=evaluation.snapshot.state_hash,
+                selected_action=proposal.selected_action,
+                submission_key=proposal.submission_key,
+                proposal_fingerprint=proposal_fingerprint,
+                proposal_intent_signature=proposal_intent_signature,
+                outcome=PlannerAttemptOutcome.REJECTED_DUPLICATE_COGNITIVE,
+                outcome_reason=duplicate_reason,
+                budget_used=governance.budget_used,
+                budget_limit=governance.budget_limit,
+                consume_budget=True,
+            )
+            self.record_observation(
+                run_id=run_id,
+                kind=ObservationKind.SYSTEM_AUDIT,
+                summary="Planner proposal rejected as a cognitive duplicate.",
+                details=(
+                    f"error_code={PlannerAttemptOutcome.REJECTED_DUPLICATE_COGNITIVE.value}; "
+                    f"selected_action={proposal.selected_action.value}; "
+                    f"proposal_fingerprint={proposal_fingerprint}; "
+                    f"proposal_intent_signature={proposal_intent_signature}; "
+                    f"phase_key={governance.phase_key}."
+                ),
+            )
+            if budget_used >= governance.budget_limit:
+                self._record_phase_exhaustion(
+                    run_id=run_id,
+                    governance=governance,
+                    snapshot_hash=evaluation.snapshot.state_hash,
+                    reason="Planner phase budget was exhausted after repeated duplicate proposals.",
+                )
+            raise CognitiveDuplicatePlannerProposalError(
+                f"Planner proposal was rejected as a cognitive duplicate for phase {governance.phase_key}.",
+            )
+
         if proposal.selected_action not in legal_actions:
             budget_used = governance.budget_used + 1
             self._record_planner_attempt(
@@ -879,6 +1082,7 @@ class LedgerStore:
                 selected_action=proposal.selected_action,
                 submission_key=proposal.submission_key,
                 proposal_fingerprint=proposal_fingerprint,
+                proposal_intent_signature=proposal_intent_signature,
                 outcome=PlannerAttemptOutcome.REJECTED_ILLEGAL,
                 outcome_reason=(
                     f"Selected action {proposal.selected_action.value} is not legal under "
@@ -917,70 +1121,6 @@ class LedgerStore:
                 f"Legal actions: {legal_action_summary if legal_action_summary else 'none'}.",
             )
 
-        existing_accepted = next(
-            (
-                attempt
-                for attempt in current_attempts
-                if attempt.outcome == PlannerAttemptOutcome.ACCEPTED and attempt.selected_action is not None
-            ),
-            None,
-        )
-        duplicate_cognitive = next(
-            (
-                attempt
-                for attempt in current_attempts
-                if attempt.proposal_fingerprint == proposal_fingerprint
-                and attempt.outcome
-                in {
-                    PlannerAttemptOutcome.ACCEPTED,
-                    PlannerAttemptOutcome.REJECTED_DUPLICATE_COGNITIVE,
-                }
-            ),
-            None,
-        )
-        if existing_accepted is not None or duplicate_cognitive is not None:
-            duplicate_reason = (
-                "The current phase already has an accepted planner proposal and state has not advanced yet."
-                if existing_accepted is not None
-                else "The planner repeated the same proposal fingerprint inside the current phase."
-            )
-            budget_used = governance.budget_used + 1
-            self._record_planner_attempt(
-                run_id=run_id,
-                phase_key=governance.phase_key,
-                policy_version=governance.policy_version,
-                snapshot_hash=evaluation.snapshot.state_hash,
-                selected_action=proposal.selected_action,
-                submission_key=proposal.submission_key,
-                proposal_fingerprint=proposal_fingerprint,
-                outcome=PlannerAttemptOutcome.REJECTED_DUPLICATE_COGNITIVE,
-                outcome_reason=duplicate_reason,
-                budget_used=governance.budget_used,
-                budget_limit=governance.budget_limit,
-                consume_budget=True,
-            )
-            self.record_observation(
-                run_id=run_id,
-                kind=ObservationKind.SYSTEM_AUDIT,
-                summary="Planner proposal rejected as a cognitive duplicate.",
-                details=(
-                    f"error_code={PlannerAttemptOutcome.REJECTED_DUPLICATE_COGNITIVE.value}; "
-                    f"selected_action={proposal.selected_action.value}; "
-                    f"proposal_fingerprint={proposal_fingerprint}; "
-                    f"phase_key={governance.phase_key}."
-                ),
-            )
-            if budget_used >= governance.budget_limit:
-                self._record_phase_exhaustion(
-                    run_id=run_id,
-                    governance=governance,
-                    snapshot_hash=evaluation.snapshot.state_hash,
-                    reason="Planner phase budget was exhausted after repeated duplicate proposals.",
-                )
-            raise CognitiveDuplicatePlannerProposalError(
-                f"Planner proposal was rejected as a cognitive duplicate for phase {governance.phase_key}.",
-            )
-
         self._record_planner_attempt(
             run_id=run_id,
             phase_key=governance.phase_key,
@@ -989,6 +1129,7 @@ class LedgerStore:
             selected_action=proposal.selected_action,
             submission_key=proposal.submission_key,
             proposal_fingerprint=proposal_fingerprint,
+            proposal_intent_signature=proposal_intent_signature,
             outcome=PlannerAttemptOutcome.ACCEPTED,
             outcome_reason="Planner proposal was accepted under the current legal-action guard.",
             budget_used=governance.budget_used,
@@ -1008,6 +1149,7 @@ class LedgerStore:
                 "selected_action": proposal.selected_action.value,
                 "submission_key": proposal.submission_key,
                 "proposal_fingerprint": proposal_fingerprint,
+                "proposal_intent_signature": proposal_intent_signature,
                 "expected_outcome": proposal.expected_outcome,
                 "legal_actions": [action.name.value for action in evaluation.actions],
                 "legal_action_details": legal_action_descriptions,
@@ -1100,7 +1242,124 @@ class LedgerStore:
                 records=planner_attempt_records,
             )
 
-    def record_planner_recharge(self, *, run_id: str, reason: str) -> PlannerAttemptView:
+    def build_planner_recharge_preflight(self, run_id: str) -> PlannerRechargePreflightView:
+        """Explain whether a founder should reopen the exhausted planner phase yet."""
+
+        snapshot = self.build_run_snapshot(run_id)
+        governance = self.build_planner_governance(run_id)
+        failure_report = self.build_failure_report(run_id)
+        latest_founder_intervention = (
+            snapshot.recent_founder_interventions[-1]
+            if snapshot.recent_founder_interventions
+            else None
+        )
+
+        caution_codes: list[PlannerRechargeCautionCode] = []
+        guidance: list[str] = []
+
+        if not governance.exhausted:
+            guidance.append(
+                "The current planner phase is not exhausted yet, so manual recharge is unavailable.",
+            )
+        else:
+            guidance.append(
+                "The current planner phase is exhausted, so one founder-controlled recharge is allowed if the blockage was reviewed.",
+            )
+
+        if governance.recharge_count > 0:
+            caution_codes.append(PlannerRechargeCautionCode.REPEATED_RECHARGE)
+            guidance.append(
+                f"This phase has already been manually recharged {governance.recharge_count} time(s). "
+                "Only reopen it again if the operating context changed or you intentionally want one more bounded pass.",
+            )
+
+        if failure_report is not None:
+            guidance.append(
+                f"Latest execution failure: {failure_report.error_code} - {failure_report.observed_outcome}",
+            )
+            if failure_report.deterministic:
+                caution_codes.append(PlannerRechargeCautionCode.DETERMINISTIC_FAILURE)
+                guidance.append(
+                    "That failure looks deterministic, so recharge should usually wait until the underlying blocker is fixed.",
+                )
+            else:
+                guidance.append(
+                    "That failure looks transient or infrastructure-related, so recharge may be reasonable once the environment recovers.",
+                )
+        else:
+            guidance.append(
+                "No structured execution failure is attached to the current phase.",
+            )
+
+        if snapshot.latest_rejection_reason is not None:
+            caution_codes.append(PlannerRechargeCautionCode.LATEST_REJECTION_PRESENT)
+            guidance.append(
+                f"Latest rejection reason is still active: {snapshot.latest_rejection_reason}",
+            )
+
+        if (
+            latest_founder_intervention is not None
+            and latest_founder_intervention.reply_kind == FounderReplyKind.REJECT
+        ):
+            caution_codes.append(PlannerRechargeCautionCode.PRIOR_FOUNDER_REJECT)
+            guidance.append(
+                "The most recent founder intervention rejected the previous escalation, so another recharge should only happen if genuinely new information exists.",
+            )
+
+        return PlannerRechargePreflightView(
+            run_id=snapshot.run.id,
+            phase_key=governance.phase_key,
+            policy_version=governance.policy_version,
+            exhausted=governance.exhausted,
+            budget_limit=governance.budget_limit,
+            budget_used=governance.budget_used,
+            budget_remaining=governance.budget_remaining,
+            recharge_count=governance.recharge_count,
+            latest_attempt_summary=self._sanitize_planner_text(
+                governance.latest_attempt_summary,
+                limit=4000,
+            ),
+            latest_failure_error_code=failure_report.error_code if failure_report is not None else None,
+            latest_failure_summary=(
+                self._sanitize_planner_text(
+                    failure_report.observed_outcome,
+                    limit=500,
+                )
+                if failure_report is not None
+                else None
+            ),
+            latest_failure_deterministic=(
+                failure_report.deterministic if failure_report is not None else None
+            ),
+            latest_rejection_reason=self._sanitize_planner_text(
+                snapshot.latest_rejection_reason,
+                limit=4000,
+            ),
+            latest_founder_intervention_kind=(
+                latest_founder_intervention.reply_kind
+                if latest_founder_intervention is not None
+                else None
+            ),
+            latest_founder_intervention_summary=(
+                self._sanitize_planner_text(
+                    latest_founder_intervention.summary,
+                    limit=400,
+                )
+                if latest_founder_intervention is not None
+                else None
+            ),
+            caution_codes=caution_codes,
+            requires_acknowledgement=bool(caution_codes),
+            guidance=guidance,
+        )
+
+    def record_planner_recharge(
+        self,
+        *,
+        run_id: str,
+        reason: str,
+        acknowledge_unchanged_context: bool = False,
+    ) -> PlannerAttemptView:
         """Manually reopen a planner phase after the current budget is exhausted."""
 
         normalized_reason = self._normalize_optional_text(reason)
@@ -1109,9 +1368,17 @@ class LedgerStore:
 
         snapshot = self.build_run_snapshot(run_id)
         governance = self.build_planner_governance(run_id)
+        preflight = self.build_planner_recharge_preflight(run_id)
         if not governance.exhausted:
             raise PermissionError(
                 f"Run {run_id} is not exhausted in the current planner phase; recharge is not allowed yet.",
+            )
+        if preflight.requires_acknowledgement and not acknowledge_unchanged_context:
+            caution_summary = ", ".join(code.value for code in preflight.caution_codes)
+            raise PermissionError(
+                "Planner recharge requires explicit acknowledgement because the current phase still carries caution signals "
+                f"({caution_summary}). Review `v2-spring planner recharge-check {run_id}` and rerun with "
+                "`--acknowledge-unchanged-context` if you still want to reopen this phase.",
             )
 
         attempt = self._record_planner_attempt(
@@ -1125,7 +1392,8 @@ class LedgerStore:
             outcome=PlannerAttemptOutcome.MANUAL_RECHARGE,
             outcome_reason=(
                 "Founder manually reopened the current planner phase after exhaustion. "
-                f"Reason: {normalized_reason}"
+                f"Reason: {normalized_reason}. "
+                f"Caution codes: {', '.join(code.value for code in preflight.caution_codes) if preflight.caution_codes else 'none'}."
             ),
             budget_used=governance.budget_used,
             budget_limit=governance.budget_limit,
@@ -1139,6 +1407,10 @@ class LedgerStore:
                 f"error_code={PlannerAttemptOutcome.MANUAL_RECHARGE.value}; "
                 f"phase_key={governance.phase_key}; "
                 f"budget_limit={governance.budget_limit}; "
+                f"requires_ack={preflight.requires_acknowledgement}; "
+                f"caution_codes={','.join(code.value for code in preflight.caution_codes) if preflight.caution_codes else '-'}; "
+                f"latest_failure_error_code={preflight.latest_failure_error_code if preflight.latest_failure_error_code else '-'}; "
+                f"latest_rejection_reason={preflight.latest_rejection_reason if preflight.latest_rejection_reason else '-'}; "
                 f"reason={normalized_reason}."
             ),
         )
@@ -1201,7 +1473,17 @@ class LedgerStore:
             streak += 1
 
         proposals = self.list_planner_proposals_for_run(run_id)
-        latest_proposal = proposals[-1] if proposals else None
+        failure_anchor = latest_failed.task.started_at or latest_failed.task.created_at
+        latest_proposal = next(
+            (
+                proposal
+                for proposal in reversed(proposals)
+                if proposal.created_at <= failure_anchor
+            ),
+            None,
+        )
+        if latest_proposal is None:
+            latest_proposal = proposals[-1] if proposals else None
         return FailureReportView(
             failure_class=failure_class,
             error_code=error_code,
@@ -1209,6 +1491,11 @@ class LedgerStore:
             normalized_failure_signature=normalized_signature,
             previous_rationale=(
                 self._sanitize_planner_text(latest_proposal.rationale, limit=4000)
+                if latest_proposal is not None
+                else None
+            ),
+            previous_expected_outcome=(
+                self._sanitize_planner_text(latest_proposal.expected_outcome, limit=4000)
                 if latest_proposal is not None
                 else None
             ),
@@ -1259,6 +1546,48 @@ class LedgerStore:
             stale_quota_used=governance.stale_quota_used,
             stale_quota_remaining=governance.stale_quota_remaining,
         )
+
+    def open_repeated_failure_founder_escalation_if_needed(
+        self,
+        run_id: str,
+    ) -> PendingFounderEscalationView | None:
+        """Open a founder-help lane when deterministic execution failure repeats."""
+
+        snapshot = self.build_run_snapshot(run_id)
+        if snapshot.pending_founder_escalation is not None:
+            return None
+
+        failure_report = self.build_failure_report(run_id)
+        if failure_report is None:
+            return None
+        if not failure_report.deterministic:
+            return None
+        if failure_report.repeated_failure_streak < 2:
+            return None
+
+        observation = self.record_observation(
+            run_id=run_id,
+            kind=ObservationKind.PLANNER_ESCALATION,
+            summary="System requires founder review after repeated deterministic execution failure.",
+            details=(
+                "escalation_target=founder; "
+                "help_kind=manual_override_request; "
+                "error_code=execution_failure_loop_detected; "
+                f"failure_error_code={failure_report.error_code}; "
+                f"repeated_failure_streak={failure_report.repeated_failure_streak}; "
+                f"normalized_failure_signature={failure_report.normalized_failure_signature}; "
+                f"blocking_reason={self._sanitize_planner_text(failure_report.observed_outcome, limit=500)}; "
+                f"analysis_summary={self._sanitize_planner_text(failure_report.previous_rationale, limit=500) or '-'}; "
+                "requested_help=Review whether the same bounded execution path should be redirected, overridden, or stopped before another planner attempt."
+            ),
+        )
+        refreshed_snapshot = self.build_run_snapshot(run_id)
+        pending = refreshed_snapshot.pending_founder_escalation
+        if pending is None or str(pending.observation_id) != str(observation.id):
+            raise RuntimeError(
+                "Repeated execution failure escalation was recorded, but the founder-help lane did not become visible in the refreshed snapshot.",
+            )
+        return pending
 
     def record_planner_escalation(
         self,
@@ -1722,6 +2051,13 @@ class LedgerStore:
         return cleaned
 
     @staticmethod
+    def _build_approval_timeout_reason(expires_at) -> str:
+        return (
+            "Approval timed out without a founder response"
+            + (f" by {expires_at.isoformat()}." if expires_at is not None else ".")
+        )
+
+    @staticmethod
     def _sanitize_planner_text(value: str | None, *, limit: int) -> str | None:
         if value is None:
             return None
@@ -1789,32 +2125,72 @@ class LedgerStore:
         return masked
 
     @staticmethod
-    def _get_run_for_execution(session: Session, run_id: str) -> RunRecord:
-        run = session.get(RunRecord, run_id)
-        if run is None:
-            raise LookupError(f"Run {run_id} was not found.")
-        if run.status != RunStatus.READY:
-            raise PermissionError(
-                f"Run {run_id} is {run.status.value}; bounded execution requires the run to be ready.",
-            )
-        return run
-
-    @staticmethod
-    def _get_run_for_mutation(
+    def _acquire_run_status_guard(
         session: Session,
         run_id: str,
         *,
         mutation_name: str,
         allow_during_waiting_approval: bool = False,
+        allow_during_suspended: bool = False,
+        required_status: RunStatus | None = None,
     ) -> RunRecord:
+        statement = update(RunRecord).where(RunRecord.id == run_id).values(updated_at=RunRecord.updated_at)
+        if required_status is not None:
+            statement = statement.where(RunRecord.status == required_status)
+        else:
+            if not allow_during_waiting_approval:
+                statement = statement.where(RunRecord.status != RunStatus.WAITING_APPROVAL)
+            if not allow_during_suspended:
+                statement = statement.where(RunRecord.status != RunStatus.SUSPENDED)
+
+        rowcount = session.execute(statement).rowcount
         run = session.get(RunRecord, run_id)
         if run is None:
             raise LookupError(f"Run {run_id} was not found.")
+        if rowcount:
+            return run
+        if required_status is not None:
+            raise PermissionError(
+                f"Run {run_id} is {run.status.value}; {mutation_name} requires the run to be {required_status.value}.",
+            )
         if run.status == RunStatus.WAITING_APPROVAL and not allow_during_waiting_approval:
             raise PermissionError(
                 f"Run {run_id} is waiting for approval; {mutation_name} is blocked until approval is resolved.",
             )
-        return run
+        if run.status == RunStatus.SUSPENDED and not allow_during_suspended:
+            raise PermissionError(
+                f"Run {run_id} is suspended; {mutation_name} is blocked until the timed-out approval is explicitly recovered.",
+            )
+        raise PermissionError(
+            f"Run {run_id} changed while attempting {mutation_name}; refresh the current state and retry deterministically.",
+        )
+
+    @classmethod
+    def _get_run_for_execution(cls, session: Session, run_id: str) -> RunRecord:
+        return cls._acquire_run_status_guard(
+            session,
+            run_id,
+            mutation_name="bounded execution",
+            required_status=RunStatus.READY,
+        )
+
+    @classmethod
+    def _get_run_for_mutation(
+        cls,
+        session: Session,
+        run_id: str,
+        *,
+        mutation_name: str,
+        allow_during_waiting_approval: bool = False,
+        allow_during_suspended: bool = False,
+    ) -> RunRecord:
+        return cls._acquire_run_status_guard(
+            session,
+            run_id,
+            mutation_name=mutation_name,
+            allow_during_waiting_approval=allow_during_waiting_approval,
+            allow_during_suspended=allow_during_suspended,
+        )
 
     def _finalize_failed_task(
         self,
@@ -2057,6 +2433,7 @@ class LedgerStore:
                 "approve_effect": record.approve_effect,
                 "reject_effect": record.reject_effect,
                 "requested_at": record.requested_at,
+                "expires_at": record.expires_at,
                 "resolved_at": record.resolved_at,
                 "resolution_reason": record.resolution_reason,
             },
@@ -2236,6 +2613,14 @@ class LedgerStore:
         ):
             warnings.append("Run is marked rejected but no rejected approval is recorded.")
 
+        if run.status == RunStatus.SUSPENDED and not any(
+            approval.status == ApprovalStatus.EXPIRED for approval in approvals
+        ):
+            warnings.append("Run is marked suspended but no expired approval is recorded.")
+
+        if any(approval.status == ApprovalStatus.EXPIRED for approval in approvals) and run.status != RunStatus.SUSPENDED:
+            warnings.append("An approval expired but the run is not marked suspended.")
+
         for task in tasks:
             if task.task.status == TaskStatus.COMPLETED and str(task.task.id) not in task_completed_ids:
                 warnings.append(
@@ -2365,6 +2750,77 @@ class LedgerStore:
             json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"),
         ).hexdigest()
 
+    @classmethod
+    def _build_planner_proposal_intent_signature(
+        cls,
+        *,
+        selected_action: PossibleActionName,
+        rationale: str,
+        expected_outcome: str,
+    ) -> str:
+        alias_map = {
+            "db": "database",
+            "repo": "repository",
+            "repos": "repository",
+            "review": "inspect",
+            "inspect": "inspect",
+            "check": "inspect",
+            "examine": "inspect",
+            "scan": "inspect",
+            "proceed": "continue",
+            "proceeding": "continue",
+            "continue": "continue",
+            "continuing": "continue",
+            "path": "path",
+            "paths": "path",
+            "directory": "path",
+            "directories": "path",
+            "file": "path",
+            "files": "path",
+        }
+        stopwords = {
+            "a",
+            "an",
+            "and",
+            "before",
+            "can",
+            "first",
+            "for",
+            "into",
+            "later",
+            "next",
+            "one",
+            "or",
+            "should",
+            "step",
+            "that",
+            "the",
+            "then",
+            "this",
+            "to",
+            "while",
+            "with",
+        }
+
+        normalized_source = f"{rationale} {expected_outcome}".lower()
+        tokens = re.findall(r"[a-z0-9_]+", normalized_source)
+        normalized_tokens: list[str] = []
+        for token in tokens:
+            canonical = alias_map.get(token, token)
+            if canonical in stopwords:
+                continue
+            if len(canonical) <= 2:
+                continue
+            normalized_tokens.append(canonical)
+        unique_tokens = sorted(set(normalized_tokens))
+        payload = {
+            "selected_action": selected_action.value,
+            "normalized_tokens": unique_tokens,
+        }
+        return sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        ).hexdigest()
+
     def _record_planner_attempt(
         self,
         *,
@@ -2375,6 +2831,7 @@ class LedgerStore:
         selected_action: PossibleActionName | None,
         submission_key: str | None,
         proposal_fingerprint: str | None,
+        proposal_intent_signature: str | None = None,
         outcome: PlannerAttemptOutcome,
         outcome_reason: str,
         budget_used: int,
@@ -2423,6 +2880,7 @@ class LedgerStore:
                         "selected_action": selected_action.value if selected_action is not None else None,
                         "submission_key": submission_key,
                         "proposal_fingerprint": proposal_fingerprint,
+                        "proposal_intent_signature": proposal_intent_signature,
                         "outcome": outcome.value,
                         "outcome_reason": outcome_reason,
                         "attempt_index": record.attempt_index,

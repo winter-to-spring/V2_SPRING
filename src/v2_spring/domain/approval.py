@@ -11,6 +11,7 @@ class ApprovalStatus(StrEnum):
     PENDING = "pending"
     APPROVED = "approved"
     REJECTED = "rejected"
+    EXPIRED = "expired"
 
 
 class ApprovalView(BaseModel):
@@ -26,6 +27,7 @@ class ApprovalView(BaseModel):
     approve_effect: str
     reject_effect: str
     requested_at: datetime
+    expires_at: datetime
     resolved_at: datetime | None
     resolution_reason: str | None
 

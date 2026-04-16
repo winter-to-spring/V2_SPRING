@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 from textwrap import dedent
@@ -8,21 +9,27 @@ from textwrap import dedent
 from pydantic import ValidationError
 
 from v2_spring.adapters.langgraph_planner import (
+    AnthropicStructuredPlannerTransport,
     LangGraphPlannerAdapter,
+    OpenAIStructuredPlannerTransport,
+    PlannerTransportError,
     ScriptedStructuredPlannerTransport,
 )
-from v2_spring.config import load_config
+from v2_spring.config import AppConfig, load_config
 from v2_spring.domain.approval import ApprovalStatus
 from v2_spring.domain.founder_intervention import (
     FOUNDER_REPLY_INPUT_ADAPTER,
     FounderInterventionView,
 )
+from v2_spring.domain.observation import ObservationKind
 from v2_spring.domain.planner_adapter import (
     ActionProposal,
     EscalationProposal,
     PlannerInvocationProofView,
+    PlannerTransportAuditView,
+    PlannerTransportProvider,
 )
-from v2_spring.domain.planner_attempt import PlannerAttemptView
+from v2_spring.domain.planner_attempt import PlannerAttemptView, PlannerRechargePreflightView
 from v2_spring.domain.proposal import PlannerProposalInput, PlannerProposalView
 from v2_spring.domain.replay import ArtifactInspectionView, RunReplayView, TaskReplayView
 from v2_spring.domain.snapshot import PossibleActionEvaluationView, PossibleActionName, RunSnapshotView
@@ -232,7 +239,7 @@ def build_parser() -> argparse.ArgumentParser:
     approval_list_parser.add_argument(
         "--status",
         default="pending",
-        choices=["pending", "approved", "rejected", "all"],
+        choices=["pending", "approved", "rejected", "expired", "all"],
         help="Filter approvals by status.",
     )
     approval_list_parser.add_argument(
@@ -255,6 +262,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional structured feedback. Required for --reject.",
     )
     approval_resolve_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Override DATABASE_URL for this invocation.",
+    )
+
+    approval_sweep_parser = approval_subparsers.add_parser(
+        "sweep-timeouts",
+        help="Expire overdue approvals and suspend the affected runs.",
+    )
+    approval_sweep_parser.add_argument(
+        "--now",
+        default=None,
+        help="Optional ISO-8601 timestamp used as the timeout cutoff. Defaults to current UTC time.",
+    )
+    approval_sweep_parser.add_argument(
         "--database-url",
         default=None,
         help="Override DATABASE_URL for this invocation.",
@@ -351,6 +373,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Why the founder believes another planner attempt should be allowed.",
     )
     planner_recharge_parser.add_argument(
+        "--acknowledge-unchanged-context",
+        action="store_true",
+        help=(
+            "Explicitly confirm that the founder reviewed the current blockage and still wants to reopen the phase "
+            "even if the environment or rejection context appears unchanged."
+        ),
+    )
+    planner_recharge_parser.add_argument(
         "--format",
         default="pretty",
         choices=["pretty", "json"],
@@ -362,11 +392,39 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override DATABASE_URL for this invocation.",
     )
 
+    planner_recharge_check_parser = planner_subparsers.add_parser(
+        "recharge-check",
+        help="Show founder-facing recharge guidance before reopening an exhausted planner phase.",
+    )
+    planner_recharge_check_parser.add_argument("run_id", help="Run id to inspect.")
+    planner_recharge_check_parser.add_argument(
+        "--format",
+        default="pretty",
+        choices=["pretty", "json"],
+        help="Output format. Defaults to pretty.",
+    )
+    planner_recharge_check_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Override DATABASE_URL for this invocation.",
+    )
+
     planner_invoke_parser = planner_subparsers.add_parser(
         "invoke",
         help="Invoke the bounded LangGraph planner adapter and validate the result.",
     )
     planner_invoke_parser.add_argument("run_id", help="Run id to target.")
+    planner_invoke_parser.add_argument(
+        "--provider",
+        default=None,
+        choices=[provider.value for provider in PlannerTransportProvider],
+        help="Planner transport provider. Defaults to PLANNER_PROVIDER or scripted.",
+    )
+    planner_invoke_parser.add_argument(
+        "--model",
+        default=None,
+        help="Optional provider model override. Defaults to the configured planner model.",
+    )
     planner_invoke_parser.add_argument(
         "--scripted-response-json",
         default=None,
@@ -505,6 +563,54 @@ def _build_store(database_url_override: str | None) -> LedgerStore:
     return LedgerStore(load_config(database_url_override).database_url)
 
 
+def _parse_cli_datetime(value: str | None) -> datetime | None:
+    if value is None:
+        return None
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _build_planner_transport(
+    *,
+    args: argparse.Namespace,
+    config: AppConfig,
+):
+    provider = PlannerTransportProvider(args.provider) if args.provider else config.planner_provider
+    if provider == PlannerTransportProvider.SCRIPTED:
+        scripted_responses = _load_scripted_planner_responses(
+            inline_json=args.scripted_response_json,
+            file_path=args.scripted_response_file,
+        )
+        return ScriptedStructuredPlannerTransport(scripted_responses), provider
+    if provider == PlannerTransportProvider.OPENAI:
+        if not config.openai_api_key:
+            raise ValueError(
+                "OPENAI_API_KEY is not configured. Set it in the environment before using --provider openai.",
+            )
+        transport = OpenAIStructuredPlannerTransport(
+            model=args.model or config.planner_openai_model,
+            api_key=config.openai_api_key,
+            timeout_seconds=config.planner_timeout_seconds,
+            max_retries=config.planner_max_retries,
+        )
+        return transport, provider
+    if provider == PlannerTransportProvider.ANTHROPIC:
+        if not config.anthropic_api_key:
+            raise ValueError(
+                "ANTHROPIC_API_KEY is not configured. Set it in the environment before using --provider anthropic.",
+            )
+        transport = AnthropicStructuredPlannerTransport(
+            model=args.model or config.planner_anthropic_model,
+            api_key=config.anthropic_api_key,
+            timeout_seconds=config.planner_timeout_seconds,
+            max_retries=config.planner_max_retries,
+        )
+        return transport, provider
+    raise ValueError(f"Unsupported planner transport provider: {provider.value}")
+
+
 def _render_run(run_id: str, store: LedgerStore) -> str:
     run = store.get_run(run_id)
     if run is None:
@@ -617,6 +723,7 @@ def _render_approvals(store: LedgerStore, status_filter: str) -> str:
                 f"   approve_effect:   {approval.approve_effect}",
                 f"   reject_effect:    {approval.reject_effect}",
                 f"   requested_at:     {approval.requested_at.isoformat()}",
+                f"   expires_at:       {approval.expires_at.isoformat()}",
                 f"   resolved_at:      {approval.resolved_at.isoformat() if approval.resolved_at else '-'}",
                 f"   resolution_reason:{approval.resolution_reason if approval.resolution_reason else '-'}",
             ],
@@ -642,10 +749,40 @@ def _render_resolved_approval(
         new_status:       {approval.status.value}
         requested_action: {approval.requested_action}
         outcome:          {outcome}
+        expires_at:       {approval.expires_at.isoformat()}
         resolution_reason:{approval.resolution_reason if approval.resolution_reason else "-"}
         resolved_at:      {approval.resolved_at.isoformat() if approval.resolved_at else "-"}
         """,
     ).strip()
+
+
+def _render_expired_approvals(approvals, store: LedgerStore, *, sweep_now: datetime) -> str:
+    lines = [
+        "Approval timeout sweep",
+        "----------------------",
+        f"sweep_now:          {sweep_now.isoformat()}",
+    ]
+    if not approvals:
+        lines.append("No pending approvals had reached their expiration time.")
+        return "\n".join(lines)
+
+    lines.append(f"expired_count:      {len(approvals)}")
+    for index, approval in enumerate(approvals, start=1):
+        run = store.get_run(str(approval.run_id))
+        lines.extend(
+            [
+                "",
+                f"{index}. {approval.id}",
+                f"   run_id:           {approval.run_id}",
+                f"   approval_status:  {approval.status.value}",
+                f"   run_status:       {run.status.value if run is not None else '-'}",
+                f"   requested_action: {approval.requested_action}",
+                f"   expires_at:       {approval.expires_at.isoformat()}",
+                f"   resolved_at:      {approval.resolved_at.isoformat() if approval.resolved_at else '-'}",
+                f"   resolution_reason:{approval.resolution_reason if approval.resolution_reason else '-'}",
+            ],
+        )
+    return "\n".join(lines)
 
 
 def _render_tasks(run_id: str, store: LedgerStore) -> str:
@@ -762,6 +899,7 @@ def _render_snapshot(snapshot: RunSnapshotView) -> str:
                 f"id:                  {snapshot.pending_approval.id}",
                 f"requested_action:    {snapshot.pending_approval.requested_action}",
                 f"reason:              {snapshot.pending_approval.reason}",
+                f"expires_at:          {snapshot.pending_approval.expires_at.isoformat()}",
             ],
         )
     if snapshot.pending_founder_escalation is not None:
@@ -914,6 +1052,20 @@ def _render_planner_invocation(proof: PlannerInvocationProofView) -> str:
         f"format_failures:      {proof.format_failures}",
         f"stale_quota_exhausted:{proof.stale_quota_exhausted}",
         "",
+        "Transport",
+        "---------",
+        f"provider:             {proof.transport.provider.value}",
+        f"model:                {proof.transport.model}",
+        f"response_id:          {proof.transport.response_id if proof.transport.response_id else '-'}",
+        f"retry_count:          {proof.transport.retry_count}",
+        f"truncated:            {proof.transport.truncated}",
+        f"input_tokens:         {proof.transport.input_tokens if proof.transport.input_tokens is not None else '-'}",
+        f"output_tokens:        {proof.transport.output_tokens if proof.transport.output_tokens is not None else '-'}",
+        f"total_tokens:         {proof.transport.total_tokens if proof.transport.total_tokens is not None else '-'}",
+        f"system_prompt_hash:   {proof.transport.system_prompt_hash}",
+        f"user_prompt_hash:     {proof.transport.user_prompt_hash}",
+        f"user_prompt_chars:    {proof.transport.user_prompt_chars}",
+        "",
         "Context window",
         "--------------",
         f"legal_actions:        {', '.join(action.name.value for action in proof.context_window.legal_actions) or '-'}",
@@ -933,6 +1085,7 @@ def _render_planner_invocation(proof: PlannerInvocationProofView) -> str:
                 f"streak:              {report.repeated_failure_streak}",
                 f"deterministic:       {report.deterministic}",
                 f"observed_outcome:    {report.observed_outcome}",
+                f"previous_outcome:    {report.previous_expected_outcome if report.previous_expected_outcome else '-'}",
                 f"short_traceback:     {report.short_traceback if report.short_traceback else '-'}",
             ],
         )
@@ -963,6 +1116,120 @@ def _render_planner_invocation(proof: PlannerInvocationProofView) -> str:
             ],
         )
     return "\n".join(lines)
+
+
+def _record_transport_success_audit(
+    *,
+    store: LedgerStore,
+    run_id: str,
+    audit: PlannerTransportAuditView,
+) -> None:
+    store.record_observation(
+        run_id=run_id,
+        kind=ObservationKind.SYSTEM_AUDIT,
+        summary=f"Planner transport completed via {audit.provider.value} and produced a structured candidate.",
+        details=(
+            "error_code=planner_transport_success; "
+            f"provider={audit.provider.value}; "
+            f"model={audit.model}; "
+            f"response_id={audit.response_id if audit.response_id else '-'}; "
+            f"retry_count={audit.retry_count}; "
+            f"input_tokens={audit.input_tokens if audit.input_tokens is not None else '-'}; "
+            f"output_tokens={audit.output_tokens if audit.output_tokens is not None else '-'}; "
+            f"total_tokens={audit.total_tokens if audit.total_tokens is not None else '-'}; "
+            f"truncated={audit.truncated}; "
+            f"system_prompt_hash={audit.system_prompt_hash}; "
+            f"user_prompt_hash={audit.user_prompt_hash}; "
+            f"user_prompt_chars={audit.user_prompt_chars}."
+        ),
+    )
+
+
+def _record_transport_format_failure_audit(
+    *,
+    store: LedgerStore,
+    run_id: str,
+    audit: PlannerTransportAuditView | None,
+    reason: str,
+) -> None:
+    if audit is None:
+        details = f"error_code=planner_transport_format_failure; reason={reason}."
+        summary = "Planner transport returned a response that failed schema parsing."
+    else:
+        details = (
+            "error_code=planner_transport_format_failure; "
+            f"provider={audit.provider.value}; "
+            f"model={audit.model}; "
+            f"response_id={audit.response_id if audit.response_id else '-'}; "
+            f"retry_count={audit.retry_count}; "
+            f"input_tokens={audit.input_tokens if audit.input_tokens is not None else '-'}; "
+            f"output_tokens={audit.output_tokens if audit.output_tokens is not None else '-'}; "
+            f"total_tokens={audit.total_tokens if audit.total_tokens is not None else '-'}; "
+            f"truncated={audit.truncated}; "
+            f"system_prompt_hash={audit.system_prompt_hash}; "
+            f"user_prompt_hash={audit.user_prompt_hash}; "
+            f"user_prompt_chars={audit.user_prompt_chars}; "
+            f"reason={reason}."
+        )
+        summary = (
+            f"Planner transport via {audit.provider.value} returned a response that failed schema parsing."
+        )
+    store.record_observation(
+        run_id=run_id,
+        kind=ObservationKind.SYSTEM_AUDIT,
+        summary=summary,
+        details=details,
+    )
+
+
+def _record_transport_error_audit(
+    *,
+    store: LedgerStore,
+    run_id: str,
+    error: PlannerTransportError,
+) -> None:
+    if error.code == "cancelled":
+        summary = (
+            f"Planner transport via {error.provider.value} was interrupted locally before a structured response was accepted."
+        )
+        details = (
+            f"error_code={error.code}; "
+            f"provider={error.provider.value}; "
+            f"model={error.model}; "
+            f"retryable={error.retryable}; "
+            f"retry_count={error.retry_count}; "
+            f"status_code={error.status_code if error.status_code is not None else '-'}; "
+            f"response_id={error.response_id if error.response_id else '-'}; "
+            f"timeout_seconds={error.timeout_seconds if error.timeout_seconds is not None else '-'}; "
+            f"orphan_risk_possible={error.orphan_risk_possible}; "
+            "cancellation_scope=local_cli_only; "
+            "recommended_action=inspect planner attempts and provider telemetry before reinvoking; "
+            f"message={str(error)}."
+        )
+        store.record_observation(
+            run_id=run_id,
+            kind=ObservationKind.SYSTEM_AUDIT,
+            summary=summary,
+            details=details,
+        )
+        return
+    store.record_observation(
+        run_id=run_id,
+        kind=ObservationKind.SYSTEM_AUDIT,
+        summary=f"Planner transport via {error.provider.value} failed before a structured response was accepted.",
+        details=(
+            f"error_code={error.code}; "
+            f"provider={error.provider.value}; "
+            f"model={error.model}; "
+            f"retryable={error.retryable}; "
+            f"retry_count={error.retry_count}; "
+            f"status_code={error.status_code if error.status_code is not None else '-'}; "
+            f"response_id={error.response_id if error.response_id else '-'}; "
+            f"timeout_seconds={error.timeout_seconds if error.timeout_seconds is not None else '-'}; "
+            f"orphan_risk_possible={error.orphan_risk_possible}; "
+            f"message={str(error)}."
+        ),
+    )
 
 
 def _render_planner_attempt(attempt: PlannerAttemptView) -> str:
@@ -1008,6 +1275,35 @@ def _render_planner_attempts(attempts: list[PlannerAttemptView], *, run_id: str)
                 f"   created_at:       {attempt.created_at.isoformat()}",
             ],
         )
+    return "\n".join(lines)
+
+
+def _render_planner_recharge_preflight(preflight: PlannerRechargePreflightView) -> str:
+    lines = [
+        "Planner recharge preflight",
+        "-------------------------",
+        f"run_id:                     {preflight.run_id}",
+        f"phase_key:                  {preflight.phase_key}",
+        f"policy_version:             {preflight.policy_version}",
+        f"phase_exhausted:            {'yes' if preflight.exhausted else 'no'}",
+        f"budget:                     {preflight.budget_used}/{preflight.budget_limit}",
+        f"budget_remaining:           {preflight.budget_remaining}",
+        f"recharge_count:             {preflight.recharge_count}",
+        f"requires_acknowledgement:   {'yes' if preflight.requires_acknowledgement else 'no'}",
+        f"caution_codes:              {', '.join(code.value for code in preflight.caution_codes) if preflight.caution_codes else '-'}",
+        f"latest_attempt:             {preflight.latest_attempt_summary if preflight.latest_attempt_summary else '-'}",
+        f"latest_failure_error_code:  {preflight.latest_failure_error_code if preflight.latest_failure_error_code else '-'}",
+        f"latest_failure_summary:     {preflight.latest_failure_summary if preflight.latest_failure_summary else '-'}",
+        f"failure_is_deterministic:   {preflight.latest_failure_deterministic if preflight.latest_failure_deterministic is not None else '-'}",
+        f"latest_rejection_reason:    {preflight.latest_rejection_reason if preflight.latest_rejection_reason else '-'}",
+        f"latest_founder_reply_kind:  {preflight.latest_founder_intervention_kind.value if preflight.latest_founder_intervention_kind is not None else '-'}",
+        f"latest_founder_reply:       {preflight.latest_founder_intervention_summary if preflight.latest_founder_intervention_summary else '-'}",
+        "",
+        "Guidance",
+        "--------",
+    ]
+    for item in preflight.guidance:
+        lines.append(f"- {item}")
     return "\n".join(lines)
 
 
@@ -1075,6 +1371,7 @@ def _render_replay(replay: RunReplayView, *, verbose: bool) -> str:
             [
                 f"- current approval state: {latest_approval.status.value}",
                 f"- requested action: {latest_approval.requested_action}",
+                f"- expires at: {latest_approval.expires_at.isoformat()}",
                 f"- resolution reason: {latest_approval.resolution_reason if latest_approval.resolution_reason else '-'}",
             ],
         )
@@ -1145,7 +1442,7 @@ def _render_replay(replay: RunReplayView, *, verbose: bool) -> str:
         lines.extend(["", "Detailed approvals", "-----------------"])
         for approval in replay.approvals:
             lines.append(
-                f"- {approval.id}: {approval.status.value} / {approval.requested_action}",
+                f"- {approval.id}: {approval.status.value} / {approval.requested_action} / expires_at={approval.expires_at.isoformat()}",
             )
 
         lines.extend(["", "Detailed decisions", "------------------"])
@@ -1416,6 +1713,17 @@ def main() -> None:
             raise SystemExit(1) from exc
         return
 
+    if args.command == "approval" and args.approval_command == "sweep-timeouts":
+        store = _build_store(args.database_url)
+        try:
+            sweep_now = _parse_cli_datetime(args.now)
+        except ValueError as exc:
+            print(f"Invalid --now timestamp: {args.now}")
+            raise SystemExit(2) from exc
+        expired = store.expire_overdue_approvals(now=sweep_now)
+        print(_render_expired_approvals(expired, store, sweep_now=sweep_now or datetime.now(timezone.utc)))
+        return
+
     if args.command == "planner" and args.planner_command == "propose":
         store = _build_store(args.database_url)
         try:
@@ -1476,10 +1784,26 @@ def main() -> None:
             print(_render_planner_attempts(attempts, run_id=args.run_id))
         return
 
+    if args.command == "planner" and args.planner_command == "recharge-check":
+        store = _build_store(args.database_url)
+        if store.get_run(args.run_id) is None:
+            print(f"Run {args.run_id} was not found.")
+            raise SystemExit(1)
+        preflight = store.build_planner_recharge_preflight(args.run_id)
+        if args.format == "json":
+            print(json.dumps(preflight.model_dump(mode="json"), indent=2, ensure_ascii=False))
+        else:
+            print(_render_planner_recharge_preflight(preflight))
+        return
+
     if args.command == "planner" and args.planner_command == "recharge":
         store = _build_store(args.database_url)
         try:
-            attempt = store.record_planner_recharge(run_id=args.run_id, reason=args.reason)
+            attempt = store.record_planner_recharge(
+                run_id=args.run_id,
+                reason=args.reason,
+                acknowledge_unchanged_context=args.acknowledge_unchanged_context,
+            )
             if args.format == "json":
                 print(json.dumps(attempt.model_dump(mode="json"), indent=2, ensure_ascii=False))
             else:
@@ -1490,8 +1814,15 @@ def main() -> None:
         return
 
     if args.command == "planner" and args.planner_command == "invoke":
-        store = _build_store(args.database_url)
+        config = load_config(args.database_url)
+        store = LedgerStore(config.database_url)
         try:
+            repeated_failure_escalation = store.open_repeated_failure_founder_escalation_if_needed(args.run_id)
+            if repeated_failure_escalation is not None:
+                raise PermissionError(
+                    "Founder review is now required because deterministic execution failure repeated without state advancement. "
+                    f"Pending escalation={repeated_failure_escalation.observation_id}.",
+                )
             context = store.build_planner_context(args.run_id)
             if context.snapshot.pending_founder_escalation is not None:
                 raise PermissionError(
@@ -1503,16 +1834,20 @@ def main() -> None:
                     "Planner phase budget is exhausted for the current state segment. "
                     "Use `v2-spring planner recharge <run-id> --reason ...` or resolve the founder lane first.",
                 )
-            scripted_responses = _load_scripted_planner_responses(
-                inline_json=args.scripted_response_json,
-                file_path=args.scripted_response_file,
-            )
+            transport, _ = _build_planner_transport(args=args, config=config)
             adapter = LangGraphPlannerAdapter(
-                transport=ScriptedStructuredPlannerTransport(scripted_responses),
+                transport=transport,
+                max_user_prompt_chars=config.planner_max_context_chars,
             )
             try:
-                parsed_output, format_failures = adapter.invoke(context)
+                invocation = adapter.invoke(context)
             except PlannerAdapterFormatError as exc:
+                _record_transport_format_failure_audit(
+                    store=store,
+                    run_id=args.run_id,
+                    audit=exc.transport_audit,
+                    reason=str(exc),
+                )
                 store.record_planner_format_failure(
                     run_id=args.run_id,
                     snapshot_hash=context.snapshot.state_hash,
@@ -1522,39 +1857,45 @@ def main() -> None:
 
             accepted_decision_id = None
             escalation_observation_id = None
-            if isinstance(parsed_output, ActionProposal):
+            if isinstance(invocation.parsed_output, ActionProposal):
                 recorded = store.record_planner_proposal(
                     run_id=args.run_id,
                     proposal=PlannerProposalInput(
                         snapshot_hash=context.snapshot.state_hash,
-                        selected_action=parsed_output.selected_action,
-                        rationale=parsed_output.analysis_summary,
-                        expected_outcome=parsed_output.expected_outcome,
+                        selected_action=invocation.parsed_output.selected_action,
+                        rationale=invocation.parsed_output.analysis_summary,
+                        expected_outcome=invocation.parsed_output.expected_outcome,
                     ),
                 )
                 accepted_decision_id = recorded.decision_id
-            elif isinstance(parsed_output, EscalationProposal):
+            elif isinstance(invocation.parsed_output, EscalationProposal):
                 observation = store.record_planner_escalation(
                     run_id=args.run_id,
                     snapshot_hash=context.snapshot.state_hash,
-                    analysis_summary=parsed_output.analysis_summary,
-                    confidence=parsed_output.confidence.value,
-                    help_kind=parsed_output.help_kind.value,
-                    blocking_reason=parsed_output.blocking_reason,
-                    requested_help=parsed_output.requested_help,
+                    analysis_summary=invocation.parsed_output.analysis_summary,
+                    confidence=invocation.parsed_output.confidence.value,
+                    help_kind=invocation.parsed_output.help_kind.value,
+                    blocking_reason=invocation.parsed_output.blocking_reason,
+                    requested_help=invocation.parsed_output.requested_help,
                 )
                 escalation_observation_id = observation.id
 
+            _record_transport_success_audit(
+                store=store,
+                run_id=args.run_id,
+                audit=invocation.transport_audit,
+            )
             proof = PlannerInvocationProofView(
                 run_id=context.snapshot.run.id,
                 policy_version=context.snapshot.policy_version,
                 snapshot_hash=context.snapshot.state_hash,
                 context_window=context,
-                parsed_output=parsed_output,
-                format_failures=format_failures,
+                parsed_output=invocation.parsed_output,
+                format_failures=invocation.format_failures,
                 accepted_decision_id=accepted_decision_id,
                 escalation_observation_id=escalation_observation_id,
                 stale_quota_exhausted=context.snapshot.planner_stale_quota_exhausted,
+                transport=invocation.transport_audit,
             )
             if args.format == "json":
                 print(json.dumps(proof.model_dump(mode="json"), indent=2, ensure_ascii=False))
@@ -1571,7 +1912,10 @@ def main() -> None:
             CognitiveDuplicatePlannerProposalError,
             PlannerPhaseExhaustedError,
             PermissionError,
+            PlannerTransportError,
         ) as exc:
+            if isinstance(exc, PlannerTransportError):
+                _record_transport_error_audit(store=store, run_id=args.run_id, error=exc)
             print(str(exc))
             raise SystemExit(1) from exc
         return

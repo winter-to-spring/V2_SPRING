@@ -13,7 +13,13 @@ from v2_spring.domain.founder_intervention import (
     FounderOverrideInput,
 )
 from v2_spring.domain.observation import ObservationKind, ObservationView
-from v2_spring.domain.planner_attempt import PlannerAttemptOutcome, PlannerAttemptView, PlannerGovernanceView
+from v2_spring.domain.planner_attempt import (
+    PlannerAttemptOutcome,
+    PlannerAttemptView,
+    PlannerGovernanceView,
+    PlannerRechargeCautionCode,
+    PlannerRechargePreflightView,
+)
 from v2_spring.domain.proposal import PlannerProposalInput, PlannerProposalView
 from v2_spring.domain.replay import ArtifactInspectionView, RunReplayView, TaskReplayView
 from v2_spring.domain.run import RiskLevel, RunCreateInput, RunStatus, RunView, UrgencyLevel
@@ -51,6 +57,8 @@ __all__ = [
     "PlannerAttemptOutcome",
     "PlannerAttemptView",
     "PlannerGovernanceView",
+    "PlannerRechargeCautionCode",
+    "PlannerRechargePreflightView",
     "PlannerProposalInput",
     "PlannerProposalView",
     "PossibleActionEvaluationView",

@@ -31,7 +31,15 @@ planner-attempt ledger.
   - task summary
   - latest task headline
   - latest artifact headline
-- Planner-only traces such as accepted decisions must **not** advance the phase.
+- Planner-only traces must **not** advance the phase:
+  - accepted planner decisions
+  - planner escalation records
+  - founder-help lane markers
+  - founder hint / reject / override bookkeeping
+  - manual recharge records
+- Examples:
+  - resolving approval or completing a bounded task may advance the phase
+  - opening or clearing a founder escalation must not advance the phase by itself
 
 ## Attempt Budget Policy
 
@@ -66,6 +74,8 @@ Planner duplication is handled in two layers.
 - Definition:
   - the same proposal fingerprint is repeated inside the current active planner
     phase, or
+  - the same normalized proposal intent signature is repeated for the same
+    action inside the current active planner phase, or
   - a proposal is submitted after one proposal has already been accepted in the
     same active planner phase and state has not advanced.
 - Result: explicit rejection with
@@ -77,6 +87,11 @@ Planner duplication is handled in two layers.
 - Reopening a planner phase is a founder-controlled action.
 - `manual_recharge` is allowed only when the current active phase is exhausted.
 - Recharge requires an explicit non-blank reason.
+- The founder can inspect `planner recharge-check` before reopening the phase.
+- Recharge guidance must surface the latest failure / rejection / founder-help
+  context that still affects the current phase.
+- Repeated recharge, deterministic runtime blockage, or still-active rejection
+  context require explicit acknowledgement before the phase can be reopened.
 - Recharge resets the active-budget window for the current phase but does not
   delete past attempts.
 - Past attempts remain replayable and auditable.
@@ -91,6 +106,13 @@ Planner proposal governance is separate from executor/runtime failure.
   problems, or provider outages do **not** consume planner proposal budget.
 - Those failures must be tracked through task / observation / artifact state and
   can create a new planning phase later.
+- Repeated **deterministic** execution failure is a special case:
+  - it still does not consume planner proposal budget directly
+  - but once the same deterministic execution blocker repeats without state
+    advancement, the system must open a founder-help escalation lane before it
+    accepts another planner proposal
+  - this keeps the planner/executor boundary honest without blaming the planner
+    for one-off runtime noise
 
 ## Structured Outcome Contract
 
@@ -144,4 +166,4 @@ budget without meaningful progress.
   manual CLI proof more verbose.
 - Exact semantic duplicate detection is still imperfect and remains a separate
   risk.
-- Recharge misuse and phase-reset abuse still require future hardening.
+- Phase-reset abuse still requires future hardening.

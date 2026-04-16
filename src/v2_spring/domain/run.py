@@ -28,6 +28,7 @@ class RiskLevel(StrEnum):
 class RunStatus(StrEnum):
     CREATED = "created"
     WAITING_APPROVAL = "waiting_approval"
+    SUSPENDED = "suspended"
     READY = "ready"
     REJECTED = "rejected"
     RUNNING = "running"

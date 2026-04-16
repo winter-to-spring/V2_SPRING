@@ -39,6 +39,13 @@ planner-only and founder-only bookkeeping such as:
 Those details still belong in the snapshot hash and planner context, but they do
 not count as meaningful advancement.
 
+Regression coverage now proves both sides of the rule:
+
+- meaningful progress such as approval resolution or bounded task completion
+  changes `planner_phase_key`
+- founder escalation bookkeeping, founder hints, and repeated deterministic
+  failure escalations do not
+
 ## Replay / CLI Surface
 
 The CLI now exposes:
@@ -57,8 +64,10 @@ The CLI now exposes:
 
 `RISK-0017` is resolved in this slice.
 
-`RISK-0016` and `RISK-0010` are mitigated but still remain open for broader
-future planner modes.
+`RISK-0016` is resolved in the current founder-help loop.
+
+`RISK-0010` is resolved for the current bounded planner lane and should only be
+reopened if future planner-visible state introduces new advancement signals.
 
 `RISK-0018` remains open and is intentionally deferred until a richer founder
 surface exists.
