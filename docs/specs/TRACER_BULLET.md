@@ -41,6 +41,7 @@ Expected result:
 - an initial `Observation` is recorded
 - an initial `Decision` record explains that the run entered planning
 - the append-only ledger captures all three bootstrap events
+- a pending `Approval` is created so the human can explicitly continue or stop the loop
 
 ### Step 2. Build a state snapshot
 
@@ -101,12 +102,15 @@ Example:
 ```bash
 v2 approval list
 v2 approval resolve <approval-id> --approve
+v2 approval resolve <approval-id> --reject --reason "Do not continue until the repository scope is tighter"
 ```
 
 Expected result:
 - an `Approval` exists in Postgres
 - CLI can show why approval is needed
 - approval or rejection is recorded as a structured event
+- rejection feedback is stored so the next planner loop can reuse it
+- pending approval blocks new non-approval writes until the gate is resolved
 
 ### Step 7. Finalize or replan
 
@@ -162,6 +166,7 @@ It does not need full module graphs or dynamic hiring yet.
 4. Every run is replayable from stored records.
 5. Approval is required before final completion.
 6. Failure is recorded explicitly, not silently skipped.
+7. Pending approval acts as a write barrier for non-approval state mutations.
 
 ## CLI Surfaces Required
 

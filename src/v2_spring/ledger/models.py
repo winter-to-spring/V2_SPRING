@@ -8,6 +8,7 @@ from uuid import uuid4
 from sqlalchemy import DateTime, Enum, ForeignKey, JSON, String, event
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
+from v2_spring.domain.approval import ApprovalStatus
 from v2_spring.domain.decision import DecisionKind
 from v2_spring.domain.observation import ObservationKind
 from v2_spring.domain.run import RiskLevel, RunStatus, UrgencyLevel
@@ -25,6 +26,8 @@ class LedgerEventType(StrEnum):
     RUN_CREATED = "RUN_CREATED"
     OBSERVATION_RECORDED = "OBSERVATION_RECORDED"
     DECISION_RECORDED = "DECISION_RECORDED"
+    APPROVAL_REQUESTED = "APPROVAL_REQUESTED"
+    APPROVAL_RESOLVED = "APPROVAL_RESOLVED"
 
 
 class RunRecord(Base):
@@ -67,6 +70,10 @@ class RunRecord(Base):
         cascade="all, delete-orphan",
     )
     observations: Mapped[list["ObservationRecord"]] = relationship(
+        back_populates="run",
+        cascade="all, delete-orphan",
+    )
+    approvals: Mapped[list["ApprovalRecord"]] = relationship(
         back_populates="run",
         cascade="all, delete-orphan",
     )
@@ -118,6 +125,35 @@ class ObservationRecord(Base):
     )
 
     run: Mapped[RunRecord] = relationship(back_populates="observations")
+
+
+class ApprovalRecord(Base):
+    __tablename__ = "approvals"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("runs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    status: Mapped[ApprovalStatus] = mapped_column(
+        Enum(ApprovalStatus, native_enum=False),
+        nullable=False,
+        default=ApprovalStatus.PENDING,
+    )
+    requested_action: Mapped[str] = mapped_column(String(400), nullable=False)
+    reason: Mapped[str] = mapped_column(String(4000), nullable=False)
+    approve_effect: Mapped[str] = mapped_column(String(4000), nullable=False)
+    reject_effect: Mapped[str] = mapped_column(String(4000), nullable=False)
+    requested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=utc_now,
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolution_reason: Mapped[str | None] = mapped_column(String(4000), nullable=True)
+
+    run: Mapped[RunRecord] = relationship(back_populates="approvals")
 
 
 class EventLedgerRecord(Base):

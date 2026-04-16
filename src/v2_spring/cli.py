@@ -6,6 +6,7 @@ from textwrap import dedent
 from pydantic import ValidationError
 
 from v2_spring.config import load_config
+from v2_spring.domain.approval import ApprovalStatus
 from v2_spring.domain.run import RunCreateInput
 from v2_spring.ledger.store import LedgerStore
 
@@ -55,6 +56,41 @@ def build_parser() -> argparse.ArgumentParser:
     events_parser = run_subparsers.add_parser("events", help="Show ledger events for a run.")
     events_parser.add_argument("run_id", help="Run id to inspect.")
     events_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Override DATABASE_URL for this invocation.",
+    )
+
+    approval_parser = subparsers.add_parser("approval", help="Inspect and resolve approvals.")
+    approval_subparsers = approval_parser.add_subparsers(dest="approval_command")
+
+    approval_list_parser = approval_subparsers.add_parser("list", help="List approvals.")
+    approval_list_parser.add_argument(
+        "--status",
+        default="pending",
+        choices=["pending", "approved", "rejected", "all"],
+        help="Filter approvals by status.",
+    )
+    approval_list_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Override DATABASE_URL for this invocation.",
+    )
+
+    approval_resolve_parser = approval_subparsers.add_parser(
+        "resolve",
+        help="Resolve a pending approval.",
+    )
+    approval_resolve_parser.add_argument("approval_id", help="Approval id to resolve.")
+    resolve_group = approval_resolve_parser.add_mutually_exclusive_group(required=True)
+    resolve_group.add_argument("--approve", action="store_true", help="Approve the request.")
+    resolve_group.add_argument("--reject", action="store_true", help="Reject the request.")
+    approval_resolve_parser.add_argument(
+        "--reason",
+        default=None,
+        help="Optional structured feedback. Required for --reject.",
+    )
+    approval_resolve_parser.add_argument(
         "--database-url",
         default=None,
         help="Override DATABASE_URL for this invocation.",
@@ -127,9 +163,66 @@ def _render_events(run_id: str, store: LedgerStore) -> str:
                 lines.append(f"   details:     {observation.details}")
                 continue
 
+        if event.event_type.value in {"APPROVAL_REQUESTED", "APPROVAL_RESOLVED"}:
+            lines.append(f"   payload:     {event.payload}")
+            continue
+
         lines.append(f"   payload:     {event.payload}")
 
     return "\n".join(lines)
+
+
+def _render_approvals(store: LedgerStore, status_filter: str) -> str:
+    status = None if status_filter == "all" else ApprovalStatus(status_filter)
+    approvals = store.list_approvals(status=status)
+    lines = ["Approvals", "---------"]
+    if not approvals:
+        lines.append("No approvals matched the current filter.")
+        if status_filter != "all":
+            lines.append("Tip: use --status all to include already resolved approvals.")
+        return "\n".join(lines)
+
+    for index, approval in enumerate(approvals, start=1):
+        lines.extend(
+            [
+                "",
+                f"{index}. {approval.id}",
+                f"   run_id:           {approval.run_id}",
+                f"   status:           {approval.status.value}",
+                f"   requested_action: {approval.requested_action}",
+                f"   reason:           {approval.reason}",
+                f"   approve_effect:   {approval.approve_effect}",
+                f"   reject_effect:    {approval.reject_effect}",
+                f"   requested_at:     {approval.requested_at.isoformat()}",
+                f"   resolved_at:      {approval.resolved_at.isoformat() if approval.resolved_at else '-'}",
+                f"   resolution_reason:{approval.resolution_reason if approval.resolution_reason else '-'}",
+            ],
+        )
+    return "\n".join(lines)
+
+
+def _render_resolved_approval(
+    approval_id: str,
+    store: LedgerStore,
+    *,
+    approved: bool,
+    reason: str | None,
+) -> str:
+    approval = store.resolve_approval(approval_id, approved=approved, reason=reason)
+    outcome = "approved" if approved else "rejected"
+    return dedent(
+        f"""\
+        Approval resolved
+        -----------------
+        id:               {approval.id}
+        run_id:           {approval.run_id}
+        new_status:       {approval.status.value}
+        requested_action: {approval.requested_action}
+        outcome:          {outcome}
+        resolution_reason:{approval.resolution_reason if approval.resolution_reason else "-"}
+        resolved_at:      {approval.resolved_at.isoformat() if approval.resolved_at else "-"}
+        """,
+    ).strip()
 
 
 def main() -> None:
@@ -178,6 +271,50 @@ def main() -> None:
         try:
             print(_render_events(args.run_id, store))
         except LookupError as exc:
+            print(str(exc))
+            raise SystemExit(1) from exc
+        return
+
+    if args.command == "approval" and args.approval_command == "list":
+        store = _build_store(args.database_url)
+        print(_render_approvals(store, args.status))
+        return
+
+    if args.command == "approval" and args.approval_command == "resolve":
+        if args.reject and args.reason is None:
+            print("Rejecting an approval requires --reason so the next planner loop can learn from it.")
+            raise SystemExit(2)
+        store = _build_store(args.database_url)
+        try:
+            print(
+                _render_resolved_approval(
+                    args.approval_id,
+                    store,
+                    approved=args.approve,
+                    reason=args.reason,
+                ),
+            )
+        except (LookupError, PermissionError, ValueError) as exc:
+            print(str(exc))
+            raise SystemExit(1) from exc
+        return
+
+    if args.command == "approval" and args.approval_command == "list":
+        store = _build_store(args.database_url)
+        print(_render_approvals(store, args.status))
+        return
+
+    if args.command == "approval" and args.approval_command == "resolve":
+        store = _build_store(args.database_url)
+        try:
+            print(
+                _render_resolved_approval(
+                    args.approval_id,
+                    store,
+                    approved=args.approve,
+                ),
+            )
+        except (LookupError, ValueError) as exc:
             print(str(exc))
             raise SystemExit(1) from exc
         return

@@ -1,5 +1,6 @@
 """Ledger and event recording primitives will live here."""
 from v2_spring.ledger.models import (
+    ApprovalRecord,
     DecisionRecord,
     EventLedgerRecord,
     LedgerEventType,
@@ -9,6 +10,7 @@ from v2_spring.ledger.models import (
 from v2_spring.ledger.store import LedgerStore
 
 __all__ = [
+    "ApprovalRecord",
     "DecisionRecord",
     "EventLedgerRecord",
     "LedgerEventType",

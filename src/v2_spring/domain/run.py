@@ -27,6 +27,9 @@ class RiskLevel(StrEnum):
 
 class RunStatus(StrEnum):
     CREATED = "created"
+    WAITING_APPROVAL = "waiting_approval"
+    READY = "ready"
+    REJECTED = "rejected"
 
 
 class RunCreateInput(BaseModel):
@@ -61,4 +64,3 @@ class RunView(BaseModel):
     risk: RiskLevel
     created_at: datetime
     updated_at: datetime
-
