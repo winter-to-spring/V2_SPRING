@@ -47,7 +47,11 @@ def test_dispatch_isolated_worker_proof_returns_patch_and_receipt(tmp_path: Path
     assert result.task.kind == TaskKind.ISOLATED_WORKER_PROOF
     assert result.task.status == TaskStatus.COMPLETED
     artifact_types = {artifact.artifact_type for artifact in result.artifacts}
-    assert artifact_types == {ArtifactType.UNIFIED_PATCH, ArtifactType.EXECUTION_RECEIPT}
+    assert artifact_types == {
+        ArtifactType.UNIFIED_PATCH,
+        ArtifactType.EXECUTION_RECEIPT,
+        ArtifactType.VALIDATION_RECEIPT,
+    }
 
     patch_artifact = next(artifact for artifact in result.artifacts if artifact.artifact_type == ArtifactType.UNIFIED_PATCH)
     receipt_artifact = next(

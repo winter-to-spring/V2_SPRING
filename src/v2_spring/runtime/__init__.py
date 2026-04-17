@@ -2,6 +2,7 @@
 
 from v2_spring.runtime.containerized_worker import (
     ContainerizedWorkerExecutionError,
+    ContainerizedWorkerPreflightRefusal,
     ContainerizedWorkerReceipt,
     ContainerizedWorkerTimeout,
     execute_containerized_worker_proof,
@@ -16,6 +17,7 @@ from v2_spring.runtime.patch_gate import PatchApplyOutcome, PatchApplyReceipt, a
 
 __all__ = [
     "ContainerizedWorkerExecutionError",
+    "ContainerizedWorkerPreflightRefusal",
     "ContainerizedWorkerReceipt",
     "ContainerizedWorkerTimeout",
     "IsolatedWorkerExecutionError",

@@ -22,7 +22,7 @@ from v2_spring.domain.founder_intervention import (
     FounderInterventionView,
 )
 from v2_spring.domain.observation import ObservationKind
-from v2_spring.domain.patch_intake import PatchResolutionView, PatchReviewView
+from v2_spring.domain.patch_intake import PatchResolutionView, PatchReviewView, PatchWarningCode
 from v2_spring.domain.planner_adapter import (
     ActionProposal,
     EscalationProposal,
@@ -2085,7 +2085,7 @@ def _render_patch_review(review: PatchReviewView) -> str:
     if intake.warnings:
         lines.extend(["", "Warnings", "--------"])
         for warning in intake.warnings:
-            lines.append(f"- {warning.code.value}: {warning.message}")
+            lines.append(f"- [{_patch_warning_severity_label(warning.code)}] {warning.code.value}: {warning.message}")
     if intake.changed_files:
         lines.extend(["", "Touched files", "-------------"])
         for changed_file in intake.changed_files:
@@ -2095,6 +2095,18 @@ def _render_patch_review(review: PatchReviewView) -> str:
     if review.raw_receipt is not None:
         lines.extend(["", "Raw receipt", "-----------", review.raw_receipt.rstrip()])
     return "\n".join(lines)
+
+
+def _patch_warning_severity_label(code: PatchWarningCode) -> str:
+    if code in {
+        PatchWarningCode.DANGEROUS_KEYWORD,
+        PatchWarningCode.SENSITIVE_PATH,
+        PatchWarningCode.CENTRAL_FILE,
+        PatchWarningCode.AUTO_APPLY_BURST,
+        PatchWarningCode.STRUCTURAL_DANGER,
+    }:
+        return "BLOCK"
+    return "WARN"
 
 
 def _render_patch_resolution(resolution: PatchResolutionView) -> str:

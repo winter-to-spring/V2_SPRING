@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "registry_name": "v2_spring_worker_manifest",
+  "runtimes": {
+    "containerized_worker": {
+      "runtime": "containerized_worker",
+      "worker_image_tag": "v2-spring/container-worker-proof:static-v2",
+      "base_image_reference": "docker.io/library/python:3.12-slim@sha256:804ddf3251a60bbf9c92e73b7566c40428d54d0e79d3428194edf40da6521286",
+      "required_tools": [
+        "python"
+      ],
+      "allow_network": false,
+      "supports_multi_file_context": false,
+      "supported_write_scopes": [
+        "single_file"
+      ],
+      "supported_output_kinds": [
+        "unified_patch"
+      ],
+      "log_capture": {
+        "strategy": "sandwich",
+        "max_bytes": 4000,
+        "head_bytes": 1000,
+        "tail_bytes": 3000
+      },
+      "dynamic_admission_tools": [
+        "python"
+      ]
+    }
+  }
+}

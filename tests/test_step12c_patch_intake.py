@@ -39,7 +39,9 @@ def test_patch_review_and_approve_applies_patch_and_records_validation(tmp_path:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     _init_git_workspace(workspace)
-    (workspace / "README.md").write_text("# Demo\n", encoding="utf-8")
+    target = workspace / "src" / "v2_spring" / "ledger" / "demo.py"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("VALUE = 1\n", encoding="utf-8")
 
     store.dispatch_isolated_worker_task(
         run_id=run_id,
@@ -50,14 +52,14 @@ def test_patch_review_and_approve_applies_patch_and_records_validation(tmp_path:
 
     review = store.build_patch_review(run_id)
     assert review.intake.status == PatchIntakeStatus.PENDING
-    assert "README.md" in review.patch_body
+    assert "demo.py" in review.patch_body
     assert review.intake.validation_artifact_id is None
 
     resolution = store.approve_patch_intake(str(review.intake.id))
     assert resolution.intake.status == PatchIntakeStatus.APPLIED
     assert resolution.intake.resolution_code == PatchResolutionCode.FOUNDER_APPROVED
     assert resolution.intake.validation_artifact_id is not None
-    assert "isolated worker proof" in (workspace / "README.md").read_text(encoding="utf-8")
+    assert "isolated worker proof" in target.read_text(encoding="utf-8")
     assert store.get_run(run_id).status.value == "completed"  # type: ignore[union-attr]
     assert any(
         event.event_type == LedgerEventType.PATCH_INTAKE_APPLIED
@@ -71,7 +73,9 @@ def test_patch_reject_reopens_planning_without_touching_workspace(tmp_path: Path
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     _init_git_workspace(workspace)
-    (workspace / "README.md").write_text("# Demo\n", encoding="utf-8")
+    target = workspace / "src" / "v2_spring" / "ledger" / "demo.py"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("VALUE = 1\n", encoding="utf-8")
 
     store.dispatch_isolated_worker_task(
         run_id=run_id,
@@ -88,7 +92,7 @@ def test_patch_reject_reopens_planning_without_touching_workspace(tmp_path: Path
 
     assert resolution.intake.status == PatchIntakeStatus.REJECTED
     assert resolution.intake.resolution_code == PatchResolutionCode.FOUNDER_REJECTED
-    assert "isolated worker proof" not in (workspace / "README.md").read_text(encoding="utf-8")
+    assert "isolated worker proof" not in target.read_text(encoding="utf-8")
     snapshot = store.build_run_snapshot(run_id)
     evaluation = evaluate_possible_actions(snapshot)
     assert any(action.name.value == "replan_from_failed_execution" for action in evaluation.actions)
@@ -100,8 +104,9 @@ def test_patch_approve_rejects_when_workspace_drifted_since_dispatch(tmp_path: P
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     _init_git_workspace(workspace)
-    readme = workspace / "README.md"
-    readme.write_text("# Demo\n", encoding="utf-8")
+    target = workspace / "src" / "v2_spring" / "ledger" / "demo.py"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("VALUE = 1\n", encoding="utf-8")
 
     store.dispatch_isolated_worker_task(
         run_id=run_id,
@@ -110,10 +115,10 @@ def test_patch_approve_rejects_when_workspace_drifted_since_dispatch(tmp_path: P
         timeout_seconds=5,
     )
     review = store.build_patch_review(run_id)
-    readme.write_text("# Demo\nworkspace drifted before apply\n", encoding="utf-8")
+    target.write_text("VALUE = 2\n", encoding="utf-8")
 
     resolution = store.approve_patch_intake(str(review.intake.id))
 
     assert resolution.intake.status == PatchIntakeStatus.REJECTED
     assert resolution.intake.resolution_code == PatchResolutionCode.BASE_HASH_CONFLICT
-    assert "drifted" in readme.read_text(encoding="utf-8")
+    assert "VALUE = 2" in target.read_text(encoding="utf-8")
