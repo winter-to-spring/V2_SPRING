@@ -1172,6 +1172,7 @@ def _render_execution_claim(claim: ExecutionClaimView | None) -> str:
         owner:               {claim.owner}
         status:              {claim.status.value}
         lease_token:         {claim.lease_token}
+        fencing_token:       {claim.fencing_token}
         acquired_at:         {claim.acquired_at.isoformat()}
         heartbeat_at:        {claim.heartbeat_at.isoformat()}
         expires_at:          {claim.expires_at.isoformat()}

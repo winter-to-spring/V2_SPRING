@@ -152,6 +152,9 @@ Observed In:
 - ~~[RISK-0043 Detailed repair feedback may still trap the planner in a bounded but wasteful repair loop](entries/2026-04-17-repair-loop-deadlock-after-detailed-feedback.md)~~
 - ~~[RISK-0044 Lightweight structural scan may create founder friction through false positives](entries/2026-04-17-structural-scan-false-positive-friction.md)~~
 - [RISK-0045 Static protected-path lists may miss semantically central files outside the initial trust boundary](entries/2026-04-17-shadow-centrality-beyond-protected-paths.md)
-- [RISK-0046 Lease TTL may starve long-running work or delay reclaim when ownership lasts too long](entries/2026-04-17-lease-starvation-and-reclaim-deadlock.md)
-- [RISK-0047 Execution claim acquisition may still depend on store-level serialization without stronger atomic CAS semantics](entries/2026-04-17-atomic-claim-failure.md)
-- [RISK-0048 Reclaim may reopen ownership before old worker side-effects are fully fenced](entries/2026-04-17-reclaim-side-effects-without-fencing.md)
+- ~~[RISK-0046 Lease TTL may starve long-running work or delay reclaim when ownership lasts too long](entries/2026-04-17-lease-starvation-and-reclaim-deadlock.md)~~
+- ~~[RISK-0047 Execution claim acquisition may still depend on store-level serialization without stronger atomic CAS semantics](entries/2026-04-17-atomic-claim-failure.md)~~
+- ~~[RISK-0048 Reclaim may reopen ownership before old worker side-effects are fully fenced](entries/2026-04-17-reclaim-side-effects-without-fencing.md)~~
+- [RISK-0049 Lease renewal heartbeats may amplify control-plane write load as worker count grows](entries/2026-04-17-heartbeat-storm-under-lease-renewal.md)
+- ~~[RISK-0050 Lease expiry may become non-deterministic when worker clocks drift from store/server time](entries/2026-04-17-clock-drift-in-lease-expiry.md)~~
+- [RISK-0051 External side-effects may outlive reclaimed lease ownership even when stale results are fenced](entries/2026-04-17-external-side-effect-ghost-after-reclaim.md)

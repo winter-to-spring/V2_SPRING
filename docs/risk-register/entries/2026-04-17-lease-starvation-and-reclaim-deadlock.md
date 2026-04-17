@@ -1,9 +1,9 @@
 # Risk ID: RISK-0046
-Title: Lease TTL may starve long-running work or delay reclaim when ownership lasts too long
+Title: ~~Lease TTL may starve long-running work or delay reclaim when ownership lasts too long~~
 Class: Before Scale
-Status: Mitigating
+Status: Resolved
 Owner: Execution scheduler / lease policy
-Observed In: Step 17 lease-aware execution claims
+Observed In: Step 17 lease-aware execution claims, Step 18 lease hardening
 
 ## Description
 
@@ -37,11 +37,14 @@ work to finish, but small enough that reclaim remains useful.
 - add heartbeat or renewal only when longer-lived runtimes are opened
 - consider adaptive TTL once worker classes become more diverse
 
-Current mitigation:
+Current resolution:
 
 - Step 17 derives lease TTL from task timeout plus bounded slack
 - reclaim is pessimistic and founder-visible
 - expired claims can be explicitly reconciled instead of silently lingering
+- Step 18 adds thresholded lease renewal so bounded long-running work can extend
+  ownership without noisy always-on heartbeats
+- renewal and expiry are computed from store/server time, not worker clocks
 
 ## Capability Gate
 - Capability: longer-lived workers / background executors / adaptive lease lanes
@@ -50,17 +53,18 @@ Current mitigation:
   longer tightly bounded by local timeout contracts
 
 ## Issue Link
-- GitHub Issue: #41
+- GitHub Issue: #43
 
 ## Doc Links
-- ADR: ../../adr/0015-lease-aware-execution-claims-and-reclaim.md
-- Design note: ../../implementation-notes/STEP_17_EXECUTION_LEASES_AND_ORPHAN_RECONCILIATION.md
+- ADR: ../../adr/0016-lease-renewal-fencing-and-stale-result-rejection.md
+- Design note: ../../implementation-notes/STEP_18_LEASE_RENEWAL_AND_FENCED_RECLAIM_HARDENING.md
 
 ## Exit Criteria
 
-- lease TTL is explicit for each execution class
+- bounded workers renew only when TTL is genuinely low
 - reclaim does not routinely interrupt legitimate bounded work
-- longer-lived runtimes have renewal/heartbeat semantics before they are opened
+- lease expiry truth remains centralized in the store/server clock
 
 ## Last Updated
 - 2026-04-17
+- 2026-04-17 (resolved in Step 18)
