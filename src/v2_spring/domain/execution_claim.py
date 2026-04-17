@@ -25,6 +25,7 @@ class ExecutionClaimView(BaseModel):
     runtime: str = Field(min_length=1, max_length=120)
     owner: str = Field(min_length=1, max_length=120)
     lease_token: str = Field(min_length=1, max_length=120)
+    fencing_token: int = Field(ge=1)
     status: ExecutionClaimStatus
     acquired_at: datetime
     heartbeat_at: datetime

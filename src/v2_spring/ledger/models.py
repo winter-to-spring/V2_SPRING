@@ -45,8 +45,10 @@ class LedgerEventType(StrEnum):
     PLANNER_ATTEMPT_RECORDED = "PLANNER_ATTEMPT_RECORDED"
     FOUNDER_INTERVENTION_RECORDED = "FOUNDER_INTERVENTION_RECORDED"
     EXECUTION_CLAIM_ACQUIRED = "EXECUTION_CLAIM_ACQUIRED"
+    EXECUTION_CLAIM_RENEWED = "EXECUTION_CLAIM_RENEWED"
     EXECUTION_CLAIM_RELEASED = "EXECUTION_CLAIM_RELEASED"
     EXECUTION_CLAIM_RECLAIMED = "EXECUTION_CLAIM_RECLAIMED"
+    EXECUTION_RESULT_REJECTED = "EXECUTION_RESULT_REJECTED"
 
 
 class RunRecord(Base):
@@ -225,6 +227,8 @@ class TaskRecord(Base):
     )
     summary: Mapped[str] = mapped_column(String(400), nullable=False)
     execution_context_id: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    execution_claim_token: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    execution_claim_fencing_token: Mapped[int | None] = mapped_column(nullable=True)
     command: Mapped[str] = mapped_column(String(400), nullable=False)
     cwd: Mapped[str] = mapped_column(String(4000), nullable=False)
     timeout_seconds: Mapped[int] = mapped_column(nullable=False)

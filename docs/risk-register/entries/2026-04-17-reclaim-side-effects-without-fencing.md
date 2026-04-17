@@ -1,9 +1,9 @@
 # Risk ID: RISK-0048
-Title: Reclaim may reopen ownership before old worker side-effects are fully fenced
+Title: ~~Reclaim may reopen ownership before old worker side-effects are fully fenced~~
 Class: Before Scale
-Status: Mitigating
+Status: Resolved
 Owner: Runtime reclaim / execution isolation
-Observed In: Step 17 reclaim design
+Observed In: Step 17 reclaim design, Step 18 fenced result hardening
 
 ## Description
 
@@ -34,12 +34,16 @@ real ownership cutoff.
 - expand fencing semantics before opening remote or externally side-effectful
   runtimes
 
-Current mitigation:
+Current resolution:
 
 - Step 17 attempts hard container reclaim before marking a containerized claim
   reclaimed
 - reclaim results are recorded in typed ledger/audit events
 - late ownership is not honored after reclaim
+- Step 18 rejects stale completion/failure receipts when claim token/fencing
+  token no longer match the active owner
+- rejected stale results are preserved as receipt artifacts plus typed
+  `EXECUTION_RESULT_REJECTED` evidence
 
 ## Capability Gate
 - Capability: remote or side-effectful runtimes beyond current bounded worker
@@ -49,17 +53,18 @@ Current mitigation:
   producing accepted side-effects after ownership is revoked
 
 ## Issue Link
-- GitHub Issue: #41
+- GitHub Issue: #43
 
 ## Doc Links
-- ADR: ../../adr/0015-lease-aware-execution-claims-and-reclaim.md
-- Design note: ../../implementation-notes/STEP_17_EXECUTION_LEASES_AND_ORPHAN_RECONCILIATION.md
+- ADR: ../../adr/0016-lease-renewal-fencing-and-stale-result-rejection.md
+- Design note: ../../implementation-notes/STEP_18_LEASE_RENEWAL_AND_FENCED_RECLAIM_HARDENING.md
 
 ## Exit Criteria
 
-- reclaim includes runtime-specific fencing for every opened runtime class
-- stale results are deterministically rejected after reclaim
-- reclaim tests prove ownership cutoff rather than just state-table updates
+- stale results are deterministically rejected after reclaim or supersession
+- reclaim includes runtime-specific evidence about hard reclaim attempts
+- replay/audit can explain why a late worker result was refused
 
 ## Last Updated
 - 2026-04-17
+- 2026-04-17 (resolved in Step 18)
