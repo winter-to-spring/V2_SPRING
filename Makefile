@@ -1,4 +1,4 @@
-.PHONY: env-init infra-up infra-down infra-logs venv install run compile test ci-smoke db-upgrade db-current db-history
+.PHONY: env-init env-local env-docker env-vm infra-up infra-down infra-logs venv install run compile test ci-smoke db-upgrade db-current db-history
 
 COMPOSE_FILE=docker-compose.yml
 ALEMBIC_BIN=$(if $(wildcard .venv/bin/alembic),.venv/bin/alembic,alembic)
@@ -8,6 +8,27 @@ env-init:
 		echo ".env already exists"; \
 	else \
 		cp .env.example .env && echo "Created .env from .env.example"; \
+	fi
+
+env-local:
+	@if [ -f .env ] && [ "$${FORCE:-0}" != "1" ]; then \
+		echo ".env already exists; rerun with FORCE=1 to overwrite"; \
+	else \
+		cp infra/env/local.env.example .env && echo "Created .env from infra/env/local.env.example"; \
+	fi
+
+env-docker:
+	@if [ -f .env ] && [ "$${FORCE:-0}" != "1" ]; then \
+		echo ".env already exists; rerun with FORCE=1 to overwrite"; \
+	else \
+		cp infra/env/docker.env.example .env && echo "Created .env from infra/env/docker.env.example"; \
+	fi
+
+env-vm:
+	@if [ -f .env ] && [ "$${FORCE:-0}" != "1" ]; then \
+		echo ".env already exists; rerun with FORCE=1 to overwrite"; \
+	else \
+		cp infra/env/vm.env.example .env && echo "Created .env from infra/env/vm.env.example"; \
 	fi
 
 infra-up:

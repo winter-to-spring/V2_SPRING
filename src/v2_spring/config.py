@@ -15,7 +15,10 @@ load_dotenv()
 class AppConfig:
     """Configuration required by the current CLI slices."""
 
+    app_env: str
+    log_level: str
     database_url: str
+    redis_url: str
     planner_provider: PlannerTransportProvider
     planner_openai_model: str
     planner_anthropic_model: str
@@ -45,7 +48,10 @@ def load_config(database_url_override: str | None = None) -> AppConfig:
         ) from exc
 
     return AppConfig(
+        app_env=(os.getenv("APP_ENV") or "local").strip(),
+        log_level=(os.getenv("LOG_LEVEL") or "info").strip(),
         database_url=database_url,
+        redis_url=(os.getenv("REDIS_URL") or "redis://localhost:6379/0").strip(),
         planner_provider=planner_provider,
         planner_openai_model=(os.getenv("PLANNER_OPENAI_MODEL") or "gpt-4o").strip(),
         planner_anthropic_model=(os.getenv("PLANNER_ANTHROPIC_MODEL") or "claude-3-5-sonnet-latest").strip(),

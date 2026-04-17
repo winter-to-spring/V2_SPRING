@@ -44,7 +44,7 @@ The first milestone is a **CLI-verifiable tracer bullet**.
 ## Quick Start
 
 ```bash
-cp .env.example .env
+make env-local
 make infra-up
 python3 -m venv .venv
 source .venv/bin/activate
@@ -54,10 +54,20 @@ v2-spring doctor
 v2-spring --help
 ```
 
+## Environment Profiles
+
+- local host development: `make env-local`
+- Docker-networked app process: `make env-docker`
+- VM / single-host deployment: `make env-vm`
+
+Environment contract and variable reference:
+- [Environment variables](docs/runbooks/ENVIRONMENT_VARIABLES.md)
+
 ## Key Documents
 
 - [Final direction](docs/charter/FINAL_DIRECTION.md)
 - [Execution plan](docs/architecture/EXECUTION_PLAN.md)
+- [Environment variables](docs/runbooks/ENVIRONMENT_VARIABLES.md)
 - [Founder verification requirements](docs/verification/FOUNDER_VERIFICATION_REQUIREMENTS.md)
 - [Tracer bullet](docs/specs/TRACER_BULLET.md)
 - [ADR index](docs/adr/README.md)
