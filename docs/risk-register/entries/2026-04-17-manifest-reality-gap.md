@@ -52,7 +52,7 @@ dynamic admission checks as containerized worker capabilities broaden.
   just static declarations
 
 ## Issue Link
-- GitHub Issue: #37
+- GitHub Issue: #45
 
 ## Doc Links
 - ADR: ../../adr/0012-container-runtime-provenance-and-guardrails.md

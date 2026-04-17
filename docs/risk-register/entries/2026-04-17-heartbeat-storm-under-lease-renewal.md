@@ -48,7 +48,7 @@ Current mitigation:
   concurrency increase
 
 ## Issue Link
-- GitHub Issue: #43
+- GitHub Issue: #45
 
 ## Doc Links
 - ADR: ../../adr/0016-lease-renewal-fencing-and-stale-result-rejection.md
