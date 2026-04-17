@@ -1,59 +1,56 @@
-# ADR 0019: Postgres Migration And Transactional Concurrency
+# ADR 0019: Postgres Migration과 Transactional Concurrency
 
-## Status
+## 상태
 
 Accepted
 
-## Context
+## 배경
 
-By Step 20, V2_SPRING had a strong single-node control plane, but the primary
-store semantics were still effectively SQLite-first.
+Step 20 시점의 V2_SPRING은 강한 single-node control plane을 갖췄지만, primary
+store semantics는 여전히 사실상 SQLite-first였습니다.
 
-That was sufficient for local development and bounded founder/operator loops,
-but it was no longer a healthy foundation for:
+이것은 로컬 개발과 bounded founder/operator loop에는 충분했지만, 아래를 위한
+건강한 기반은 아니었습니다.
 
 - multi-writer claim / renew / reclaim traffic
-- row-level ownership semantics around execution leases
-- versioned schema evolution for a long-lived operational ledger
+- execution lease 주변의 row-level ownership semantics
+- 장수하는 operational ledger를 위한 versioned schema evolution
 
-Step 21 introduces the first Postgres-oriented slice so the storage layer starts
-matching the concurrency model already designed in Steps 17-20.
+Step 21은 storage layer를 Steps 17-20에서 이미 설계한 concurrency model과
+맞추기 위해, 첫 번째 Postgres-oriented slice를 도입합니다.
 
-## Decision
+## 결정
 
-We adopt the following Step 21 baseline:
+Step 21의 baseline을 아래와 같이 채택합니다.
 
-1. PostgreSQL becomes the intended primary store for multi-writer operation.
-2. Execution-claim hot paths gain dialect-aware row-lock helpers so Postgres can
-   enforce claim ownership through `FOR UPDATE` semantics.
-3. JSON-heavy ledger payloads use a PostgreSQL JSONB variant while preserving
-   SQLite compatibility for local development.
-4. Alembic is introduced as the official schema-versioning path.
-5. Lease / claim / reclaim paths remain the first migration target; LangGraph
-   persistence is deferred until after core ledger semantics are stable on
-   Postgres.
+1. multi-writer operation의 intended primary store는 PostgreSQL이다
+2. execution-claim hot path는 dialect-aware row-lock helper를 가지며,
+   Postgres는 `FOR UPDATE` semantics로 claim ownership을 강제한다
+3. JSON-heavy ledger payload는 SQLite compatibility를 유지하면서도
+   PostgreSQL JSONB variant를 사용한다
+4. Alembic을 공식 schema-versioning 경로로 도입한다
+5. migration 첫 대상은 lease / claim / reclaim path이고, LangGraph persistence는
+   core ledger semantics가 Postgres에서 안정된 뒤로 미룬다
 
-## Consequences
+## 결과
 
-### Positive
+### 긍정적
 
-- lease and fencing logic now has a clearer storage contract on Postgres
-- audit payloads are better positioned for indexed JSON queries on Postgres
-- schema evolution has a versioned migration baseline instead of relying only on
-  implicit ORM bootstrap
-- Step 21 narrows the gap between current single-node behavior and future
-  multi-agent execution
+- lease와 fencing logic이 Postgres 위에서 더 명확한 storage contract를 가진다
+- audit payload가 Postgres의 indexed JSON query에 더 잘 맞는다
+- schema evolution이 implicit ORM bootstrap 대신 versioned migration baseline을 갖는다
+- Step 21은 현재 single-node 동작과 미래 multi-agent execution 사이의 간극을 줄인다
 
-### Negative
+### 부정적
 
-- the repository now carries Alembic scaffolding that must be maintained
-- row-locking paths add dialect-specific behavior to the store
-- connection pool sizing and lock contention still need runtime observation and
-  follow-on hardening
+- 저장소에 유지보수해야 할 Alembic scaffolding이 추가된다
+- row-locking path가 store에 dialect-specific behavior를 더한다
+- connection pool sizing과 lock contention은 여전히 runtime observation과
+  follow-on hardening이 필요하다
 
-## Follow-on
+## 후속
 
-- keep `RISK-0055`, `RISK-0056`, and `RISK-0057` open as mitigating until
-  Postgres-backed runtime behavior is proven end-to-end
-- keep planner/runtime side-effect risks out of scope until networked runtimes
-  are intentionally opened
+- Postgres-backed runtime behavior가 end-to-end로 증명될 때까지
+  `RISK-0055`, `RISK-0056`, `RISK-0057`은 mitigating 상태로 유지한다
+- networked runtime이 의도적으로 열리기 전까지 planner/runtime side-effect
+  리스크는 범위 밖으로 둔다

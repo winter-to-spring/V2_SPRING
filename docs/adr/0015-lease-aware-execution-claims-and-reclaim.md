@@ -1,73 +1,72 @@
-# ADR 0015: Lease-aware execution claims and pessimistic reclaim
+# ADR 0015: Lease-aware Execution Claim과 Pessimistic Reclaim
 
-## Status
+## 상태
 
 Accepted
 
-## Context
+## 배경
 
-By Step 16, V2_SPRING could dispatch increasingly capable workers, but the
-system still lacked a typed ownership model for in-flight execution.
+Step 16 시점에서 V2_SPRING은 점점 더 강한 worker를 dispatch할 수 있었지만,
+in-flight execution에 대한 typed ownership 모델은 아직 없었습니다.
 
-That left three gaps:
+그로 인해 세 가지 공백이 남아 있었습니다.
 
-- competing workers could contend on the same run without a shared claim model
-- approval-sensitive mutations could race with live execution
-- expired or orphaned executions could remain ambiguous unless they were
-  explicitly reclaimed and audited
+- 여러 worker가 shared claim model 없이 같은 run을 두고 경합할 수 있었다
+- approval-sensitive mutation이 live execution과 race를 일으킬 수 있었다
+- expired/orphan execution은 명시적 reclaim과 audit 없이는 여전히 애매했다
 
-The next capability slice needed to answer:
+다음 capability slice는 아래에 답해야 했습니다.
 
-- who owns this execution lane right now
-- until when that ownership remains valid
-- what happens when ownership expires or becomes orphaned
+- 지금 이 execution lane의 주인은 누구인가
+- 그 ownership은 언제까지 유효한가
+- ownership이 만료되거나 orphan이 되면 무슨 일이 일어나는가
 
-## Decision
+## 결정
 
-We introduce a lease-aware execution claim model at the control-plane layer.
+control-plane layer에 lease-aware execution claim model을 도입합니다.
 
-The model includes:
+이 모델은 아래를 포함합니다.
 
-- one execution claim per run
-- typed claim lifecycle:
+- run당 하나의 execution claim
+- typed claim lifecycle
   - `ACTIVE`
   - `RELEASED`
   - `RECLAIMED`
-  - `EXPIRED` reserved for future use
-- lease metadata:
+  - `EXPIRED`는 향후 용도로 예약
+- lease metadata
   - owner
   - runtime
   - lease token
-  - acquired / heartbeat / expiry timestamps
-- lease-aware guards on approval-sensitive mutation lanes
-- claim lifecycle visibility in snapshot, progress surface, replay, and audit
+  - acquired / heartbeat / expiry timestamp
+- approval-sensitive mutation lane에 lease-aware guard 추가
+- snapshot, progress surface, replay, audit에서 claim lifecycle 가시화
 
-We also adopt a **pessimistic reclaim** policy.
+또한 **pessimistic reclaim** 정책을 채택합니다.
 
-- lease TTL includes a small slack window
-- once expiry is observed, the old owner is no longer trusted
-- reclaim attempts runtime-specific hard fencing before ownership is reopened
-- late results are not accepted after reclaim
+- lease TTL에는 작은 slack window가 포함된다
+- expiry가 관측되는 순간 이전 owner는 더 이상 신뢰하지 않는다
+- reclaim은 ownership을 다시 열기 전에 runtime-specific hard fencing을 시도한다
+- reclaim 이후 late result는 받아들이지 않는다
 
-## Consequences
+## 결과
 
-### Positive
+### 긍정적
 
-- competing dispatch becomes a typed refusal instead of an implicit race
-- approval/founder mutations cannot silently interleave with live execution
-- expired claims become reclaimable and founder-visible
-- reclaim outcomes are recorded as explicit audit evidence
+- competing dispatch가 implicit race가 아니라 typed refusal이 된다
+- approval/founder mutation이 live execution과 조용히 interleave되지 않는다
+- expired claim은 reclaim 가능하고 founder-visible해진다
+- reclaim outcome이 명시적인 audit evidence로 기록된다
 
-### Negative
+### 부정적
 
-- lease bookkeeping increases runtime/state complexity
-- TTL design becomes a governance surface in its own right
-- stronger atomic claim semantics and heartbeat policy may still need later
-  hardening before broader multi-worker scale
+- lease bookkeeping이 runtime/state 복잡도를 높인다
+- TTL 설계 자체가 하나의 governance surface가 된다
+- 더 넓은 multi-worker scale 전에는 stronger atomic claim semantics와 heartbeat
+  policy가 추가로 필요할 수 있다
 
-## Follow-up
+## 후속
 
-- Step 17 resolves the current single-node/current-runtime concurrency gap
-- stronger atomic claim semantics remain tracked under `RISK-0047`
-- longer-lived/adaptive lease policy remains tracked under `RISK-0046`
-- reclaim side-effect fencing remains tracked under `RISK-0048`
+- Step 17은 현재 single-node/current-runtime concurrency gap을 닫는다
+- stronger atomic claim semantics는 `RISK-0047`로 계속 추적한다
+- longer-lived/adaptive lease policy는 `RISK-0046`으로 계속 추적한다
+- reclaim side-effect fencing은 `RISK-0048`로 계속 추적한다

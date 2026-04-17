@@ -1,71 +1,71 @@
 # ADR 0009: Production Planner Transport Seam
 
-## Status
+## 상태
 
 Accepted
 
-## Context
+## 배경
 
-Step 10-a proved the planner slot with a scripted transport.
-Step 10-b completed the founder reply lane.
+Step 10-a는 scripted transport로 planner slot을 증명했고, Step 10-b는 founder
+reply lane을 완성했습니다.
 
-The next gap was production reality:
+이후 남은 간극은 production 현실이었습니다.
 
-- real network latency
-- provider-specific structured-output behavior
+- 실제 network latency
+- provider별 structured-output 동작
 - token accounting
-- retry / timeout / cancellation handling
-- sanitization and bounded context windowing
+- retry / timeout / cancellation 처리
+- sanitization과 bounded context windowing
 
-If we connected a real LLM directly to the planner core, provider exceptions and
-SDK semantics would leak across the control plane boundary.
+실제 LLM을 planner core에 직접 연결하면 provider 예외와 SDK semantics가
+control plane 경계를 넘어 새어나오게 됩니다.
 
-## Decision
+## 결정
 
-We introduce a provider-agnostic `StructuredPlannerTransport` seam and keep all
-provider-specific behavior at the adapter edge.
+provider-agnostic한 `StructuredPlannerTransport` seam을 도입하고,
+provider-specific behavior는 adapter edge에만 둡니다.
 
-The first production implementation is **OpenAI-first**, but not
-OpenAI-shaped in the core.
+첫 번째 production 구현은 **OpenAI-first**이지만, core는 OpenAI-shaped가
+아닙니다.
 
-Rules:
+규칙:
 
-- the planner core talks only to `StructuredTransportResponse`
-- provider SDK exceptions are translated into internal typed transport errors
-- prompt bodies are sanitized before transport invocation
-- raw prompt/response bodies are not persisted by default; prompt hashes and
-  transport telemetry are recorded instead
-- prompt payloads are truncated before transport invocation when the bounded
-  context window becomes too large
-- provider/network retry is handled inside the transport adapter and remains
-  separate from planner phase budget accounting
-- a second provider path may be added behind the same seam without changing
-  planner core types
-- local cancellation is normalized into typed transport errors and recorded as
-  bounded orphan-risk audit evidence rather than being treated as a silent drop
+- planner core는 `StructuredTransportResponse`만 상대합니다
+- provider SDK exception은 내부 typed transport error로 번역됩니다
+- prompt body는 transport invocation 전에 sanitization됩니다
+- raw prompt/response body는 기본적으로 저장하지 않고, prompt hash와
+  transport telemetry만 기록합니다
+- bounded context window가 너무 커지면 transport invocation 전에 prompt
+  payload를 truncate합니다
+- provider/network retry는 transport adapter 내부에서 처리하고,
+  planner phase budget accounting과 분리합니다
+- 두 번째 provider는 planner core type을 바꾸지 않고 같은 seam 뒤에 추가할 수
+  있습니다
+- local cancellation은 typed transport error로 정규화되며, silent drop이 아닌
+  bounded orphan-risk audit evidence로 기록됩니다
 
-## Consequences
+## 결과
 
-### Positive
+### 긍정적
 
-- provider/network instability stays outside the planner core
-- transport telemetry becomes replayable without storing raw prompt bodies
-- adding a second provider later does not require changing planner core types
-- single-provider-first implementation is still fast enough to deliver usable
-  production hardening now
+- provider/network 불안정성이 planner core 밖에 머무름
+- raw prompt body를 저장하지 않고도 transport telemetry를 replay 가능하게 남길
+  수 있음
+- 두 번째 provider를 추가해도 planner core type은 바꿀 필요가 없음
+- single-provider-first 구현으로도 지금 필요한 production hardening을 충분히
+  제공할 수 있음
 
-### Negative
+### 부정적
 
-- the first concrete adapter still has vendor-specific behavior that must be
-  watched for lock-in
-- additional providers still need their own concrete translation layers and
-  policy tuning
-- cancellation/orphan behavior is not fully solved by foreground CLI handling
-- prompt truncation may trade completeness for bounded cost and latency
+- 첫 concrete adapter는 여전히 vendor-specific behavior를 가지고 있으므로
+  lock-in을 계속 감시해야 함
+- 다른 provider는 각자 translation layer와 policy tuning이 필요함
+- foreground CLI handling만으로는 cancellation/orphan behavior가 완전히 해결되지 않음
+- prompt truncation은 bounded cost/latency를 위해 completeness를 일부 희생할 수 있음
 
-## Follow-up
+## 후속
 
-- Step 10-c implements the first concrete OpenAI transport and telemetry path
-- the seam is now validated by both OpenAI-style JSON schema transport and an
-  Anthropic-style tool-use transport path in tests
-- cancellation/orphan semantics remain an explicit risk before scale
+- Step 10-c가 첫 번째 concrete OpenAI transport와 telemetry path를 구현한다
+- 현재 seam은 OpenAI-style JSON schema transport와 Anthropic-style tool-use
+  transport path 양쪽 테스트로 검증된다
+- cancellation/orphan semantics는 여전히 before-scale 리스크로 남는다

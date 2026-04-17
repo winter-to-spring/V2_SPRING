@@ -8,6 +8,8 @@ from hashlib import sha256
 import json
 from pathlib import Path
 import re
+import threading
+import time
 import textwrap
 from typing import Iterator
 from uuid import uuid4
@@ -84,7 +86,7 @@ from v2_spring.domain.routing import (
     derive_requirements_for_snapshot,
     route_task,
 )
-from v2_spring.domain.run import RunCreateInput, RunStatus, RunView
+from v2_spring.domain.run import RiskLevel, RunCreateInput, RunStatus, RunView, UrgencyLevel
 from v2_spring.domain.runtime_trust import RuntimeTrustMode, RuntimeTrustView
 from v2_spring.domain.snapshot import (
     ArtifactHeadlineView,
@@ -195,9 +197,78 @@ class SchemaStatus:
     missing_tables: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class PostgresPoolStatus:
+    """Compact pool diagnostics suitable for founder/operator doctor surfaces."""
+
+    pool_size: int | None
+    checked_out: int | None
+    checked_in: int | None
+    current_overflow: int | None
+    max_overflow: int | None
+    utilization_ratio: float | None
+
+
+@dataclass(frozen=True)
+class PostgresContentionStatus:
+    """Compact live PostgreSQL contention snapshot."""
+
+    total_connections: int
+    active_connections: int
+    lock_waiting_connections: int
+    idle_in_transaction_connections: int
+    longest_transaction_ms: float
+    max_connections: int | None
+
+
+@dataclass(frozen=True)
+class DatabaseDoctorReport:
+    """Unified database health report used by the Step 22 doctor surface."""
+
+    schema: SchemaStatus
+    controller_db_boundary: str
+    blocked_worker_env_vars: tuple[str, ...]
+    postgres_pool: PostgresPoolStatus | None = None
+    postgres_contention: PostgresContentionStatus | None = None
+
+
+@dataclass(frozen=True)
+class PostgresContentionSmokeResult:
+    """Result bundle for a live PostgreSQL contention smoke probe."""
+
+    hold_seconds: float
+    lock_waiting_observed: bool
+    peak_lock_waiting_connections: int
+    contender_latency_ms: float
+    peak_checked_out_connections: int | None
+    peak_connection_utilization_ratio: float | None
+    renewed_successfully: bool
+
+
+@dataclass(frozen=True)
+class Step22ContentionFixture:
+    """Temporary live rows used to exercise contention safely against PostgreSQL."""
+
+    run_id: str
+    execution_context_id: str
+    lease_token: str
+    fencing_token: int
+    timeout_seconds: int
+
+
 class LedgerStore:
     """Typed persistence boundary for V2_SPRING tracer-bullet state and events."""
 
+    _WORKER_DB_BOUNDARY = "controller_mediated"
+    _BLOCKED_WORKER_ENV_VARS = (
+        "DATABASE_URL",
+        "REDIS_URL",
+        "PGHOST",
+        "PGPORT",
+        "PGUSER",
+        "PGPASSWORD",
+        "PGDATABASE",
+    )
     _DEFAULT_APPROVAL_TIMEOUT = timedelta(hours=24)
     # Approval should pause stateful progression, not blind the system.
     _APPROVAL_SAFE_OBSERVATION_KINDS = frozenset(
@@ -260,6 +331,14 @@ class LedgerStore:
     def supports_jsonb(self) -> bool:
         return self._dialect_name == "postgresql"
 
+    @property
+    def worker_db_boundary(self) -> str:
+        return self._WORKER_DB_BOUNDARY
+
+    @property
+    def blocked_worker_env_vars(self) -> tuple[str, ...]:
+        return self._BLOCKED_WORKER_ENV_VARS
+
     def inspect_schema_status(self) -> SchemaStatus:
         expected_tables = tuple(sorted(Base.metadata.tables.keys()))
         with self._engine.begin() as connection:
@@ -292,6 +371,87 @@ class LedgerStore:
             migration_controlled=migration_controlled,
             current_revision=current_revision,
             missing_tables=missing_tables,
+        )
+
+    def inspect_database_doctor(self) -> DatabaseDoctorReport:
+        schema = self.inspect_schema_status()
+        pool_status = self._inspect_pool_status()
+        contention_status: PostgresContentionStatus | None = None
+        if self._dialect_name == "postgresql" and schema.ready:
+            with self._engine.begin() as connection:
+                contention_status = self._inspect_postgres_contention_status(connection)
+        return DatabaseDoctorReport(
+            schema=schema,
+            controller_db_boundary=self.worker_db_boundary,
+            blocked_worker_env_vars=self.blocked_worker_env_vars,
+            postgres_pool=pool_status,
+            postgres_contention=contention_status,
+        )
+
+    def _inspect_pool_status(self) -> PostgresPoolStatus | None:
+        pool = self._engine.pool
+        size_getter = getattr(pool, "size", None)
+        checked_out_getter = getattr(pool, "checkedout", None)
+        checked_in_getter = getattr(pool, "checkedin", None)
+        overflow_getter = getattr(pool, "overflow", None)
+        if not callable(size_getter) or not callable(checked_out_getter):
+            return None
+
+        pool_size = int(size_getter())
+        checked_out = int(checked_out_getter())
+        checked_in = int(checked_in_getter()) if callable(checked_in_getter) else None
+        current_overflow = int(overflow_getter()) if callable(overflow_getter) else None
+        max_overflow_raw = getattr(pool, "_max_overflow", None)  # noqa: SLF001
+        max_overflow = int(max_overflow_raw) if isinstance(max_overflow_raw, int) else None
+
+        available_capacity = pool_size
+        if current_overflow is not None and current_overflow > 0:
+            available_capacity += current_overflow
+        utilization_ratio: float | None = None
+        if available_capacity > 0:
+            utilization_ratio = min(1.0, checked_out / available_capacity)
+
+        return PostgresPoolStatus(
+            pool_size=pool_size,
+            checked_out=checked_out,
+            checked_in=checked_in,
+            current_overflow=current_overflow,
+            max_overflow=max_overflow,
+            utilization_ratio=utilization_ratio,
+        )
+
+    @staticmethod
+    def _inspect_postgres_contention_status(connection) -> PostgresContentionStatus:
+        activity = connection.execute(
+            text(
+                """
+                SELECT
+                    COUNT(*) AS total_connections,
+                    COUNT(*) FILTER (WHERE state = 'active') AS active_connections,
+                    COUNT(*) FILTER (WHERE wait_event_type = 'Lock') AS lock_waiting_connections,
+                    COUNT(*) FILTER (WHERE state = 'idle in transaction') AS idle_in_transaction_connections,
+                    COALESCE(
+                        MAX(EXTRACT(EPOCH FROM (clock_timestamp() - xact_start)) * 1000)
+                            FILTER (WHERE xact_start IS NOT NULL),
+                        0
+                    ) AS longest_transaction_ms
+                FROM pg_stat_activity
+                WHERE datname = current_database()
+                """,
+            ),
+        ).mappings().one()
+        max_connections_raw = connection.execute(text("SHOW max_connections")).scalar_one()
+        try:
+            max_connections = int(max_connections_raw)
+        except (TypeError, ValueError):  # pragma: no cover - defensive guard
+            max_connections = None
+        return PostgresContentionStatus(
+            total_connections=int(activity["total_connections"] or 0),
+            active_connections=int(activity["active_connections"] or 0),
+            lock_waiting_connections=int(activity["lock_waiting_connections"] or 0),
+            idle_in_transaction_connections=int(activity["idle_in_transaction_connections"] or 0),
+            longest_transaction_ms=float(activity["longest_transaction_ms"] or 0.0),
+            max_connections=max_connections,
         )
 
     def ensure_schema(self) -> None:
@@ -356,6 +516,183 @@ class LedgerStore:
             raise
         finally:
             session.close()
+
+    def run_postgres_contention_smoke(
+        self,
+        *,
+        hold_seconds: float = 1.0,
+    ) -> PostgresContentionSmokeResult:
+        self.ensure_schema()
+        if self._dialect_name != "postgresql":
+            raise RuntimeError("Postgres contention smoke requires a PostgreSQL DATABASE_URL.")
+
+        fixture = self._create_step22_contention_fixture()
+        blocker_ready = threading.Event()
+        contender_started = threading.Event()
+        contender_done = threading.Event()
+        contender_latency_ms = 0.0
+        renewed_successfully = False
+        contender_error: list[BaseException] = []
+
+        def _blocker() -> None:
+            session = self._session_factory()
+            try:
+                run = self._load_run_for_claim_mutation(session, fixture.run_id)
+                if run is None:
+                    raise RuntimeError("Step 22 contention smoke run disappeared before lock acquisition.")
+                claim = self._load_execution_claim(
+                    session,
+                    fixture.run_id,
+                    for_update=True,
+                    dialect_name=self._dialect_name,
+                )
+                if claim is None:
+                    raise RuntimeError("Step 22 contention smoke claim disappeared before lock acquisition.")
+                blocker_ready.set()
+                time.sleep(hold_seconds)
+                session.rollback()
+            except BaseException as exc:  # pragma: no cover - defensive thread guard
+                contender_error.append(exc)
+                blocker_ready.set()
+            finally:
+                session.close()
+
+        def _contender() -> None:
+            nonlocal contender_latency_ms, renewed_successfully
+            contender_started.set()
+            started_at = time.perf_counter()
+            try:
+                renewed = self.renew_execution_claim(
+                    run_id=fixture.run_id,
+                    execution_context_id=fixture.execution_context_id,
+                    lease_token=fixture.lease_token,
+                    fencing_token=fixture.fencing_token,
+                    timeout_seconds=fixture.timeout_seconds,
+                    owner="step22_contention_smoke",
+                )
+                renewed_successfully = renewed is not None
+            except BaseException as exc:  # pragma: no cover - defensive thread guard
+                contender_error.append(exc)
+            finally:
+                contender_latency_ms = (time.perf_counter() - started_at) * 1000
+                contender_done.set()
+
+        blocker = threading.Thread(target=_blocker, name="step22-blocker", daemon=True)
+        contender = threading.Thread(target=_contender, name="step22-contender", daemon=True)
+        peak_lock_waiting_connections = 0
+        peak_checked_out_connections: int | None = None
+        peak_connection_utilization_ratio: float | None = None
+        join_timeout = max(hold_seconds + 1.0, 3.0)
+        try:
+            blocker.start()
+            if not blocker_ready.wait(timeout=join_timeout):
+                raise RuntimeError("Step 22 contention smoke failed to acquire the blocker lease lock in time.")
+            contender.start()
+            if not contender_started.wait(timeout=1.0):
+                raise RuntimeError("Step 22 contention smoke contender did not start in time.")
+
+            poll_deadline = time.monotonic() + join_timeout
+            while not contender_done.is_set() and time.monotonic() < poll_deadline:
+                doctor = self.inspect_database_doctor()
+                if doctor.postgres_contention is not None:
+                    peak_lock_waiting_connections = max(
+                        peak_lock_waiting_connections,
+                        doctor.postgres_contention.lock_waiting_connections,
+                    )
+                if doctor.postgres_pool is not None:
+                    if doctor.postgres_pool.checked_out is not None:
+                        peak_checked_out_connections = max(
+                            peak_checked_out_connections or 0,
+                            doctor.postgres_pool.checked_out,
+                        )
+                    if doctor.postgres_pool.utilization_ratio is not None:
+                        current_ratio = doctor.postgres_pool.utilization_ratio
+                        if (
+                            peak_connection_utilization_ratio is None
+                            or current_ratio > peak_connection_utilization_ratio
+                        ):
+                            peak_connection_utilization_ratio = current_ratio
+                time.sleep(0.05)
+
+            blocker.join(timeout=join_timeout)
+            contender.join(timeout=join_timeout)
+            if blocker.is_alive() or contender.is_alive():
+                raise RuntimeError("Step 22 contention smoke did not finish cleanly.")
+            if contender_error:
+                raise RuntimeError("Step 22 contention smoke hit an execution error.") from contender_error[0]
+            return PostgresContentionSmokeResult(
+                hold_seconds=hold_seconds,
+                lock_waiting_observed=peak_lock_waiting_connections > 0,
+                peak_lock_waiting_connections=peak_lock_waiting_connections,
+                contender_latency_ms=contender_latency_ms,
+                peak_checked_out_connections=peak_checked_out_connections,
+                peak_connection_utilization_ratio=peak_connection_utilization_ratio,
+                renewed_successfully=renewed_successfully,
+            )
+        finally:
+            if blocker.is_alive():
+                blocker.join(timeout=join_timeout)
+            if contender.is_alive():
+                contender.join(timeout=join_timeout)
+            self._cleanup_step22_contention_fixture(fixture.run_id)
+
+    def _create_step22_contention_fixture(self) -> Step22ContentionFixture:
+        now = utc_now()
+        with self.session() as session:
+            run = RunRecord(
+                project="step22-smoke",
+                goal="Prove PostgreSQL contention diagnostics.",
+                status=RunStatus.RUNNING,
+                urgency=UrgencyLevel.NORMAL,
+                risk=RiskLevel.MEDIUM,
+            )
+            session.add(run)
+            session.flush()
+            execution_context_id = f"ctx-step22-{uuid4().hex[:10]}"
+            task = TaskRecord(
+                run_id=run.id,
+                decision_id=None,
+                kind=TaskKind.CONTAINERIZED_WORKER_PROOF,
+                status=TaskStatus.RUNNING,
+                summary="Step 22 contention smoke task",
+                execution_context_id=execution_context_id,
+                command="step22_contention_smoke",
+                cwd="/tmp/v2-spring",
+                timeout_seconds=15,
+                started_at=now,
+            )
+            session.add(task)
+            session.flush()
+            lease_token = f"lease-{uuid4().hex}"
+            claim = ExecutionClaimRecord(
+                run_id=run.id,
+                task_id=task.id,
+                runtime=ExecutionRuntime.CONTAINERIZED_WORKER.value,
+                owner="step22_contention_smoke",
+                lease_token=lease_token,
+                status=ExecutionClaimStatus.ACTIVE,
+                acquired_at=now - timedelta(seconds=5),
+                heartbeat_at=now - timedelta(seconds=5),
+                expires_at=now + timedelta(seconds=1),
+                released_at=None,
+                reclaim_reason=None,
+                version=1,
+            )
+            task.execution_claim_token = lease_token
+            task.execution_claim_fencing_token = 1
+            session.add(claim)
+            session.flush()
+            return Step22ContentionFixture(
+                run_id=run.id,
+                execution_context_id=execution_context_id,
+                lease_token=lease_token,
+                fencing_token=1,
+                timeout_seconds=task.timeout_seconds,
+            )
+
+    def _cleanup_step22_contention_fixture(self, run_id: str) -> None:
+        with self._engine.begin() as connection:
+            connection.execute(text("DELETE FROM runs WHERE id = :run_id"), {"run_id": run_id})
 
     @classmethod
     def _build_execution_claim_ttl(cls, timeout_seconds: int) -> timedelta:
@@ -462,10 +799,19 @@ class LedgerStore:
             ),
         )
 
-    def _load_run_for_claim_mutation(self, session: Session, run_id: str) -> RunRecord | None:
+    def _load_run_for_claim_mutation(
+        self,
+        session: Session,
+        run_id: str,
+        *,
+        skip_locked: bool = False,
+    ) -> RunRecord | None:
         if self.supports_row_level_locking:
             return session.scalar(
-                select(RunRecord).where(RunRecord.id == run_id).with_for_update().limit(1),
+                select(RunRecord)
+                .where(RunRecord.id == run_id)
+                .with_for_update(skip_locked=skip_locked)
+                .limit(1),
             )
         return session.get(RunRecord, run_id)
 
@@ -817,6 +1163,9 @@ class LedgerStore:
         execution_context_id: str,
         reason: str,
     ) -> None:
+        run = self._load_run_for_claim_mutation(session, run_id)
+        if run is None:
+            return
         claim = self._load_execution_claim(
             session,
             run_id,
@@ -998,16 +1347,29 @@ class LedgerStore:
     def reclaim_execution_claims(self, run_id: str | None = None) -> list[ExecutionClaimView]:
         self.ensure_schema()
         with self.session() as session:
-            statement = select(ExecutionClaimRecord).where(ExecutionClaimRecord.status == ExecutionClaimStatus.ACTIVE)
+            statement = select(ExecutionClaimRecord.run_id).where(
+                ExecutionClaimRecord.status == ExecutionClaimStatus.ACTIVE,
+            )
             if run_id is not None:
                 statement = statement.where(ExecutionClaimRecord.run_id == run_id)
-            if self.supports_row_level_locking:
-                statement = statement.with_for_update(skip_locked=True)
-            claims = list(session.scalars(statement.order_by(ExecutionClaimRecord.acquired_at.asc())).all())
+            candidate_run_ids = list(session.scalars(statement.order_by(ExecutionClaimRecord.acquired_at.asc())).all())
             reclaimed: list[ExecutionClaimView] = []
-            for claim in claims:
-                run = session.get(RunRecord, claim.run_id)
+            for candidate_run_id in candidate_run_ids:
+                run = self._load_run_for_claim_mutation(
+                    session,
+                    candidate_run_id,
+                    skip_locked=True,
+                )
                 if run is None:
+                    continue
+                claim = self._load_execution_claim(
+                    session,
+                    candidate_run_id,
+                    for_update=True,
+                    skip_locked=True,
+                    dialect_name=self._dialect_name,
+                )
+                if claim is None or claim.status != ExecutionClaimStatus.ACTIVE:
                     continue
                 claim_expires_at = self._coerce_utc_datetime(claim.expires_at)
                 if claim_expires_at is not None and claim_expires_at > utc_now():

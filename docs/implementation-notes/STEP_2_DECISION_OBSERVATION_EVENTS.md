@@ -43,3 +43,12 @@ records.
 - planner-produced decisions
 
 Those belong to later slices.
+
+## Feedback Incorporated
+
+- Later review pressure favored a directly replayable event timeline over an
+  early derived read model.
+- That feedback validated Step 2's decision to make observations and decisions
+  durable first, then derive human-readable history from ledger data.
+- The "show the process, do not infer it later" rule from this slice carried
+  forward into replay, planner governance, and founder/operator surfaces.

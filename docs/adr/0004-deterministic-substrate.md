@@ -1,26 +1,30 @@
-# ADR-0004: Deterministic Substrate
+# ADR-0004: 결정론적 Substrate
 
-## Status
+## 상태
+
 Accepted
 
-## Context
-Autonomous planning cannot be trusted if state mutation is non-deterministic or
-unreplayable.
+## 배경
 
-## Decision
-- Postgres is the durable record store.
-- Redis is coordination only.
-- Planners do not mutate state directly.
-- Deterministic executors perform state transitions.
-- Deterministic read-side engines such as `evaluate_possible_actions()` must
-  remain pure and side-effect free.
-- V2 starts with a hybrid persistence model:
-  - state tables for current truth
-  - append-only event ledger for replay and audit
-- Decisions and observations are recorded in typed tables and mirrored into the
-  append-only ledger as immutable process evidence.
+상태 변경이 비결정론적이거나 replay 불가능하다면 자율 planning은 신뢰할 수
+없습니다.
 
-## Consequences
-- Queue, lease, cancel, retry, and resume semantics must be explicit.
-- Reconciliation and replay are mandatory.
-- Planner/executor contracts must be narrow and testable.
+## 결정
+
+- Postgres는 durable record store가 됩니다.
+- Redis는 coordination 전용입니다.
+- planner는 상태를 직접 변경하지 않습니다.
+- deterministic executor가 상태 전이를 수행합니다.
+- `evaluate_possible_actions()` 같은 deterministic read-side engine은 순수하고
+  side-effect가 없어야 합니다.
+- V2는 hybrid persistence model로 시작합니다.
+  - 현재 진실을 담는 state table
+  - replay와 audit을 위한 append-only event ledger
+- Decision과 Observation은 typed table에 기록되고, immutable process
+  evidence로서 append-only ledger에도 미러링됩니다.
+
+## 결과
+
+- queue, lease, cancel, retry, resume semantics는 명시적이어야 합니다.
+- reconciliation과 replay는 필수입니다.
+- planner / executor 계약은 좁고 테스트 가능해야 합니다.

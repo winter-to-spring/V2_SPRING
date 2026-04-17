@@ -61,3 +61,13 @@ just mirroring raw run status.
   escape hatches
 - `RISK-0018` is addressed by narrower founder reply commands and file-based
   input support for multiline hints/reasons
+
+## Feedback Incorporated
+
+- Strong feedback on "lying dashboards" pushed this slice to keep the progress
+  surface as an on-the-fly projection from ledger/state, not a second mutable
+  store.
+- Audit hygiene feedback also required compact summaries to preserve
+  raw/trace escape hatches instead of over-sanitizing founder context.
+- Founder CLI ergonomics feedback directly led to file-based multiline input
+  support for hints and reasons.

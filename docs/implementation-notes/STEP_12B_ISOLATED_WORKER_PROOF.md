@@ -58,3 +58,12 @@ as silent runtime crashes.
 - `RISK-0023`: resolved for the Step 12-b proof boundary
 - `RISK-0024`: resolved through timeout reclaim and temp-file log capture
 - `RISK-0027`: remains open before unrestricted bypass-style workers can scale
+
+## Feedback Incorporated
+
+- Isolation feedback pushed this slice toward strengthened soft isolation
+  rather than pretending a simple subprocess CWD was a real sandbox.
+- Timeout and I/O feedback directly led to process-group reclaim and temp-file
+  stdout/stderr capture instead of pipe-based streaming.
+- Full OS/container isolation was intentionally deferred into Step 13 as a
+  separate risk closure target.

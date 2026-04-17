@@ -42,3 +42,13 @@
 - `RISK-0021` remains mitigating because local cancellation is now better
   classified and finalized, but remote provider orphan exposure still exists
   before scale
+
+## Feedback Incorporated
+
+- Freshness feedback pushed this slice to stop trusting "recent enough"
+  snapshots and instead require typed anchors on mutation paths.
+- Cancellation feedback also forced a distinction between interrupt intent and
+  final reconciliation so replay no longer pretends local abort means upstream
+  termination.
+- That kept the current scope honest while leaving true provider-side orphan
+  handling as a later scale concern.

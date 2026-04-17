@@ -1,45 +1,48 @@
 # Risk ID: RISK-0057
-Title: Postgres write lock contention may reduce execution throughput under claim and renewal load
+Title: claim과 renewal 부하 아래에서 Postgres write lock contention이 execution throughput을 떨어뜨릴 수 있음
 Class: Before Next Phase
 Status: Mitigating
 Owner: Storage / Execution plane
 Observed In: Step 21 planning
 
-## Description
+## 설명
 
-Postgres will give V2_SPRING stronger transactional guarantees, but the lease
-and audit design can still become inefficient if claims, renewals, and event
-writes contend on the same rows or indexes too aggressively.
+Postgres는 V2_SPRING에 더 강한 transactional guarantee를 주지만, claim,
+renewal, event write가 같은 row나 index에서 과하게 경합하면 lease와 audit
+설계 자체가 비효율적일 수 있습니다.
 
-This is especially likely once heartbeat/renew traffic and execution-claim
-updates are mixed with normal audit writes.
+특히 heartbeat/renew traffic과 execution-claim update가 일반 audit write와
+섞이기 시작하면 이런 일이 더 잘 발생합니다.
 
-## Impact
+## 영향
 
-- claim acquisition latency may spike under worker concurrency
-- healthy renewals may slow down unrelated founder/operator flows
-- the control plane may become correct but operationally sluggish
+- worker concurrency 아래에서 claim acquisition latency가 급등할 수 있음
+- 정상적인 renewal이 unrelated founder/operator flow를 느리게 만들 수 있음
+- control plane은 논리적으로 맞더라도 운영적으로 둔해질 수 있음
 
-## Why This Matters
+## 왜 중요한가
 
-Correctness is the first goal of Step 21, but we also need a path that remains
-usable once multi-writer execution opens wider.
+정확성은 Step 21의 첫 목표지만, multi-writer execution이 더 넓게 열렸을 때도
+쓸 수 있는 경로가 필요합니다.
 
-## Suggested Mitigation
+## 권장 완화책
 
-- keep thresholded renewal semantics from Step 19
-- design indexes for claim lookup, expiry, and active-claim checks explicitly
-- validate high-contention paths with targeted concurrency tests
-- prefer short transactions and narrow lock scope on claim/reclaim hot paths
+- Step 19의 thresholded renewal semantics를 유지한다
+- claim lookup, expiry, active-claim check용 index를 명시적으로 설계한다
+- targeted concurrency test로 high-contention path를 검증한다
+- claim/reclaim hot path에서는 짧은 transaction과 좁은 lock scope를 선호한다
 
-Current mitigation:
+현재 완화 상태:
 
-- Step 21 adds Postgres-aware row locking on claim acquisition, renewal, and
-  reclaim paths
-- execution-claim tables now carry explicit Postgres-friendly indexes for
-  status/expiry and runtime/status lookups
-- targeted regression tests now cover the generated locking SQL and JSONB
-  variants used by the ledger
+- Step 21은 claim acquisition, renewal, reclaim path에 Postgres-aware row locking을 추가함
+- execution-claim table은 이제 status/expiry, runtime/status lookup용
+  Postgres 친화 index를 명시적으로 가짐
+- targeted regression test가 generated locking SQL과 ledger에서 쓰는 JSONB
+  variant를 검증함
+- Step 22는 release/reclaim hot path 전반에 걸쳐 run-first / claim-second lock
+  ordering을 더 명시적으로 만듦
+- Step 22는 실제 PostgreSQL 백엔드에서 lock waiting과 contender latency를
+  측정하는 live contention smoke probe를 추가함
 
 ## Capability Gate
 - Capability: multi-writer execution with Postgres as the primary store
@@ -52,14 +55,17 @@ Current mitigation:
 
 ## Doc Links
 - ADR: ../../adr/0019-postgres-migration-and-transactional-concurrency.md
+- ADR: ../../adr/0020-postgres-contention-soak-and-controller-boundary.md
 - Design note: ../../issues/STEP_21_POSTGRES_MIGRATION_AND_TRANSACTIONAL_CONCURRENCY.md
 - Design note: ../../implementation-notes/STEP_21_POSTGRES_MIGRATION_AND_TRANSACTIONAL_CONCURRENCY.md
+- Design note: ../../implementation-notes/STEP_22_POSTGRES_CONTENTION_AND_CONTROLLER_DB_BOUNDARY.md
 
-## Exit Criteria
+## 종료 기준
 
-- claim and renewal hot paths have explicit index/transaction strategy
-- concurrency regression tests show acceptable contention behavior
+- claim과 renewal hot path가 명시적인 index/transaction 전략을 가진다
+- concurrency regression test가 수용 가능한 contention 동작을 보여준다
 
 ## Last Updated
 - 2026-04-17
 - 2026-04-17 (mitigating in Step 21)
+- 2026-04-17 (mitigating with Step 22 contention diagnostics and lock-order hardening)

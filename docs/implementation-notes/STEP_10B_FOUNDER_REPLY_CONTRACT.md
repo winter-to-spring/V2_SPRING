@@ -71,3 +71,11 @@ reopened if future planner-visible state introduces new advancement signals.
 
 `RISK-0018` remains open and is intentionally deferred until a richer founder
 surface exists.
+
+## Feedback Incorporated
+
+- Feedback on founder intervention ambiguity pushed this slice to make `hint`,
+  `override`, and `reject` separate, typed paths.
+- That same pressure exposed CLI ergonomics limits for multiline input, which
+  stayed intentionally open until the richer founder/operator surface.
+- The result was a narrower but much more replayable founder-help loop.

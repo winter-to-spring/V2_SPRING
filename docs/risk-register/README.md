@@ -1,75 +1,74 @@
-# Shared Risk Register
+# 공용 리스크 레지스터
 
-The risk register exists so operational and architectural risks do not live in
-one person's memory.
+리스크 레지스터는 운영 리스크와 아키텍처 리스크가 특정 한 사람의 기억 속에만
+남지 않도록 하기 위해 존재합니다.
 
-If another agent, another teammate, or another session picks up this repo,
-they should be able to answer three questions quickly:
+다른 에이전트, 다른 팀원, 혹은 다른 세션이 이 저장소를 이어받더라도 아래 세
+가지를 빠르게 답할 수 있어야 합니다.
 
-1. What risks are already known?
-2. When do they have to be fixed?
-3. What capability should stay gated until they are fixed?
+1. 이미 알려진 리스크는 무엇인가?
+2. 이 리스크는 언제까지 해결해야 하는가?
+3. 어떤 capability가 이 리스크 때문에 아직 gate 상태여야 하는가?
 
-## Operating Rules
+## 운영 규칙
 
-### 1. The register is a shared repo artifact
+### 1. 레지스터는 공용 repo artifact다
 
-Every meaningful risk is recorded in this repo.
+의미 있는 모든 리스크는 이 저장소 안에 기록합니다.
 
-We do not rely on private memory, informal chat, or "we'll remember later"
-promises.
+개인 기억, 비공식 대화, "나중에 기억하자" 같은 약속에 의존하지 않습니다.
 
-### 2. Every risk gets a class
+### 2. 모든 리스크는 class를 가진다
 
-Use one of these classes:
+아래 class 중 하나를 사용합니다.
 
 - `Now`
 - `Before Next Phase`
 - `Before Scale`
 - `Later Hardening`
 
-### 3. Every risk gets a capability gate
+### 3. 모든 리스크는 capability gate를 가진다
 
-The risk entry must say what it blocks.
+각 리스크 엔트리는 무엇을 막고 있는지 반드시 적어야 합니다.
 
-Examples:
+예:
 
-- opening planner/replanner
-- adding background workers
-- increasing agent count
-- exposing a founder surface
+- planner/replanner 열기
+- background worker 추가
+- agent 수 증가
+- founder surface 노출
 
-### 4. Issues are for execution, not for memory
+### 4. 이슈는 실행을 위한 것이지, 기억을 대신하는 것이 아니다
 
-The risk register is the full shared memory.
+리스크 레지스터가 전체 공용 메모리입니다.
 
-GitHub issues are created when a risk becomes an execution slice:
+GitHub issue는 리스크가 실제 실행 슬라이스가 되었을 때 만듭니다.
 
 - `Now`
 - `Before Next Phase`
-- repeated or cross-cutting risks
-- anything that needs implementation rather than passive tracking
+- 반복되거나 여러 단계를 가로지르는 리스크
+- 수동 추적이 아니라 실제 구현이 필요한 항목
 
-### 5. Resolved risks stay visible
+### 5. 해결된 리스크도 계속 보이게 둔다
 
-Resolved risks are not deleted from this register.
+해결된 리스크는 이 레지스터에서 삭제하지 않습니다.
 
-We keep them visible with a strikethrough in the index and in the entry title so
-future readers can see:
+인덱스와 엔트리 제목에 취소선을 남겨, 나중에 보는 사람이 아래를 알 수 있게
+합니다.
 
-- what risk existed
-- when it was noticed
-- and that it was later resolved
+- 어떤 리스크가 존재했는지
+- 언제 발견되었는지
+- 이후 해결되었는지
 
-### 6. Resolve timing follows capability gates, not vague calendar promises
+### 6. 해결 시점은 애매한 일정이 아니라 capability gate를 따른다
 
-We do not say "sometime later" without also saying:
+우리는 "나중 언젠가"라고만 적지 않습니다. 반드시 아래 중 하나와 함께 적습니다.
 
-- before which phase
-- before which capability
-- or before which scale jump
+- 어떤 phase 전에
+- 어떤 capability 전에
+- 어떤 scale jump 전에
 
-## Minimal Entry Template
+## 최소 엔트리 템플릿
 
 ```markdown
 # Risk ID: RISK-0001
@@ -105,7 +104,7 @@ Observed In:
 - YYYY-MM-DD
 ```
 
-## Current Entries
+## 현재 엔트리
 
 - ~~[RISK-0001 Approval timeout / deadlock](entries/2026-04-16-approval-timeout.md)~~
 - ~~[RISK-0002 Approval reject reason missing](entries/2026-04-16-approval-reject-reason.md)~~
@@ -161,3 +160,7 @@ Observed In:
 - [RISK-0055 PostgreSQL connection exhaustion may appear when worker/controller fanout grows](entries/2026-04-17-postgres-connection-exhaustion-under-worker-fanout.md)
 - ~~[RISK-0056 Schema drift may break Postgres migration without versioned migration control](entries/2026-04-17-schema-drift-during-postgres-migration.md)~~
 - [RISK-0057 Postgres write lock contention may reduce execution throughput under claim and renewal load](entries/2026-04-17-postgres-write-lock-contention-under-execution-load.md)
+- ~~[RISK-0058 Postgres multi-table transactional writes may deadlock under contention](entries/2026-04-17-postgres-deadlock-contention-under-multi-table-writes.md)~~
+- [RISK-0059 JSONB-heavy ledger writes may amplify Postgres write cost under audit load](entries/2026-04-17-postgres-jsonb-write-penalty-under-audit-load.md)
+- [RISK-0060 WAL and storage pressure may rise sharply under heartbeat and audit churn](entries/2026-04-17-postgres-wal-and-storage-pressure-under-control-plane-churn.md)
+- [RISK-0061 Controller-mediated DB access may become a throughput bottleneck or SPOF](entries/2026-04-17-controller-throughput-and-spof-under-db-mediation.md)

@@ -66,3 +66,12 @@ The only change is who triggers that strict gate:
 - broader trust scoring remains out of scope
 - medium/high-risk auto-apply remains out of scope
 - per-repo review policy customization remains out of scope
+
+## Feedback Incorporated
+
+- Review-fatigue feedback pushed this slice to open only a bounded auto-apply
+  lane instead of broad review bypass.
+- At the same time, trust feedback required auto-apply to reuse the exact same
+  strict apply and validation path as founder-approved patches.
+- That is why the policy narrows who can trigger the gate, not what the gate
+  does.

@@ -96,3 +96,12 @@ This slice still defers:
 
 Those remain capability-gated and should not be confused with what Step 8
 actually proves.
+
+## Feedback Incorporated
+
+- Later governance feedback favored typed planner proposals and explicit audit
+  on refusal rather than ad-hoc planner output handling.
+- Review pressure also pushed this slice to keep approval-waiting proposals
+  evidence-only so the planner could not mutate through a human gate.
+- This contract became the stable seam for later transport, founder reply, and
+  bounded replanning work.

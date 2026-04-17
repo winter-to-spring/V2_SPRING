@@ -1,57 +1,57 @@
-# ADR 0014: Auto-Apply Trust Hardening And Repair Feedback
+# ADR 0014: Auto-Apply Trust Hardening과 Repair Feedback
 
-## Status
+## 상태
+
 Accepted
 
-## Context
+## 배경
 
-Step 15 opened a bounded auto-apply lane for low-risk patch intake results.
-That removed the founder bottleneck for obviously safe changes, but it also
-exposed new trust gaps:
+Step 15는 low-risk patch intake 결과에 대해 bounded auto-apply lane을 열었습니다.
+덕분에 명백히 안전한 변경은 founder 병목을 줄일 수 있었지만, 동시에 새로운
+trust 공백도 드러났습니다.
 
-- semantically central files could still look small enough for auto-apply
-- the planner could slice one risky change into many trivial patches
-- simple keyword scans could miss obfuscated dangerous patterns
-- detailed validation feedback could improve repair quality while still letting
-  the planner burn time in a bounded but wasteful retry loop
+- 의미상 중앙 파일이 여전히 auto-apply 가능해 보일 수 있다
+- planner가 하나의 위험한 변경을 여러 trivial patch로 쪼개는 방식으로 우회할 수 있다
+- 단순 키워드 스캔은 obfuscated dangerous pattern을 놓칠 수 있다
+- 상세한 validation feedback은 repair 품질을 높이지만, bounded한 wasteful retry
+  loop도 함께 만들 수 있다
 
-## Decision
+## 결정
 
-We harden the bounded auto-apply lane with explicit, replay-visible rules.
+bounded auto-apply lane을 replay-visible한 명시적 규칙으로 강화합니다.
 
-The policy now includes:
+정책은 이제 아래를 포함합니다.
 
-- central/protected file detection that forces founder review even for
-  single-file, low-line-count patches
-- burst detection for repeated auto-apply against the same file or module over a
-  bounded window
-- lightweight structural scan that separates hard block findings from soft
-  warning findings
-- detailed patch repair feedback built from strict apply and validation receipts
-- bounded repair retry quota that escalates to founder guidance when repeated
-  repair attempts do not converge
+- single-file / low-line-count patch라도 central/protected file이면 founder
+  review를 강제하는 규칙
+- 같은 파일이나 모듈에 대해 bounded window 안에서 반복되는 auto-apply를 감지하는
+  burst detection
+- hard block finding과 soft warning finding을 분리하는 lightweight structural
+  scan
+- strict apply / validation receipt로부터 만들어진 detailed patch repair feedback
+- repair 시도가 계속 수렴하지 않을 때 founder guidance로 escalation하는 bounded
+  repair retry quota
 
-We keep this first implementation explicit and deterministic rather than
-score-based.
+첫 구현은 score-based가 아니라 explicit하고 deterministic한 방식으로 유지합니다.
 
-## Consequences
+## 결과
 
-### Positive
+### 긍정적
 
-- the auto-apply lane remains narrow and easier to trust
-- replay and founder surfaces can explain why auto-apply was blocked or
-  rerouted
-- failed auto-apply attempts give the planner materially better repair context
-- repeated repair failure no longer hides behind silent background retry
+- auto-apply lane이 좁고 믿을 만한 범위에 머문다
+- replay와 founder surface가 왜 auto-apply가 막혔는지 또는 reroute되었는지
+  설명할 수 있다
+- 실패한 auto-apply가 planner에 더 유의미한 repair context를 제공한다
+- 반복 repair failure가 조용한 background retry로 숨지 않는다
 
-### Negative
+### 부정적
 
-- patch policy logic becomes more stateful and must stay heavily tested
-- static central-file rules still leave some shadow centrality unmodeled
-- structural scan remains intentionally lightweight and conservative
+- patch policy logic이 더 stateful해지고, 강한 테스트가 계속 필요하다
+- static central-file rule은 여전히 일부 shadow centrality를 모델링하지 못한다
+- structural scan은 의도적으로 lightweight하고 보수적이다
 
-## Follow-up
+## 후속
 
-- richer centrality beyond static protected-file rules remains deferred
-- stronger semantic analysis remains deferred
-- broader trust expansion should stay explicit and bounded rather than implicit
+- static protected-file rule을 넘어서는 richer centrality는 defer한다
+- 더 강한 semantic analysis도 defer한다
+- trust 확장은 implicit하지 않고 explicit하고 bounded한 방식으로만 열어야 한다

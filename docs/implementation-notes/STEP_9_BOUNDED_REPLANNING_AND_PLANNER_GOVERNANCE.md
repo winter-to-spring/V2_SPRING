@@ -126,3 +126,12 @@ Still deferred after Step 9:
 - semantic duplicate equivalence beyond exact fingerprints
 - stronger TOCTOU protection under concurrency
 - planner-facing payload hygiene and sanitization hardening
+
+## Feedback Incorporated
+
+- Feedback on planner loops and invisible retry churn pushed this slice toward
+  explicit budget accounting and replay-visible attempt history.
+- That pressure is why recharge, duplicate handling, and exhaustion became
+  first-class governance concepts instead of hidden adapter behavior.
+- Payload hygiene concerns identified here were deliberately carried forward to
+  Step 11 rather than diluted inside Step 9.

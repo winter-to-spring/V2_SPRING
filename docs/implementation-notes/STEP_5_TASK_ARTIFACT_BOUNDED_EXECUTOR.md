@@ -96,3 +96,12 @@ not leave behind an orphaned result that the ledger cannot explain.
 - planner-selected multi-task execution
 
 Those belong to later execution and scaling slices.
+
+## Feedback Incorporated
+
+- Later execution feedback consistently favored bounded, replayable work units
+  over an early broad executor surface.
+- That validated the Step 5 choice to keep filesystem writes coupled to a
+  transactional artifact/ledger commit with explicit cleanup on failure.
+- The "receipt first, silent orphan never" principle introduced here carried
+  into isolated workers, container runtimes, and patch intake.

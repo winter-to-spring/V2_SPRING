@@ -1,4 +1,4 @@
-# Glossary
+# 용어집
 
-This directory will define stable terms used across the control plane, planner,
-executor, and verification surfaces.
+이 디렉터리는 control plane, planner, executor, verification surface 전반에
+걸쳐 공통으로 쓰이는 안정적인 용어를 정의하는 곳입니다.

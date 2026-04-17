@@ -54,3 +54,12 @@ full timeout/locking design.
 - planner-driven approval requests
 
 Those belong to later slices.
+
+## Feedback Incorporated
+
+- Follow-up feedback around human gates pushed this slice to keep rejection
+  feedback structured and approval blocking explicit instead of implicit.
+- That pressure is why the note already distinguishes a simple approval loop
+  from timeout, lease, and distributed locking concerns.
+- Later approval hardening steps built directly on this stricter Step 3
+  contract rather than replacing it.
