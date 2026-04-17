@@ -133,6 +133,9 @@ Observed In:
 - ~~[RISK-0024 Isolated worker may crash or hang without a reclaim path, leaving running tasks stuck](entries/2026-04-17-silent-worker-crash-reclaim-gap.md)~~
 - [RISK-0025 Founder review may become a throughput bottleneck without risk-based patch intake routing](entries/2026-04-17-patch-review-fatigue-and-routing.md)
 - [RISK-0026 Explicit dispatcher rules may sprawl into a hard-to-audit routing blob as runtimes grow](entries/2026-04-17-routing-policy-sprawl.md)
-- [RISK-0027 Soft-isolated worker proof lacks OS/container-level isolation for unrestricted bypass safety](entries/2026-04-17-lack-of-os-level-worker-isolation.md)
+- ~~[RISK-0027 Soft-isolated worker proof lacks OS/container-level isolation for unrestricted bypass safety](entries/2026-04-17-lack-of-os-level-worker-isolation.md)~~
 - ~~[RISK-0028 Patch may apply syntactically while still introducing semantic or validation-breaking drift](entries/2026-04-17-patch-semantic-conflict-after-apply.md)~~
 - ~~[RISK-0029 Founder review may miss dangerous or over-broad patch changes without guided review signals](entries/2026-04-17-patch-review-danger-blindness.md)~~
+- ~~[RISK-0030 Containerized worker may escape isolation if docker socket or privileged mode is exposed](entries/2026-04-17-docker-socket-and-privileged-container-escape.md)~~
+- ~~[RISK-0031 Containerized worker artifacts may be unreadable or undeletable on the host due to UID/GID mismatch](entries/2026-04-17-container-artifact-ownership-mismatch.md)~~
+- ~~[RISK-0032 Containerized worker may leave orphan containers behind after interruption or crash](entries/2026-04-17-container-orphan-garbage-collection-gap.md)~~

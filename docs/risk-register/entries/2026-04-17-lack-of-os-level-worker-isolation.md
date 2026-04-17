@@ -1,7 +1,7 @@
 # Risk ID: RISK-0027
-Title: Soft-isolated worker proof lacks OS/container-level isolation and cannot be treated as unrestricted bypass safety
+Title: ~~Soft-isolated worker proof lacks OS/container-level isolation and cannot be treated as unrestricted bypass safety~~
 Class: Before Scale
-Status: Open
+Status: Resolved
 Owner: Execution plane / Sandbox runtime
 Observed In: Step 12-b isolated worker proof planning
 
@@ -47,6 +47,15 @@ foundation is actually ready.
   broader execution fan-out
 - later add container/cgroup-backed isolation and resource ceilings
 
+Implemented resolution:
+
+- Step 13 adds a containerized worker proof lane
+- worker source transfer now uses `docker cp` copy-in / copy-out
+- least-privilege launch policy is enforced (`no-new-privileges`, `cap-drop ALL`,
+  no Docker socket, no privileged mode, no network)
+- timeout reclaim and startup garbage collection are part of the proof runtime
+- copied-out worker state is normalized on the host before intake reads it
+
 ## Capability Gate
 - Capability: broad/unrestricted bypass-style worker execution
 - Gate mode: Before Scale
@@ -57,8 +66,8 @@ foundation is actually ready.
 - GitHub Issue: #29
 
 ## Doc Links
-- ADR:
-- Design note: docs/issues/STEP_12B_ISOLATED_WORKER_PROOF.md
+- ADR: ../../adr/0011-containerized-worker-runtime.md
+- Design note: ../../implementation-notes/STEP_13_CONTAINERIZED_WORKER_RUNTIME.md
 
 ## Exit Criteria
 
@@ -68,3 +77,4 @@ foundation is actually ready.
 
 ## Last Updated
 - 2026-04-17
+- 2026-04-17 (resolved in Step 13 containerized worker proof)

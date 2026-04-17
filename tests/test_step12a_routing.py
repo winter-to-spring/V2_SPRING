@@ -94,6 +94,24 @@ def test_route_task_returns_typed_no_matching_runtime_refusal() -> None:
     assert "no currently registered execution runtime" in outcome.message.lower()
 
 
+def test_route_task_can_target_containerized_worker_when_available() -> None:
+    outcome = route_task(
+        ExecutionRequirements(
+            task_complexity=TaskComplexity.LOW,
+            needs_isolation=True,
+            requires_network=False,
+            needs_multi_file_context=False,
+            write_scope=WriteScope.SINGLE_FILE,
+            expected_output_kind=ExpectedOutputKind.UNIFIED_PATCH,
+        ),
+        SystemLimits(available_runtimes=(ExecutionRuntime.CONTAINERIZED_WORKER,)),
+    )
+
+    assert isinstance(outcome, RoutingDecision)
+    assert outcome.runtime == ExecutionRuntime.CONTAINERIZED_WORKER
+    assert outcome.matched_policy == "containerized_worker_bounded_patch_rule"
+
+
 def test_store_inspect_task_route_records_audit_for_ready_run(tmp_path: Path) -> None:
     store = make_store(tmp_path)
     run_id = _create_ready_run(store)
