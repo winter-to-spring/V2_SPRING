@@ -35,15 +35,15 @@ test:
 	PYTHONPATH=src pytest -q
 
 db-upgrade:
-	@DATABASE_URL=$${DATABASE_URL:-postgresql://v2_spring:change_me_postgres@localhost:5432/v2_spring}; \
+	@DATABASE_URL=$${DATABASE_URL:-postgresql+psycopg://v2_spring:change_me_postgres@localhost:5432/v2_spring}; \
 	$(ALEMBIC_BIN) upgrade head
 
 db-current:
-	@DATABASE_URL=$${DATABASE_URL:-postgresql://v2_spring:change_me_postgres@localhost:5432/v2_spring}; \
+	@DATABASE_URL=$${DATABASE_URL:-postgresql+psycopg://v2_spring:change_me_postgres@localhost:5432/v2_spring}; \
 	$(ALEMBIC_BIN) current
 
 db-history:
-	@DATABASE_URL=$${DATABASE_URL:-postgresql://v2_spring:change_me_postgres@localhost:5432/v2_spring}; \
+	@DATABASE_URL=$${DATABASE_URL:-postgresql+psycopg://v2_spring:change_me_postgres@localhost:5432/v2_spring}; \
 	$(ALEMBIC_BIN) history
 
 ci-smoke:

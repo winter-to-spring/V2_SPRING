@@ -47,6 +47,11 @@ competing mutations around the same run or claim row.
 - targeted regression tests cover Postgres-oriented store helpers and existing
   claim behavior
 - full Python test suite still passes after the dialect-aware store changes
+- disposable live Postgres smoke now verifies:
+  - `alembic upgrade head`
+  - `v2-spring doctor`
+  - `v2-spring run create/show`
+  against a real PostgreSQL backend
 
 ## Risk impact
 

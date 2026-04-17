@@ -122,3 +122,11 @@ def test_doctor_reports_schema_status(capsys, monkeypatch, tmp_path: Path) -> No
     assert "Database doctor" in output
     assert "dialect:" in output
     assert "sqlite" in output
+
+
+def test_cli_module_invokes_main_when_run_as_script(tmp_path: Path) -> None:
+    cli_source = Path(__file__).resolve().parents[1] / "src" / "v2_spring" / "cli.py"
+    contents = cli_source.read_text(encoding="utf-8")
+
+    assert 'if __name__ == "__main__":' in contents
+    assert "main()" in contents

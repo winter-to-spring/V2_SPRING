@@ -1,7 +1,7 @@
 # Risk ID: RISK-0056
 Title: Schema drift may break Postgres migration without versioned migration control
 Class: Before Next Phase
-Status: Mitigating
+Status: Resolved
 Owner: Storage / Core schema
 Observed In: Step 21 planning
 
@@ -41,11 +41,13 @@ Current mitigation:
   silently bootstrapping drift-prone tables from ORM metadata
 - `v2-spring doctor` can report migration control status and missing tables so
   bootstrap drift is visible before normal control-plane commands run
+- a disposable live PostgreSQL smoke run now verifies `alembic upgrade head`,
+  `v2-spring doctor`, and `run create/show` against a real Postgres backend
 
 ## Capability Gate
 - Capability: Postgres-first primary store
 - Gate mode: Before Next Phase
-- Blocked until: schema evolution is tracked through versioned migrations
+- Blocked until: n/a (resolved in current Step 21 scope)
 
 ## Issue Link
 - GitHub Issue: #47
@@ -59,8 +61,11 @@ Current mitigation:
 
 - schema changes are versioned and replayable through a migration tool
 - new environments can bootstrap to the exact expected schema deterministically
+- PostgreSQL bootstrap is validated against a live database, not only SQLite
+  smoke
 
 ## Last Updated
 - 2026-04-17
 - 2026-04-17 (mitigating in Step 21)
 - 2026-04-17 (migration-controlled bootstrap enforced in code)
+- 2026-04-17 (resolved after live Postgres smoke)
