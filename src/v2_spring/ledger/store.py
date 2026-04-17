@@ -106,6 +106,11 @@ from v2_spring.planner.proposals import (
     StalePlannerProposalError,
     TransportDuplicatePlannerProposalError,
 )
+from v2_spring.runtime import (
+    IsolatedWorkerReceipt,
+    IsolatedWorkerTimeout,
+    execute_isolated_worker_proof,
+)
 
 
 @dataclass(frozen=True)
@@ -115,6 +120,16 @@ class BoundedExecutionResult:
     task: TaskView
     artifact: ArtifactView | None
     observation: ObservationView
+
+
+@dataclass(frozen=True)
+class IsolatedWorkerDispatchResult:
+    """Return the isolated worker proof in a typed bundle."""
+
+    task: TaskView
+    artifacts: list[ArtifactView]
+    observation: ObservationView
+    receipt: IsolatedWorkerReceipt
 
 
 class LedgerStore:
@@ -2203,6 +2218,197 @@ class LedgerStore:
                 stderr=f"Artifact persistence failed after execution: {exc}",
             )
 
+    def dispatch_isolated_worker_task(
+        self,
+        *,
+        run_id: str,
+        workspace: Path,
+        artifact_root: Path,
+        timeout_seconds: int = 30,
+    ) -> IsolatedWorkerDispatchResult:
+        """Dispatch one bounded isolated-worker proof and persist its trail."""
+
+        self.ensure_schema()
+        workspace = workspace.expanduser().resolve()
+        artifact_root = artifact_root.expanduser().resolve()
+        requirements = ExecutionRequirements(
+            task_complexity="low",
+            needs_isolation=True,
+            requires_network=False,
+            needs_multi_file_context=False,
+            write_scope="single_file",
+            expected_output_kind="unified_patch",
+        )
+
+        inspection = self.inspect_task_route(run_id, requirements=requirements, record=True)
+        if not isinstance(inspection.outcome, RoutingDecision):
+            raise PermissionError(
+                f"Run {run_id} cannot be dispatched to the isolated worker: {inspection.outcome.message}",
+            )
+        if inspection.outcome.runtime != ExecutionRuntime.ISOLATED_WORKER:
+            raise PermissionError(
+                f"Run {run_id} currently routes to {inspection.outcome.runtime.value}, not isolated_worker.",
+            )
+
+        with self.session() as session:
+            run = self._get_run_for_execution(session, run_id)
+            existing_task_count = session.scalar(
+                select(TaskRecord).where(TaskRecord.run_id == run.id).limit(1),
+            )
+            if existing_task_count is not None:
+                raise PermissionError(
+                    f"Run {run_id} already has execution evidence and cannot dispatch another proof in Step 12-b.",
+                )
+
+            decision = DecisionRecord(
+                run_id=run.id,
+                kind=DecisionKind.ISOLATED_WORKER_SELECTED,
+                summary="An isolated worker proof was selected for dispatch.",
+                rationale=(
+                    "Step 12-b intentionally proves one soft-isolated worker lane before broader execution-plane "
+                    "fan-out is introduced."
+                ),
+            )
+            session.add(decision)
+            session.flush()
+            session.add(
+                EventLedgerRecord(
+                    run_id=run.id,
+                    event_type=LedgerEventType.DECISION_RECORDED,
+                    payload={
+                        "decision_id": decision.id,
+                        "kind": decision.kind.value,
+                        "summary": decision.summary,
+                        "runtime": inspection.outcome.runtime.value,
+                        "routing_policy": inspection.outcome.matched_policy,
+                    },
+                ),
+            )
+
+            execution_context_id = str(uuid4())
+            sandbox_cwd = str(artifact_root / run_id / execution_context_id / "sandbox")
+            task = TaskRecord(
+                run_id=run.id,
+                decision_id=decision.id,
+                kind=TaskKind.ISOLATED_WORKER_PROOF,
+                status=TaskStatus.READY,
+                summary="Run one bounded patch-producing proof inside an isolated worker sandbox.",
+                execution_context_id=execution_context_id,
+                command=f"isolated_worker_proof --workspace {workspace}",
+                cwd=sandbox_cwd,
+                timeout_seconds=timeout_seconds,
+            )
+            session.add(task)
+            session.flush()
+            session.add(
+                EventLedgerRecord(
+                    run_id=run.id,
+                    event_type=LedgerEventType.TASK_CREATED,
+                    payload={
+                        "task_id": task.id,
+                        "decision_id": decision.id,
+                        "kind": task.kind.value,
+                        "summary": task.summary,
+                        "status": task.status.value,
+                        "runtime": inspection.outcome.runtime.value,
+                        "requirements": requirements.model_dump(mode="json"),
+                    },
+                ),
+            )
+
+            task.status = TaskStatus.RUNNING
+            task.started_at = utc_now()
+            run.status = RunStatus.RUNNING
+            session.add(
+                EventLedgerRecord(
+                    run_id=run.id,
+                    event_type=LedgerEventType.TASK_STARTED,
+                    payload={
+                        "task_id": task.id,
+                        "decision_id": decision.id,
+                        "kind": task.kind.value,
+                        "status": task.status.value,
+                        "workspace": str(workspace),
+                        "runtime": inspection.outcome.runtime.value,
+                        "snapshot_hash": inspection.snapshot_hash,
+                        "base_context": {
+                            "source_action": inspection.source_action.value if inspection.source_action else None,
+                            "requirements": requirements.model_dump(mode="json"),
+                        },
+                    },
+                ),
+            )
+            session.flush()
+            task_id = task.id
+
+        try:
+            receipt = execute_isolated_worker_proof(
+                workspace=workspace,
+                timeout_seconds=timeout_seconds,
+                execution_context_id=execution_context_id,
+            )
+        except (IsolatedWorkerTimeout, FileNotFoundError, NotADirectoryError) as exc:
+            synthetic_receipt = self._build_failed_isolated_receipt(
+                workspace=workspace,
+                execution_context_id=execution_context_id,
+                timeout_seconds=timeout_seconds,
+                summary=str(exc),
+            )
+            return self._finalize_failed_isolated_task(
+                run_id=run_id,
+                task_id=task_id,
+                artifact_root=artifact_root,
+                receipt=synthetic_receipt,
+                failure_summary=str(exc),
+            )
+        except Exception as exc:  # pragma: no cover - defensive guard
+            synthetic_receipt = self._build_failed_isolated_receipt(
+                workspace=workspace,
+                execution_context_id=execution_context_id,
+                timeout_seconds=timeout_seconds,
+                summary=f"Unexpected isolated worker failure: {exc}",
+            )
+            return self._finalize_failed_isolated_task(
+                run_id=run_id,
+                task_id=task_id,
+                artifact_root=artifact_root,
+                receipt=synthetic_receipt,
+                failure_summary=f"Unexpected isolated worker failure: {exc}",
+            )
+
+        if receipt.timed_out or receipt.returncode not in (0, None):
+            failure_summary = receipt.summary
+            return self._finalize_failed_isolated_task(
+                run_id=run_id,
+                task_id=task_id,
+                artifact_root=artifact_root,
+                receipt=receipt,
+                failure_summary=failure_summary,
+            )
+        if not receipt.patch_body:
+            return self._finalize_failed_isolated_task(
+                run_id=run_id,
+                task_id=task_id,
+                artifact_root=artifact_root,
+                receipt=receipt,
+                failure_summary="Isolated worker proof completed without producing a bounded patch.",
+            )
+        try:
+            return self._finalize_completed_isolated_task(
+                run_id=run_id,
+                task_id=task_id,
+                artifact_root=artifact_root,
+                receipt=receipt,
+            )
+        except Exception as exc:
+            return self._finalize_failed_isolated_task(
+                run_id=run_id,
+                task_id=task_id,
+                artifact_root=artifact_root,
+                receipt=receipt,
+                failure_summary=f"Patch/receipt persistence failed after isolated execution: {exc}",
+            )
+
     @staticmethod
     def _build_run_created_event(record: RunRecord) -> EventLedgerRecord:
         return EventLedgerRecord(
@@ -2859,6 +3065,288 @@ class LedgerStore:
         except Exception:
             if artifact_path.exists():
                 artifact_path.unlink()
+            raise
+
+    def _build_failed_isolated_receipt(
+        self,
+        *,
+        workspace: Path,
+        execution_context_id: str,
+        timeout_seconds: int,
+        summary: str,
+    ) -> IsolatedWorkerReceipt:
+        now = utc_now()
+        return IsolatedWorkerReceipt(
+            execution_context_id=execution_context_id,
+            command=f"isolated_worker_proof --workspace {workspace}",
+            source_workspace=str(workspace),
+            sandbox_cwd=str(workspace),
+            started_at=now,
+            finished_at=now,
+            timeout_seconds=timeout_seconds,
+            returncode=None,
+            timed_out=False,
+            stdout_preview="",
+            stderr_preview=summary,
+            stdout_bytes=0,
+            stderr_bytes=len(summary.encode("utf-8")),
+            stderr_truncated=False,
+            changed_files=[],
+            patch_body=None,
+            summary=summary,
+            base_file_hashes={},
+            excluded_names=[],
+            env_allowlist=[],
+            secret_surface_present=False,
+        )
+
+    def _finalize_failed_isolated_task(
+        self,
+        *,
+        run_id: str,
+        task_id: str,
+        artifact_root: Path,
+        receipt: IsolatedWorkerReceipt,
+        failure_summary: str,
+    ) -> IsolatedWorkerDispatchResult:
+        artifact_directory = artifact_root / run_id / task_id
+        artifact_directory.mkdir(parents=True, exist_ok=True)
+        receipt_path = artifact_directory / "isolated-worker-receipt.json"
+        receipt_path.write_text(
+            json.dumps(receipt.model_dump(mode="json"), indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        receipt_bytes = receipt_path.read_bytes()
+        receipt_hash = sha256(receipt_bytes).hexdigest()
+
+        with self.session() as session:
+            run = session.get(RunRecord, run_id)
+            task = session.get(TaskRecord, task_id)
+            if run is None or task is None:
+                raise LookupError("Isolated task finalization failed because the run or task no longer exists.")
+
+            task.execution_context_id = receipt.execution_context_id
+            task.command = receipt.command
+            task.cwd = receipt.sandbox_cwd
+            task.timeout_seconds = receipt.timeout_seconds
+            task.stdout = receipt.stdout_preview
+            task.stderr = receipt.stderr_preview or failure_summary
+            task.completed_at = receipt.finished_at
+            task.status = TaskStatus.FAILED
+            run.status = RunStatus.FAILED
+
+            receipt_artifact = ArtifactRecord(
+                run_id=run.id,
+                task_id=task.id,
+                decision_id=task.decision_id,
+                artifact_type=ArtifactType.EXECUTION_RECEIPT,
+                title="Isolated worker execution receipt",
+                storage_kind=ArtifactStorageKind.FILESYSTEM_PATH,
+                path=str(receipt_path),
+                size_bytes=len(receipt_bytes),
+                sha256=receipt_hash,
+                execution_context_id=receipt.execution_context_id,
+                command=receipt.command,
+                cwd=receipt.sandbox_cwd,
+            )
+            session.add(receipt_artifact)
+            session.flush()
+
+            observation = ObservationRecord(
+                run_id=run.id,
+                kind=ObservationKind.TASK_EXECUTION,
+                summary="Isolated worker proof failed before a patch could be accepted.",
+                details=failure_summary,
+            )
+            session.add(observation)
+            session.flush()
+
+            session.add(
+                EventLedgerRecord(
+                    run_id=run.id,
+                    event_type=LedgerEventType.ARTIFACT_RECORDED,
+                    payload={
+                        "artifact_id": receipt_artifact.id,
+                        "task_id": task.id,
+                        "decision_id": task.decision_id,
+                        "execution_context_id": receipt_artifact.execution_context_id,
+                        "path": receipt_artifact.path,
+                        "sha256": receipt_artifact.sha256,
+                    },
+                ),
+            )
+            session.add(
+                EventLedgerRecord(
+                    run_id=run.id,
+                    event_type=LedgerEventType.TASK_FAILED,
+                    payload={
+                        "task_id": task.id,
+                        "decision_id": task.decision_id,
+                        "execution_context_id": task.execution_context_id,
+                        "status": task.status.value,
+                        "error": failure_summary,
+                        "timed_out": receipt.timed_out,
+                    },
+                ),
+            )
+            session.add(
+                EventLedgerRecord(
+                    run_id=run.id,
+                    event_type=LedgerEventType.OBSERVATION_RECORDED,
+                    payload={
+                        "observation_id": observation.id,
+                        "kind": observation.kind.value,
+                        "summary": observation.summary,
+                    },
+                ),
+            )
+            session.flush()
+            return IsolatedWorkerDispatchResult(
+                task=self._to_task_view(task),
+                artifacts=[self._to_artifact_view(receipt_artifact)],
+                observation=self._to_observation_view(observation),
+                receipt=receipt,
+            )
+
+    def _finalize_completed_isolated_task(
+        self,
+        *,
+        run_id: str,
+        task_id: str,
+        artifact_root: Path,
+        receipt: IsolatedWorkerReceipt,
+    ) -> IsolatedWorkerDispatchResult:
+        artifact_directory = artifact_root / run_id / task_id
+        artifact_directory.mkdir(parents=True, exist_ok=True)
+        patch_path = artifact_directory / "isolated-worker-proof.patch"
+        receipt_path = artifact_directory / "isolated-worker-receipt.json"
+        patch_path.write_text(receipt.patch_body or "", encoding="utf-8")
+        receipt_path.write_text(
+            json.dumps(receipt.model_dump(mode="json"), indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        patch_bytes = patch_path.read_bytes()
+        receipt_bytes = receipt_path.read_bytes()
+        patch_hash = sha256(patch_bytes).hexdigest()
+        receipt_hash = sha256(receipt_bytes).hexdigest()
+
+        try:
+            with self.session() as session:
+                run = session.get(RunRecord, run_id)
+                task = session.get(TaskRecord, task_id)
+                if run is None or task is None:
+                    raise LookupError("Isolated task finalization failed because the run or task no longer exists.")
+
+                task.execution_context_id = receipt.execution_context_id
+                task.command = receipt.command
+                task.cwd = receipt.sandbox_cwd
+                task.timeout_seconds = receipt.timeout_seconds
+                task.stdout = receipt.stdout_preview
+                task.stderr = receipt.stderr_preview
+                task.completed_at = receipt.finished_at
+                task.status = TaskStatus.COMPLETED
+                run.status = RunStatus.COMPLETED
+
+                patch_artifact = ArtifactRecord(
+                    run_id=run.id,
+                    task_id=task.id,
+                    decision_id=task.decision_id,
+                    artifact_type=ArtifactType.UNIFIED_PATCH,
+                    title="Isolated worker proof patch",
+                    storage_kind=ArtifactStorageKind.FILESYSTEM_PATH,
+                    path=str(patch_path),
+                    size_bytes=len(patch_bytes),
+                    sha256=patch_hash,
+                    execution_context_id=receipt.execution_context_id,
+                    command=receipt.command,
+                    cwd=receipt.sandbox_cwd,
+                )
+                receipt_artifact = ArtifactRecord(
+                    run_id=run.id,
+                    task_id=task.id,
+                    decision_id=task.decision_id,
+                    artifact_type=ArtifactType.EXECUTION_RECEIPT,
+                    title="Isolated worker execution receipt",
+                    storage_kind=ArtifactStorageKind.FILESYSTEM_PATH,
+                    path=str(receipt_path),
+                    size_bytes=len(receipt_bytes),
+                    sha256=receipt_hash,
+                    execution_context_id=receipt.execution_context_id,
+                    command=receipt.command,
+                    cwd=receipt.sandbox_cwd,
+                )
+                session.add(patch_artifact)
+                session.add(receipt_artifact)
+                session.flush()
+
+                observation = ObservationRecord(
+                    run_id=run.id,
+                    kind=ObservationKind.TASK_EXECUTION,
+                    summary="Isolated worker proof completed and returned a bounded patch receipt.",
+                    details=(
+                        f"Task {task.id} produced patch artifact {patch_artifact.id} and receipt artifact {receipt_artifact.id}. "
+                        f"Changed files: {', '.join(receipt.changed_files) if receipt.changed_files else '-'}."
+                    ),
+                )
+                session.add(observation)
+                session.flush()
+
+                for artifact in (patch_artifact, receipt_artifact):
+                    session.add(
+                        EventLedgerRecord(
+                            run_id=run.id,
+                            event_type=LedgerEventType.ARTIFACT_RECORDED,
+                            payload={
+                                "artifact_id": artifact.id,
+                                "task_id": task.id,
+                                "decision_id": task.decision_id,
+                                "execution_context_id": artifact.execution_context_id,
+                                "path": artifact.path,
+                                "sha256": artifact.sha256,
+                            },
+                        ),
+                    )
+                session.add(
+                    EventLedgerRecord(
+                        run_id=run.id,
+                        event_type=LedgerEventType.TASK_COMPLETED,
+                        payload={
+                            "task_id": task.id,
+                            "decision_id": task.decision_id,
+                            "execution_context_id": task.execution_context_id,
+                            "status": task.status.value,
+                            "runtime": "isolated_worker",
+                            "changed_files": receipt.changed_files,
+                            "base_file_hashes": receipt.base_file_hashes,
+                        },
+                    ),
+                )
+                session.add(
+                    EventLedgerRecord(
+                        run_id=run.id,
+                        event_type=LedgerEventType.OBSERVATION_RECORDED,
+                        payload={
+                            "observation_id": observation.id,
+                            "kind": observation.kind.value,
+                            "summary": observation.summary,
+                        },
+                    ),
+                )
+                session.flush()
+                return IsolatedWorkerDispatchResult(
+                    task=self._to_task_view(task),
+                    artifacts=[
+                        self._to_artifact_view(patch_artifact),
+                        self._to_artifact_view(receipt_artifact),
+                    ],
+                    observation=self._to_observation_view(observation),
+                    receipt=receipt,
+                )
+        except Exception:
+            if patch_path.exists():
+                patch_path.unlink()
+            if receipt_path.exists():
+                receipt_path.unlink()
             raise
 
     @staticmethod

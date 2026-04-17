@@ -9,6 +9,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 class ArtifactType(StrEnum):
     TEXT_REPORT = "text_report"
+    UNIFIED_PATCH = "unified_patch"
+    EXECUTION_RECEIPT = "execution_receipt"
 
 
 class ArtifactStorageKind(StrEnum):

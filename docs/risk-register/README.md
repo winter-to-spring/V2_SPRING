@@ -129,7 +129,8 @@ Observed In:
 - ~~[RISK-0020 Provider/network errors may bypass planner governance if they are not normalized at the adapter edge](entries/2026-04-17-provider-error-normalization-leak.md)~~
 - [RISK-0021 Local CLI cancellation may leave an in-flight provider call orphaned after the terminal exits](entries/2026-04-17-provider-cancellation-orphan.md)
 - [RISK-0022 Multi-worker approval gating still needs lease-aware concurrency controls](entries/2026-04-17-multi-worker-approval-concurrency.md)
-- [RISK-0023 Isolated worker proof may leak secrets or main workspace access if isolation is only logical](entries/2026-04-17-isolated-worker-sandbox-leakage.md)
-- [RISK-0024 Isolated worker may crash or hang without a reclaim path, leaving running tasks stuck](entries/2026-04-17-silent-worker-crash-reclaim-gap.md)
+- ~~[RISK-0023 Isolated worker proof may leak secrets or main workspace access if isolation is only logical](entries/2026-04-17-isolated-worker-sandbox-leakage.md)~~
+- ~~[RISK-0024 Isolated worker may crash or hang without a reclaim path, leaving running tasks stuck](entries/2026-04-17-silent-worker-crash-reclaim-gap.md)~~
 - [RISK-0025 Founder review may become a throughput bottleneck without risk-based patch intake routing](entries/2026-04-17-patch-review-fatigue-and-routing.md)
 - [RISK-0026 Explicit dispatcher rules may sprawl into a hard-to-audit routing blob as runtimes grow](entries/2026-04-17-routing-policy-sprawl.md)
+- [RISK-0027 Soft-isolated worker proof lacks OS/container-level isolation for unrestricted bypass safety](entries/2026-04-17-lack-of-os-level-worker-isolation.md)
