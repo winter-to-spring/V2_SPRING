@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from alembic import op
 
-from src.v2_spring.ledger.models import Base
+from v2_spring.ledger.models import Base
 
 
 revision = "20260417_000001"
