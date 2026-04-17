@@ -43,7 +43,11 @@ from v2_spring.domain.routing import (
     WriteScope,
 )
 from v2_spring.domain.snapshot import PossibleActionEvaluationView, PossibleActionName, RunSnapshotView
-from v2_spring.ledger.store import BoundedExecutionResult, LedgerStore
+from v2_spring.ledger.store import (
+    BoundedExecutionResult,
+    IsolatedWorkerDispatchResult,
+    LedgerStore,
+)
 from v2_spring.planner.actions import evaluate_possible_actions
 from v2_spring.planner.proposals import (
     CognitiveDuplicatePlannerProposalError,
@@ -295,6 +299,45 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional explicit output-kind override.",
     )
     task_route_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Override DATABASE_URL for this invocation.",
+    )
+
+    task_dispatch_parser = task_subparsers.add_parser(
+        "dispatch",
+        help="Dispatch one isolated worker proof for a run.",
+    )
+    task_dispatch_parser.add_argument("run_id", help="Run id to dispatch.")
+    task_dispatch_parser.add_argument(
+        "--runtime",
+        required=True,
+        choices=["isolated_worker"],
+        help="Execution runtime to prove. Step 12-b currently supports isolated_worker only.",
+    )
+    task_dispatch_parser.add_argument(
+        "--workspace",
+        default=".",
+        help="Source workspace path copied into the isolated worker sandbox.",
+    )
+    task_dispatch_parser.add_argument(
+        "--artifact-root",
+        default=".local/artifacts",
+        help="Root directory where patch and receipt artifacts should be written.",
+    )
+    task_dispatch_parser.add_argument(
+        "--timeout-seconds",
+        default=30,
+        type=int,
+        help="Hard timeout for the isolated worker proof. Defaults to 30.",
+    )
+    task_dispatch_parser.add_argument(
+        "--format",
+        default="pretty",
+        choices=["pretty", "json"],
+        help="Output format. Defaults to pretty.",
+    )
+    task_dispatch_parser.add_argument(
         "--database-url",
         default=None,
         help="Override DATABASE_URL for this invocation.",
@@ -986,6 +1029,29 @@ def _render_execution_result(result: BoundedExecutionResult) -> str:
         observation:         {result.observation.summary}
         artifact_path:       {artifact_line}
         artifact_sha256:     {hash_line}
+        """,
+    ).strip()
+
+
+def _render_isolated_worker_result(result: IsolatedWorkerDispatchResult) -> str:
+    artifact_lines = "\n".join(
+        f"- {artifact.artifact_type.value}: {artifact.path}"
+        for artifact in result.artifacts
+    ) or "-"
+    changed_files = ", ".join(result.receipt.changed_files) if result.receipt.changed_files else "-"
+    return dedent(
+        f"""\
+        Isolated worker proof finished
+        -----------------------------
+        task_id:             {result.task.id}
+        task_status:         {result.task.status.value}
+        execution_context:   {result.task.execution_context_id}
+        receipt_summary:     {result.receipt.summary}
+        changed_files:       {changed_files}
+        timed_out:           {result.receipt.timed_out}
+        observation:         {result.observation.summary}
+        artifacts:
+        {artifact_lines}
         """,
     ).strip()
 
@@ -2074,6 +2140,35 @@ def main() -> None:
             else:
                 print(_render_task_route(inspection))
         except (LookupError, ValueError, PermissionError) as exc:
+            print(str(exc))
+            raise SystemExit(1) from exc
+        return
+
+    if args.command == "task" and args.task_command == "dispatch":
+        store = _build_store(args.database_url)
+        try:
+            result = store.dispatch_isolated_worker_task(
+                run_id=args.run_id,
+                workspace=Path(args.workspace),
+                artifact_root=Path(args.artifact_root),
+                timeout_seconds=args.timeout_seconds,
+            )
+            if args.format == "json":
+                print(
+                    json.dumps(
+                        {
+                            "task": result.task.model_dump(mode="json"),
+                            "artifacts": [artifact.model_dump(mode="json") for artifact in result.artifacts],
+                            "observation": result.observation.model_dump(mode="json"),
+                            "receipt": result.receipt.model_dump(mode="json"),
+                        },
+                        indent=2,
+                        ensure_ascii=False,
+                    ),
+                )
+            else:
+                print(_render_isolated_worker_result(result))
+        except (LookupError, ValueError, PermissionError, FileNotFoundError, NotADirectoryError) as exc:
             print(str(exc))
             raise SystemExit(1) from exc
         return

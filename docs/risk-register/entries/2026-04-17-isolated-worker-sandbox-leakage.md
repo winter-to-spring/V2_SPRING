@@ -1,14 +1,20 @@
 # Risk ID: RISK-0023
-Title: Isolated worker proof may leak secrets or main workspace access if isolation is only logical
+Title: ~~Isolated worker proof may leak secrets or main workspace access if isolation is only logical~~
 Class: Before Next Phase
-Status: Open
+Status: Resolved
 Owner: Execution plane / Sandbox adapter
 Observed In: Step 12-b isolated worker proof planning
 
 ## Description
 
-If Step 12-b treats "isolated worker" as a simple subdirectory or loose
-worktree without tighter execution boundaries, the worker may still:
+Step 12-b now uses a strengthened soft-isolation boundary:
+
+- task-local copied workspace
+- `.env` / secret-file non-copy
+- bounded environment allowlist
+- patch/receipt-only return path
+
+Before that boundary existed, the worker proof could still:
 
 - traverse upward into the main workspace
 - read copied `.env` material or ambient local secrets
@@ -51,6 +57,7 @@ proof.
 ## Doc Links
 - ADR:
 - Design note: docs/issues/STEP_12B_ISOLATED_WORKER_PROOF.md
+- Design note: docs/implementation-notes/STEP_12B_ISOLATED_WORKER_PROOF.md
 
 ## Exit Criteria
 
@@ -59,4 +66,5 @@ proof.
 - worker-visible environment is bounded and documented
 
 ## Last Updated
+- 2026-04-17
 - 2026-04-17

@@ -1,7 +1,7 @@
 # Risk ID: RISK-0024
-Title: Isolated worker may crash or hang without a reclaim path, leaving running tasks stuck
+Title: ~~Isolated worker may crash or hang without a reclaim path, leaving running tasks stuck~~
 Class: Before Next Phase
-Status: Open
+Status: Resolved
 Owner: Execution plane / Worker runtime
 Observed In: Step 12-b isolated worker proof planning
 
@@ -10,8 +10,8 @@ Observed In: Step 12-b isolated worker proof planning
 An isolated worker can die from OOM, internal crash, or runaway loop after the
 control plane has already marked the task as dispatched.
 
-Without a hard timeout and reclaim path, the control plane may wait forever for
-a receipt that will never arrive.
+Without a hard timeout and reclaim path, the control plane could wait forever
+for a receipt that would never arrive.
 
 The same slice can also deadlock if stdout/stderr is captured through bounded
 OS pipes while the worker floods logs faster than the parent process drains
@@ -52,6 +52,7 @@ execution runtime even if the control plane remains alive.
 ## Doc Links
 - ADR:
 - Design note: docs/issues/STEP_12B_ISOLATED_WORKER_PROOF.md
+- Design note: docs/implementation-notes/STEP_12B_ISOLATED_WORKER_PROOF.md
 
 ## Exit Criteria
 
@@ -61,4 +62,5 @@ execution runtime even if the control plane remains alive.
 - replay and progress views can explain reclaim outcomes
 
 ## Last Updated
+- 2026-04-17
 - 2026-04-17
