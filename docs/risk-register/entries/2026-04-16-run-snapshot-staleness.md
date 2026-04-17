@@ -1,7 +1,7 @@
 # Risk ID: RISK-0005
 Title: RunSnapshot may become stale under concurrent writes
 Class: Before Scale
-Status: Deferred
+Status: Mitigating
 Owner: Core / Planner boundary
 Observed In: Step 7 - RunSnapshot + possible actions; Step 12-a dispatch planning
 
@@ -43,13 +43,22 @@ system.
 - consider transaction boundaries, sequence numbers, or projection tables when
   multi-worker scale begins
 
+Current mitigation:
+
+- Step 12 added base-context-aware worker intake so stale patch receipts can be
+  rejected through a safe path
+- Step 17 added lease-aware execution claims so live execution ownership now
+  blocks approval-sensitive mutation lanes
+- expired claims can now be reclaimed and surfaced explicitly instead of
+  lingering as silent ownership ambiguity
+
 ## Capability Gate
 - Capability: dispatching execution work beyond simple bounded local execution
 - Gate mode: Before Scale
 - Blocked until: a stronger snapshot freshness strategy is chosen
 
 ## Issue Link
-- GitHub Issue: #28
+- GitHub Issue: #28, #41
 
 ## Doc Links
 - ADR: docs/adr/0004-deterministic-substrate.md
@@ -64,3 +73,4 @@ system.
 ## Last Updated
 - 2026-04-16
 - 2026-04-17
+- 2026-04-17 (mitigating in Step 17)

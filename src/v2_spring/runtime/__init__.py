@@ -6,6 +6,7 @@ from v2_spring.runtime.containerized_worker import (
     ContainerizedWorkerReceipt,
     ContainerizedWorkerTimeout,
     execute_containerized_worker_proof,
+    reclaim_containerized_worker_execution,
 )
 from v2_spring.runtime.isolated_worker import (
     IsolatedWorkerExecutionError,
@@ -28,4 +29,5 @@ __all__ = [
     "apply_patch_strict",
     "execute_containerized_worker_proof",
     "execute_isolated_worker_proof",
+    "reclaim_containerized_worker_execution",
 ]

@@ -11,6 +11,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from v2_spring.domain.approval import ApprovalStatus
 from v2_spring.domain.artifact import ArtifactStorageKind, ArtifactType
 from v2_spring.domain.decision import DecisionKind
+from v2_spring.domain.execution_claim import ExecutionClaimStatus
 from v2_spring.domain.founder_intervention import FounderReplyKind
 from v2_spring.domain.observation import ObservationKind
 from v2_spring.domain.patch_intake import PatchIntakeStatus, PatchResolutionCode, PatchRiskClass
@@ -43,6 +44,9 @@ class LedgerEventType(StrEnum):
     PATCH_INTAKE_REJECTED = "PATCH_INTAKE_REJECTED"
     PLANNER_ATTEMPT_RECORDED = "PLANNER_ATTEMPT_RECORDED"
     FOUNDER_INTERVENTION_RECORDED = "FOUNDER_INTERVENTION_RECORDED"
+    EXECUTION_CLAIM_ACQUIRED = "EXECUTION_CLAIM_ACQUIRED"
+    EXECUTION_CLAIM_RELEASED = "EXECUTION_CLAIM_RELEASED"
+    EXECUTION_CLAIM_RECLAIMED = "EXECUTION_CLAIM_RECLAIMED"
 
 
 class RunRecord(Base):
@@ -109,6 +113,10 @@ class RunRecord(Base):
         cascade="all, delete-orphan",
     )
     founder_interventions: Mapped[list["FounderInterventionRecord"]] = relationship(
+        back_populates="run",
+        cascade="all, delete-orphan",
+    )
+    execution_claims: Mapped[list["ExecutionClaimRecord"]] = relationship(
         back_populates="run",
         cascade="all, delete-orphan",
     )
@@ -246,6 +254,45 @@ class TaskRecord(Base):
         back_populates="task",
         cascade="all, delete-orphan",
     )
+    execution_claims: Mapped[list["ExecutionClaimRecord"]] = relationship(back_populates="task")
+
+
+class ExecutionClaimRecord(Base):
+    __tablename__ = "execution_claims"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("runs.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    task_id: Mapped[str | None] = mapped_column(
+        ForeignKey("tasks.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    runtime: Mapped[str] = mapped_column(String(120), nullable=False)
+    owner: Mapped[str] = mapped_column(String(120), nullable=False)
+    lease_token: Mapped[str] = mapped_column(String(120), nullable=False)
+    status: Mapped[ExecutionClaimStatus] = mapped_column(
+        Enum(ExecutionClaimStatus, native_enum=False),
+        nullable=False,
+        default=ExecutionClaimStatus.ACTIVE,
+    )
+    acquired_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=utc_now,
+    )
+    heartbeat_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reclaim_reason: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    version: Mapped[int] = mapped_column(nullable=False, default=1)
+
+    run: Mapped[RunRecord] = relationship(back_populates="execution_claims")
+    task: Mapped["TaskRecord | None"] = relationship(back_populates="execution_claims")
 
 
 class ArtifactRecord(Base):

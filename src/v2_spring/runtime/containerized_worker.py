@@ -575,6 +575,21 @@ def _docker_remove_force(container_name: str) -> None:
     )
 
 
+def reclaim_containerized_worker_execution(*, execution_context_id: str) -> bool:
+    """Best-effort hard reclaim for one containerized worker execution context."""
+
+    if shutil.which("docker") is None:
+        return False
+    container_name = f"v2-spring-worker-{execution_context_id[:12]}"
+    result = subprocess.run(
+        ["docker", "rm", "-f", container_name],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.returncode == 0
+
+
 def _normalize_copied_directory(
     source: Path,
     destination: Path,

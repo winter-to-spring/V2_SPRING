@@ -1,7 +1,7 @@
 # Risk ID: RISK-0022
-Title: Multi-worker approval gating still needs lease-aware concurrency controls
+Title: ~~Multi-worker approval gating still needs lease-aware concurrency controls~~
 Class: Before Scale
-Status: Open
+Status: Resolved
 Owner: Core orchestration / runtime coordination
 Observed In: Post-RISK-0004 concurrency split
 
@@ -42,17 +42,38 @@ formalized".
 - test multi-process contention explicitly instead of extrapolating from local
   CLI behavior
 
+## Resolution
+
+Step 17 introduced a lease-aware execution claim model and applied it to the
+approval-sensitive mutation lanes.
+
+Current-scope closure now includes:
+
+- one active execution claim per run
+- typed refusal when competing dispatch collides with a live claim
+- claim-aware guards on approval/founder/patch mutation lanes
+- explicit reclaim path for expired claims
+- replay/progress visibility for claim ownership
+
+This closes the current single-node/current-runtime approval concurrency gap
+that remained after the earlier Step 4 guardrail work.
+
+Broader distributed or cross-host atomicity is now tracked separately through
+lease-model hardening risks rather than this original approval-barrier risk.
+
 ## Capability Gate
 - Capability: multi-worker execution / background loops / distributed mutation
 - Gate mode: before_scale
 - Blocked until: cross-worker mutation coordination is implemented and tested
 
 ## Issue Link
-- GitHub Issue: -
+- GitHub Issue: #41
 
 ## Doc Links
 - ADR: ../../adr/0002-human-in-the-loop-boundaries.md
+- ADR: ../../adr/0015-lease-aware-execution-claims-and-reclaim.md
 - Design note: ../../implementation-notes/STEP_4_APPROVAL_HARDENING.md
+- Design note: ../../implementation-notes/STEP_17_EXECUTION_LEASES_AND_ORPHAN_RECONCILIATION.md
 
 ## Exit Criteria
 
@@ -63,3 +84,4 @@ formalized".
 
 ## Last Updated
 - 2026-04-17
+- 2026-04-17 (resolved in Step 17)

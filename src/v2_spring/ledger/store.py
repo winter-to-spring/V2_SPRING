@@ -3,7 +3,7 @@ from __future__ import annotations
 import ast
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -18,6 +18,12 @@ from sqlalchemy.orm import Session, sessionmaker
 from v2_spring.domain.approval import ApprovalStatus, ApprovalView
 from v2_spring.domain.artifact import ArtifactStorageKind, ArtifactType, ArtifactView
 from v2_spring.domain.decision import DecisionKind, DecisionView
+from v2_spring.domain.execution_claim import (
+    ExecutionClaimRefusalCode,
+    ExecutionClaimRefusalView,
+    ExecutionClaimStatus,
+    ExecutionClaimView,
+)
 from v2_spring.domain.founder_intervention import (
     FounderInterventionDigest,
     FounderInterventionView,
@@ -101,6 +107,7 @@ from v2_spring.ledger.models import (
     Base,
     DecisionRecord,
     EventLedgerRecord,
+    ExecutionClaimRecord,
     FounderInterventionRecord,
     LedgerEventType,
     ObservationRecord,
@@ -131,6 +138,7 @@ from v2_spring.runtime import (
     apply_patch_strict,
     execute_containerized_worker_proof,
     execute_isolated_worker_proof,
+    reclaim_containerized_worker_execution,
 )
 
 
@@ -151,6 +159,14 @@ class IsolatedWorkerDispatchResult:
     artifacts: list[ArtifactView]
     observation: ObservationView
     receipt: IsolatedWorkerReceipt | ContainerizedWorkerReceipt
+
+
+class ExecutionClaimConflictError(PermissionError):
+    """Raised when a live execution claim blocks a new dispatch or mutation."""
+
+    def __init__(self, refusal: ExecutionClaimRefusalView) -> None:
+        super().__init__(refusal.message)
+        self.refusal = refusal
 
 
 class LedgerStore:
@@ -178,6 +194,7 @@ class LedgerStore:
     _PATCH_REPAIR_QUOTA_LIMIT = 3
     _PATCH_POLICY_WINDOW = timedelta(hours=1)
     _PATCH_AUTO_APPLY_MAX_CHANGED_LINES = 10
+    _EXECUTION_LEASE_SLACK = timedelta(seconds=15)
 
     def __init__(self, database_url: str) -> None:
         self._engine = create_engine(database_url, future=True)
@@ -227,6 +244,342 @@ class LedgerStore:
             raise
         finally:
             session.close()
+
+    @classmethod
+    def _build_execution_claim_ttl(cls, timeout_seconds: int) -> timedelta:
+        return timedelta(seconds=timeout_seconds) + cls._EXECUTION_LEASE_SLACK
+
+    @staticmethod
+    def _coerce_utc_datetime(value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    @classmethod
+    def _to_execution_claim_view(cls, record: ExecutionClaimRecord) -> ExecutionClaimView:
+        return ExecutionClaimView.model_validate(
+            {
+                "id": record.id,
+                "run_id": record.run_id,
+                "task_id": record.task_id,
+                "runtime": record.runtime,
+                "owner": record.owner,
+                "lease_token": record.lease_token,
+                "status": record.status.value,
+                "acquired_at": cls._coerce_utc_datetime(record.acquired_at),
+                "heartbeat_at": cls._coerce_utc_datetime(record.heartbeat_at),
+                "expires_at": cls._coerce_utc_datetime(record.expires_at),
+                "released_at": cls._coerce_utc_datetime(record.released_at),
+                "reclaim_reason": record.reclaim_reason,
+            },
+        )
+
+    @staticmethod
+    def _load_execution_claim(session: Session, run_id: str) -> ExecutionClaimRecord | None:
+        return session.scalar(select(ExecutionClaimRecord).where(ExecutionClaimRecord.run_id == run_id).limit(1))
+
+    def _raise_execution_claim_conflict(self, record: ExecutionClaimRecord, *, mutation_name: str) -> None:
+        claim = self._to_execution_claim_view(record)
+        raise ExecutionClaimConflictError(
+            ExecutionClaimRefusalView(
+                code=ExecutionClaimRefusalCode.ACTIVE_CLAIM_HELD,
+                message=(
+                    f"Run {record.run_id} already has a live execution claim; {mutation_name} is blocked "
+                    f"until the current owner releases or is reclaimed."
+                ),
+                existing_claim=claim,
+            ),
+        )
+
+    def _reclaim_execution_claim_locked(
+        self,
+        *,
+        session: Session,
+        run: RunRecord,
+        claim: ExecutionClaimRecord,
+        reason: str,
+    ) -> ExecutionClaimRecord:
+        now = utc_now()
+        task = session.get(TaskRecord, claim.task_id) if claim.task_id is not None else None
+        hard_reclaim_attempted = False
+        hard_reclaim_succeeded = False
+        if claim.runtime == ExecutionRuntime.CONTAINERIZED_WORKER.value and task is not None:
+            hard_reclaim_attempted = True
+            hard_reclaim_succeeded = reclaim_containerized_worker_execution(
+                execution_context_id=task.execution_context_id,
+            )
+
+        claim.status = ExecutionClaimStatus.RECLAIMED
+        claim.released_at = now
+        claim.reclaim_reason = reason
+        claim.version += 1
+        claim.heartbeat_at = now
+
+        if task is not None and task.status == TaskStatus.RUNNING:
+            task.status = TaskStatus.FAILED
+            task.completed_at = now
+            task.stderr = reason
+            if run.status == RunStatus.RUNNING:
+                run.status = RunStatus.READY
+            session.add(
+                EventLedgerRecord(
+                    run_id=run.id,
+                    event_type=LedgerEventType.TASK_FAILED,
+                    payload={
+                        "task_id": task.id,
+                        "decision_id": task.decision_id,
+                        "execution_context_id": task.execution_context_id,
+                        "status": task.status.value,
+                        "error": reason,
+                        "timed_out": False,
+                        "reclaimed": True,
+                    },
+                ),
+            )
+
+        session.add(
+            EventLedgerRecord(
+                run_id=run.id,
+                event_type=LedgerEventType.EXECUTION_CLAIM_RECLAIMED,
+                payload={
+                    "claim_id": claim.id,
+                    "task_id": claim.task_id,
+                    "runtime": claim.runtime,
+                    "owner": claim.owner,
+                    "reason": reason,
+                    "hard_reclaim_attempted": hard_reclaim_attempted,
+                    "hard_reclaim_succeeded": hard_reclaim_succeeded,
+                },
+            ),
+        )
+        observation = ObservationRecord(
+            run_id=run.id,
+            kind=ObservationKind.SYSTEM_AUDIT,
+            summary="Execution claim was reclaimed after expiry or orphan detection.",
+            details=(
+                f"error_code=execution_claim_reclaimed; claim_id={claim.id}; task_id={claim.task_id}; "
+                f"runtime={claim.runtime}; reason={reason}; hard_reclaim_attempted={hard_reclaim_attempted}; "
+                f"hard_reclaim_succeeded={hard_reclaim_succeeded}."
+            ),
+        )
+        session.add(observation)
+        session.flush()
+        session.add(
+            EventLedgerRecord(
+                run_id=run.id,
+                event_type=LedgerEventType.OBSERVATION_RECORDED,
+                payload={
+                    "observation_id": observation.id,
+                    "kind": observation.kind.value,
+                    "summary": observation.summary,
+                },
+            ),
+        )
+        return claim
+
+    def _ensure_no_live_execution_claim(
+        self,
+        *,
+        session: Session,
+        run: RunRecord,
+        mutation_name: str,
+    ) -> None:
+        claim = self._load_execution_claim(session, run.id)
+        if claim is None or claim.status != ExecutionClaimStatus.ACTIVE:
+            return
+        now = utc_now()
+        claim_expires_at = self._coerce_utc_datetime(claim.expires_at)
+        if claim_expires_at is not None and claim_expires_at <= now:
+            self._reclaim_execution_claim_locked(
+                session=session,
+                run=run,
+                claim=claim,
+                reason=(
+                    f"Execution lease expired before {mutation_name}; the claim was reclaimed pessimistically."
+                ),
+            )
+            return
+        self._raise_execution_claim_conflict(claim, mutation_name=mutation_name)
+
+    def _acquire_execution_claim(
+        self,
+        *,
+        session: Session,
+        run: RunRecord,
+        task: TaskRecord,
+        runtime: ExecutionRuntime,
+        timeout_seconds: int,
+        owner: str,
+    ) -> ExecutionClaimRecord:
+        self._ensure_no_live_execution_claim(
+            session=session,
+            run=run,
+            mutation_name="bounded execution dispatch",
+        )
+        now = utc_now()
+        lease_token = str(uuid4())
+        claim = self._load_execution_claim(session, run.id)
+        if claim is None:
+            claim = ExecutionClaimRecord(
+                run_id=run.id,
+                task_id=task.id,
+                runtime=runtime.value,
+                owner=owner,
+                lease_token=lease_token,
+                status=ExecutionClaimStatus.ACTIVE,
+                acquired_at=now,
+                heartbeat_at=now,
+                expires_at=now + self._build_execution_claim_ttl(timeout_seconds),
+                released_at=None,
+                reclaim_reason=None,
+                version=1,
+            )
+            session.add(claim)
+            session.flush()
+        else:
+            claim.task_id = task.id
+            claim.runtime = runtime.value
+            claim.owner = owner
+            claim.lease_token = lease_token
+            claim.status = ExecutionClaimStatus.ACTIVE
+            claim.acquired_at = now
+            claim.heartbeat_at = now
+            claim.expires_at = now + self._build_execution_claim_ttl(timeout_seconds)
+            claim.released_at = None
+            claim.reclaim_reason = None
+            claim.version += 1
+            session.flush()
+
+        session.add(
+            EventLedgerRecord(
+                run_id=run.id,
+                event_type=LedgerEventType.EXECUTION_CLAIM_ACQUIRED,
+                payload={
+                    "claim_id": claim.id,
+                    "task_id": task.id,
+                    "runtime": runtime.value,
+                    "owner": owner,
+                    "lease_token": lease_token,
+                    "expires_at": claim.expires_at.isoformat(),
+                },
+            ),
+        )
+        observation = ObservationRecord(
+            run_id=run.id,
+            kind=ObservationKind.SYSTEM_AUDIT,
+            summary="Execution claim was acquired for a bounded worker dispatch.",
+            details=(
+                f"error_code=execution_claim_acquired; claim_id={claim.id}; task_id={task.id}; "
+                f"runtime={runtime.value}; owner={owner}; expires_at={claim.expires_at.isoformat()}."
+            ),
+        )
+        session.add(observation)
+        session.flush()
+        session.add(
+            EventLedgerRecord(
+                run_id=run.id,
+                event_type=LedgerEventType.OBSERVATION_RECORDED,
+                payload={
+                    "observation_id": observation.id,
+                    "kind": observation.kind.value,
+                    "summary": observation.summary,
+                },
+            ),
+        )
+        return claim
+
+    def _release_execution_claim(
+        self,
+        *,
+        session: Session,
+        run_id: str,
+        execution_context_id: str,
+        reason: str,
+    ) -> None:
+        claim = self._load_execution_claim(session, run_id)
+        if claim is None:
+            return
+        if claim.status != ExecutionClaimStatus.ACTIVE:
+            return
+        task = session.get(TaskRecord, claim.task_id) if claim.task_id is not None else None
+        if task is None or task.execution_context_id != execution_context_id:
+            return
+        now = utc_now()
+        claim.status = ExecutionClaimStatus.RELEASED
+        claim.released_at = now
+        claim.heartbeat_at = now
+        claim.reclaim_reason = reason
+        claim.version += 1
+        session.add(
+            EventLedgerRecord(
+                run_id=run_id,
+                event_type=LedgerEventType.EXECUTION_CLAIM_RELEASED,
+                payload={
+                    "claim_id": claim.id,
+                    "task_id": claim.task_id,
+                    "runtime": claim.runtime,
+                    "owner": claim.owner,
+                    "reason": reason,
+                },
+            ),
+        )
+        observation = ObservationRecord(
+            run_id=run_id,
+            kind=ObservationKind.SYSTEM_AUDIT,
+            summary="Execution claim was released after bounded execution finished.",
+            details=(
+                f"error_code=execution_claim_released; claim_id={claim.id}; task_id={claim.task_id}; "
+                f"runtime={claim.runtime}; owner={claim.owner}; reason={reason}."
+            ),
+        )
+        session.add(observation)
+        session.flush()
+        session.add(
+            EventLedgerRecord(
+                run_id=run_id,
+                event_type=LedgerEventType.OBSERVATION_RECORDED,
+                payload={
+                    "observation_id": observation.id,
+                    "kind": observation.kind.value,
+                    "summary": observation.summary,
+                },
+            ),
+        )
+
+    def get_execution_claim(self, run_id: str) -> ExecutionClaimView | None:
+        self.ensure_schema()
+        with self.session() as session:
+            claim = self._load_execution_claim(session, run_id)
+            if claim is None:
+                return None
+            return self._to_execution_claim_view(claim)
+
+    def reclaim_execution_claims(self, run_id: str | None = None) -> list[ExecutionClaimView]:
+        self.ensure_schema()
+        with self.session() as session:
+            statement = select(ExecutionClaimRecord).where(ExecutionClaimRecord.status == ExecutionClaimStatus.ACTIVE)
+            if run_id is not None:
+                statement = statement.where(ExecutionClaimRecord.run_id == run_id)
+            claims = list(session.scalars(statement.order_by(ExecutionClaimRecord.acquired_at.asc())).all())
+            reclaimed: list[ExecutionClaimView] = []
+            for claim in claims:
+                run = session.get(RunRecord, claim.run_id)
+                if run is None:
+                    continue
+                claim_expires_at = self._coerce_utc_datetime(claim.expires_at)
+                if claim_expires_at is not None and claim_expires_at > utc_now():
+                    continue
+                reclaimed_record = self._reclaim_execution_claim_locked(
+                    session=session,
+                    run=run,
+                    claim=claim,
+                    reason="Execution lease expired and was reclaimed by the Step 17 reconciliation path.",
+                )
+                reclaimed.append(self._to_execution_claim_view(reclaimed_record))
+            session.flush()
+            return reclaimed
 
     def create_run(self, run_input: RunCreateInput) -> RunView:
         self.ensure_schema()
@@ -377,6 +730,11 @@ class LedgerStore:
                 approval.run_id,
                 mutation_name="approval resolution",
                 allow_during_waiting_approval=True,
+            )
+            self._ensure_no_live_execution_claim(
+                session=session,
+                run=run,
+                mutation_name="approval resolution",
             )
             run.status = RunStatus.READY if approved else RunStatus.REJECTED
 
@@ -706,6 +1064,11 @@ class LedgerStore:
                 raise LookupError(
                     f"Patch intake {patch_intake_id} is missing one of its required run/task/artifact links.",
                 )
+            self._ensure_no_live_execution_claim(
+                session=session,
+                run=run,
+                mutation_name="patch approval",
+            )
             message, _, _ = self._apply_patch_intake_resolution(
                 session=session,
                 run=run,
@@ -736,6 +1099,11 @@ class LedgerStore:
             run = session.get(RunRecord, patch_intake.run_id)
             if run is None:
                 raise LookupError(f"Run {patch_intake.run_id} was not found.")
+            self._ensure_no_live_execution_claim(
+                session=session,
+                run=run,
+                mutation_name="patch rejection",
+            )
 
             patch_intake.status = PatchIntakeStatus.REJECTED
             patch_intake.resolved_at = utc_now()
@@ -844,6 +1212,12 @@ class LedgerStore:
                     .where(PatchIntakeRecord.run_id == run_id)
                     .order_by(PatchIntakeRecord.created_at.asc(), PatchIntakeRecord.id.asc()),
                 ).all(),
+            )
+            execution_claim = self._load_execution_claim(session, run_id)
+            active_execution_claim = (
+                self._to_execution_claim_view(execution_claim)
+                if execution_claim is not None and execution_claim.status == ExecutionClaimStatus.ACTIVE
+                else None
             )
             founder_intervention_records = list(
                 session.scalars(
@@ -1006,6 +1380,12 @@ class LedgerStore:
                     .order_by(PatchIntakeRecord.created_at.asc(), PatchIntakeRecord.id.asc()),
                 ).all(),
             )
+            execution_claim = self._load_execution_claim(session, run_id)
+            active_execution_claim = (
+                self._to_execution_claim_view(execution_claim)
+                if execution_claim is not None and execution_claim.status == ExecutionClaimStatus.ACTIVE
+                else None
+            )
 
             pending_approval = next(
                 (approval for approval in reversed(approvals) if approval.status == ApprovalStatus.PENDING),
@@ -1078,6 +1458,9 @@ class LedgerStore:
                 "pending_patch_intake": (
                     pending_patch_intake.model_dump(mode="json") if pending_patch_intake else None
                 ),
+                "active_execution_claim": (
+                    active_execution_claim.model_dump(mode="json") if active_execution_claim else None
+                ),
                 "latest_founder_intervention_summary": latest_founder_intervention_summary,
                 "latest_rejection_reason": latest_rejection_reason,
                 "latest_decision_summary": latest_decision_summary,
@@ -1116,6 +1499,7 @@ class LedgerStore:
                 pending_approval=pending_approval,
                 pending_founder_escalation=pending_founder_escalation,
                 pending_patch_intake=self._build_pending_patch_intake(pending_patch_intake),
+                active_execution_claim=active_execution_claim,
                 latest_founder_intervention_summary=latest_founder_intervention_summary,
                 latest_rejection_reason=latest_rejection_reason,
                 latest_decision_summary=latest_decision_summary,
@@ -1188,6 +1572,7 @@ class LedgerStore:
             pending_approval=snapshot.pending_approval,
             pending_founder_escalation=snapshot.pending_founder_escalation,
             pending_patch_intake=snapshot.pending_patch_intake,
+            active_execution_claim=snapshot.active_execution_claim,
             planner_budget_remaining=snapshot.planner_budget_remaining,
             planner_phase_exhausted=snapshot.planner_phase_exhausted,
             planner_stale_quota_remaining=snapshot.planner_stale_quota_remaining,
@@ -2361,6 +2746,14 @@ class LedgerStore:
                 raise ValueError(
                     f"Planner escalation {target_escalation_id} already has a founder reply recorded.",
                 )
+            run = session.get(RunRecord, run_id)
+            if run is None:
+                raise LookupError(f"Run {run_id} was not found.")
+            self._ensure_no_live_execution_claim(
+                session=session,
+                run=run,
+                mutation_name="founder reply",
+            )
 
             record = FounderInterventionRecord(
                 run_id=run_id,
@@ -2541,6 +2934,14 @@ class LedgerStore:
             )
             session.add(task)
             session.flush()
+            self._acquire_execution_claim(
+                session=session,
+                run=run,
+                task=task,
+                runtime=ExecutionRuntime.ISOLATED_WORKER,
+                timeout_seconds=timeout_seconds,
+                owner="isolated_worker_dispatch",
+            )
             session.add(
                 EventLedgerRecord(
                     run_id=run.id,
@@ -2682,6 +3083,14 @@ class LedgerStore:
             )
             session.add(task)
             session.flush()
+            self._acquire_execution_claim(
+                session=session,
+                run=run,
+                task=task,
+                runtime=ExecutionRuntime.CONTAINERIZED_WORKER,
+                timeout_seconds=timeout_seconds,
+                owner="containerized_worker_dispatch",
+            )
             session.add(
                 EventLedgerRecord(
                     run_id=run.id,
@@ -3087,6 +3496,11 @@ class LedgerStore:
 
     @staticmethod
     def _build_progress_execution_summary(snapshot: RunSnapshotView) -> str | None:
+        if snapshot.active_execution_claim is not None and snapshot.latest_task is None:
+            return (
+                f"Execution lease is held by {snapshot.active_execution_claim.owner} "
+                f"until {snapshot.active_execution_claim.expires_at.isoformat()}."
+            )
         latest_task = snapshot.latest_task
         if latest_task is None:
             return None
@@ -3142,6 +3556,17 @@ class LedgerStore:
                 snapshot.pending_approval.reason,
                 "Approve or reject the pending approval gate.",
             )
+        if snapshot.active_execution_claim is not None:
+            return (
+                ProgressSurfaceStatus.RUNNING_EXECUTION,
+                ProgressActionOwner.EXECUTOR,
+                "A bounded execution lease is currently active.",
+                (
+                    f"{snapshot.active_execution_claim.runtime} owned by {snapshot.active_execution_claim.owner} "
+                    f"until {snapshot.active_execution_claim.expires_at.isoformat()}."
+                ),
+                "Wait for execution to finish or reconcile the claim if the lease has expired.",
+            )
         if snapshot.run.status == RunStatus.SUSPENDED:
             return (
                 ProgressSurfaceStatus.SUSPENDED_ON_TIMEOUT,
@@ -3163,8 +3588,16 @@ class LedgerStore:
                 ProgressSurfaceStatus.RUNNING_EXECUTION,
                 ProgressActionOwner.EXECUTOR,
                 "Bounded execution is currently running.",
-                snapshot.latest_task.summary if snapshot.latest_task is not None else None,
-                "Wait for execution to finish or inspect the current task output.",
+                (
+                    snapshot.latest_task.summary
+                    if snapshot.latest_task is not None
+                    else (
+                        f"Execution lease is held by {snapshot.active_execution_claim.owner}."
+                        if snapshot.active_execution_claim is not None
+                        else None
+                    )
+                ),
+                "Wait for execution to finish or inspect the current task output or lease state.",
             )
         if snapshot.run.status == RunStatus.COMPLETED:
             return (
@@ -3220,6 +3653,21 @@ class LedgerStore:
                 purpose="Review the full bounded execution and governance narrative.",
             ),
         ]
+        if snapshot.active_execution_claim is not None:
+            commands.extend(
+                [
+                    ProgressCommandHintView(
+                        label="Claim inspect",
+                        command=f"v2-spring task claim {run_id}",
+                        purpose="Inspect the current execution lease owner and expiry window.",
+                    ),
+                    ProgressCommandHintView(
+                        label="Claim reconcile",
+                        command=f"v2-spring task reconcile-claims {run_id}",
+                        purpose="Reclaim an expired execution lease and record the result as typed audit evidence.",
+                    ),
+                ],
+            )
         if surface_status == ProgressSurfaceStatus.WAITING_ON_APPROVAL and snapshot.pending_approval is not None:
             commands.extend(
                 [
@@ -3833,6 +4281,12 @@ class LedgerStore:
             task.completed_at = receipt.finished_at
             task.status = TaskStatus.FAILED
             run.status = RunStatus.FAILED
+            self._release_execution_claim(
+                session=session,
+                run_id=run.id,
+                execution_context_id=receipt.execution_context_id,
+                reason="execution_failed",
+            )
 
             receipt_artifact = ArtifactRecord(
                 run_id=run.id,
@@ -3946,6 +4400,12 @@ class LedgerStore:
                 task.completed_at = receipt.finished_at
                 task.status = TaskStatus.COMPLETED
                 run.status = RunStatus.READY
+                self._release_execution_claim(
+                    session=session,
+                    run_id=run.id,
+                    execution_context_id=receipt.execution_context_id,
+                    reason="execution_completed",
+                )
 
                 patch_warnings, risk_class, auto_apply_eligible, patch_summary = self._build_patch_review_policy(
                     session=session,

@@ -128,7 +128,7 @@ Observed In:
 - ~~[RISK-0019 Single-provider structured output may leak vendor semantics into the core planner transport seam](entries/2026-04-17-provider-schema-lock-in.md)~~
 - ~~[RISK-0020 Provider/network errors may bypass planner governance if they are not normalized at the adapter edge](entries/2026-04-17-provider-error-normalization-leak.md)~~
 - [RISK-0021 Local CLI cancellation may leave an in-flight provider call orphaned after the terminal exits](entries/2026-04-17-provider-cancellation-orphan.md)
-- [RISK-0022 Multi-worker approval gating still needs lease-aware concurrency controls](entries/2026-04-17-multi-worker-approval-concurrency.md)
+- ~~[RISK-0022 Multi-worker approval gating still needs lease-aware concurrency controls](entries/2026-04-17-multi-worker-approval-concurrency.md)~~
 - ~~[RISK-0023 Isolated worker proof may leak secrets or main workspace access if isolation is only logical](entries/2026-04-17-isolated-worker-sandbox-leakage.md)~~
 - ~~[RISK-0024 Isolated worker may crash or hang without a reclaim path, leaving running tasks stuck](entries/2026-04-17-silent-worker-crash-reclaim-gap.md)~~
 - ~~[RISK-0025 Founder review may become a throughput bottleneck without risk-based patch intake routing](entries/2026-04-17-patch-review-fatigue-and-routing.md)~~
@@ -152,3 +152,6 @@ Observed In:
 - ~~[RISK-0043 Detailed repair feedback may still trap the planner in a bounded but wasteful repair loop](entries/2026-04-17-repair-loop-deadlock-after-detailed-feedback.md)~~
 - ~~[RISK-0044 Lightweight structural scan may create founder friction through false positives](entries/2026-04-17-structural-scan-false-positive-friction.md)~~
 - [RISK-0045 Static protected-path lists may miss semantically central files outside the initial trust boundary](entries/2026-04-17-shadow-centrality-beyond-protected-paths.md)
+- [RISK-0046 Lease TTL may starve long-running work or delay reclaim when ownership lasts too long](entries/2026-04-17-lease-starvation-and-reclaim-deadlock.md)
+- [RISK-0047 Execution claim acquisition may still depend on store-level serialization without stronger atomic CAS semantics](entries/2026-04-17-atomic-claim-failure.md)
+- [RISK-0048 Reclaim may reopen ownership before old worker side-effects are fully fenced](entries/2026-04-17-reclaim-side-effects-without-fencing.md)
