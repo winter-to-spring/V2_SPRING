@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from v2_spring.domain.patch_intake import PatchIntakeStatus
 from v2_spring.domain.run import RunStatus
 from v2_spring.domain.snapshot import (
     PossibleActionEvaluationView,
@@ -29,8 +30,18 @@ def evaluate_possible_actions(snapshot: RunSnapshotView) -> PossibleActionEvalua
                 context_hint=snapshot.pending_approval.reason,
             ),
         )
+    elif snapshot.pending_patch_intake is not None:
+        actions = []
     elif snapshot.pending_founder_escalation is not None:
         actions = []
+    elif snapshot.latest_patch_intake_status == PatchIntakeStatus.REJECTED:
+        actions.append(
+            PossibleActionView(
+                name=PossibleActionName.REPLAN_FROM_FAILED_EXECUTION,
+                reason="A worker patch was rejected or failed validation and the planner should try again with current code state.",
+                context_hint=snapshot.latest_patch_rejection_reason,
+            ),
+        )
     elif snapshot.run.status == RunStatus.READY and snapshot.task_summary.created == 0 and snapshot.task_summary.running == 0:
         actions.append(
             PossibleActionView(
@@ -59,6 +70,9 @@ def evaluate_possible_actions(snapshot: RunSnapshotView) -> PossibleActionEvalua
     if actions:
         action_state = SnapshotActionState.AVAILABLE
         action_state_reason = "One or more legal next actions are available."
+    elif snapshot.pending_patch_intake is not None:
+        action_state = SnapshotActionState.BLOCKED
+        action_state_reason = "A founder patch review is required before execution can continue."
     elif snapshot.pending_founder_escalation is not None:
         action_state = SnapshotActionState.BLOCKED
         action_state_reason = "A founder reply is required before planner actions can continue."

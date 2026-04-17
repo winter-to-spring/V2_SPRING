@@ -13,6 +13,16 @@ from v2_spring.domain.founder_intervention import (
     FounderOverrideInput,
 )
 from v2_spring.domain.observation import ObservationKind, ObservationView
+from v2_spring.domain.patch_intake import (
+    PatchIntakeStatus,
+    PatchIntakeView,
+    PatchResolutionCode,
+    PatchResolutionView,
+    PatchReviewView,
+    PatchReviewWarningView,
+    PatchRiskClass,
+    PatchWarningCode,
+)
 from v2_spring.domain.planner_attempt import (
     PlannerAttemptOutcome,
     PlannerAttemptView,
@@ -51,6 +61,7 @@ from v2_spring.domain.routing import (
 from v2_spring.domain.run import RiskLevel, RunCreateInput, RunStatus, RunView, UrgencyLevel
 from v2_spring.domain.snapshot import (
     ArtifactHeadlineView,
+    PendingPatchIntakeView,
     PossibleActionEvaluationView,
     PossibleActionName,
     PossibleActionView,
@@ -80,6 +91,15 @@ __all__ = [
     "FOUNDER_REPLY_INPUT_ADAPTER",
     "ObservationKind",
     "ObservationView",
+    "PatchIntakeStatus",
+    "PatchIntakeView",
+    "PatchResolutionCode",
+    "PatchResolutionView",
+    "PatchReviewView",
+    "PatchReviewWarningView",
+    "PatchRiskClass",
+    "PatchWarningCode",
+    "PendingPatchIntakeView",
     "PlannerAttemptOutcome",
     "PlannerAttemptView",
     "PlannerGovernanceView",

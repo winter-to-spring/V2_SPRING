@@ -7,6 +7,7 @@ from v2_spring.domain.artifact import ArtifactView
 from v2_spring.domain.decision import DecisionView
 from v2_spring.domain.founder_intervention import FounderInterventionView
 from v2_spring.domain.observation import ObservationView
+from v2_spring.domain.patch_intake import PatchIntakeView
 from v2_spring.domain.planner_attempt import PlannerAttemptView
 from v2_spring.domain.run import RunView
 from v2_spring.domain.task import TaskView
@@ -44,6 +45,7 @@ class RunReplayView(BaseModel):
     tasks: list[TaskReplayView]
     planner_attempts: list[PlannerAttemptView]
     founder_interventions: list[FounderInterventionView]
+    patch_intakes: list[PatchIntakeView]
     observations: list[ObservationView]
     orphan_artifacts: list[ArtifactInspectionView]
     consistency_warnings: list[str]

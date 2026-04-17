@@ -24,6 +24,16 @@ from v2_spring.domain.founder_intervention import (
     FounderReplyKind,
 )
 from v2_spring.domain.observation import ObservationKind, ObservationView
+from v2_spring.domain.patch_intake import (
+    PatchIntakeStatus,
+    PatchIntakeView,
+    PatchResolutionCode,
+    PatchResolutionView,
+    PatchReviewView,
+    PatchReviewWarningView,
+    PatchRiskClass,
+    PatchWarningCode,
+)
 from v2_spring.domain.planner_adapter import (
     EscalationProposal,
     FailureClass,
@@ -66,6 +76,7 @@ from v2_spring.domain.routing import (
 from v2_spring.domain.run import RunCreateInput, RunStatus, RunView
 from v2_spring.domain.snapshot import (
     ArtifactHeadlineView,
+    PendingPatchIntakeView,
     PendingFounderEscalationView,
     PossibleActionEvaluationView,
     PossibleActionView,
@@ -91,6 +102,7 @@ from v2_spring.ledger.models import (
     FounderInterventionRecord,
     LedgerEventType,
     ObservationRecord,
+    PatchIntakeRecord,
     PlannerAttemptRecord,
     RunRecord,
     TaskRecord,
@@ -106,6 +118,14 @@ from v2_spring.planner.proposals import (
     StalePlannerProposalError,
     TransportDuplicatePlannerProposalError,
 )
+from v2_spring.runtime import (
+    IsolatedWorkerReceipt,
+    IsolatedWorkerTimeout,
+    PatchApplyOutcome,
+    PatchApplyReceipt,
+    apply_patch_strict,
+    execute_isolated_worker_proof,
+)
 
 
 @dataclass(frozen=True)
@@ -115,6 +135,16 @@ class BoundedExecutionResult:
     task: TaskView
     artifact: ArtifactView | None
     observation: ObservationView
+
+
+@dataclass(frozen=True)
+class IsolatedWorkerDispatchResult:
+    """Return the isolated worker proof in a typed bundle."""
+
+    task: TaskView
+    artifacts: list[ArtifactView]
+    observation: ObservationView
+    receipt: IsolatedWorkerReceipt
 
 
 class LedgerStore:
@@ -588,6 +618,273 @@ class LedgerStore:
                 return None
             return self._inspect_artifact(record)
 
+    def list_patch_intakes_for_run(self, run_id: str) -> list[PatchIntakeView]:
+        self.ensure_schema()
+        with self.session() as session:
+            records = list(
+                session.scalars(
+                    select(PatchIntakeRecord)
+                    .where(PatchIntakeRecord.run_id == run_id)
+                    .order_by(PatchIntakeRecord.created_at.asc(), PatchIntakeRecord.id.asc()),
+                ).all(),
+            )
+            return [self._to_patch_intake_view(record) for record in records]
+
+    def build_patch_review(self, run_id: str, *, include_raw: bool = False) -> PatchReviewView:
+        self.ensure_schema()
+        with self.session() as session:
+            record = next(
+                (
+                    item
+                    for item in reversed(
+                        list(
+                            session.scalars(
+                                select(PatchIntakeRecord)
+                                .where(PatchIntakeRecord.run_id == run_id)
+                                .order_by(PatchIntakeRecord.created_at.asc(), PatchIntakeRecord.id.asc()),
+                            ).all(),
+                        )
+                    )
+                    if item.status == PatchIntakeStatus.PENDING
+                ),
+                None,
+            )
+            if record is None:
+                raise LookupError(f"Run {run_id} has no pending patch intake to review.")
+
+            patch_artifact = session.get(ArtifactRecord, record.patch_artifact_id)
+            receipt_artifact = session.get(ArtifactRecord, record.receipt_artifact_id)
+            if patch_artifact is None or receipt_artifact is None:
+                raise LookupError(
+                    f"Patch intake {record.id} is missing its patch or execution receipt artifact.",
+                )
+
+            patch_body = Path(patch_artifact.path).read_text(encoding="utf-8")
+            raw_receipt = Path(receipt_artifact.path).read_text(encoding="utf-8")
+            receipt_payload = json.loads(raw_receipt)
+            added, removed = self._count_patch_lines(patch_body)
+
+            return PatchReviewView(
+                intake=self._to_patch_intake_view(record),
+                patch_body=patch_body,
+                receipt_preview=(
+                    f"runtime={receipt_payload.get('runtime', '-')}; "
+                    f"changed_files={len(receipt_payload.get('changed_files', []))}; "
+                    f"summary={receipt_payload.get('summary', '-')}"
+                ),
+                changed_lines_added=added,
+                changed_lines_removed=removed,
+                raw_receipt=raw_receipt if include_raw else None,
+            )
+
+    def approve_patch_intake(self, patch_intake_id: str) -> PatchResolutionView:
+        self.ensure_schema()
+        with self.session() as session:
+            patch_intake = session.get(PatchIntakeRecord, patch_intake_id)
+            if patch_intake is None:
+                raise LookupError(f"Patch intake {patch_intake_id} was not found.")
+            if patch_intake.status != PatchIntakeStatus.PENDING:
+                raise ValueError(
+                    f"Patch intake {patch_intake_id} is already {patch_intake.status.value} and cannot be approved again.",
+                )
+
+            run = session.get(RunRecord, patch_intake.run_id)
+            task = session.get(TaskRecord, patch_intake.task_id)
+            patch_artifact = session.get(ArtifactRecord, patch_intake.patch_artifact_id)
+            receipt_artifact = session.get(ArtifactRecord, patch_intake.receipt_artifact_id)
+            if run is None or task is None or patch_artifact is None or receipt_artifact is None:
+                raise LookupError(
+                    f"Patch intake {patch_intake_id} is missing one of its required run/task/artifact links.",
+                )
+
+            patch_body = Path(patch_artifact.path).read_text(encoding="utf-8")
+            receipt_payload = json.loads(Path(receipt_artifact.path).read_text(encoding="utf-8"))
+            apply_receipt = apply_patch_strict(
+                workspace=Path(patch_intake.source_workspace),
+                patch_body=patch_body,
+                patch_sha256=patch_intake.patch_sha256,
+                changed_files=list(patch_intake.changed_files),
+                base_file_hashes=dict(receipt_payload.get("base_file_hashes", {})),
+            )
+
+            validation_artifact = self._persist_validation_receipt_artifact(
+                session=session,
+                run=run,
+                task=task,
+                patch_intake=patch_intake,
+                patch_artifact=patch_artifact,
+                receipt=apply_receipt,
+            )
+            patch_intake.validation_artifact_id = validation_artifact.id
+            patch_intake.validation_command = apply_receipt.validation_command
+
+            if apply_receipt.outcome == PatchApplyOutcome.APPLIED:
+                patch_intake.status = PatchIntakeStatus.APPLIED
+                patch_intake.resolved_at = apply_receipt.finished_at
+                patch_intake.resolution_code = PatchResolutionCode.FOUNDER_APPROVED
+                patch_intake.resolution_reason = apply_receipt.summary
+                run.status = RunStatus.COMPLETED
+                session.add(
+                    EventLedgerRecord(
+                        run_id=run.id,
+                        event_type=LedgerEventType.PATCH_INTAKE_APPLIED,
+                        payload={
+                            "patch_intake_id": patch_intake.id,
+                            "task_id": task.id,
+                            "patch_artifact_id": patch_artifact.id,
+                            "validation_artifact_id": validation_artifact.id,
+                            "resolution_code": patch_intake.resolution_code.value,
+                        },
+                    ),
+                )
+                observation = ObservationRecord(
+                    run_id=run.id,
+                    kind=ObservationKind.SYSTEM_AUDIT,
+                    summary="Founder approved the patch intake and strict apply succeeded.",
+                    details=(
+                        f"error_code={patch_intake.resolution_code.value}; "
+                        f"patch_intake_id={patch_intake.id}; "
+                        f"validation_artifact_id={validation_artifact.id}; "
+                        f"validation_command={apply_receipt.validation_command}."
+                    ),
+                )
+                session.add(observation)
+                session.flush()
+                session.add(
+                    EventLedgerRecord(
+                        run_id=run.id,
+                        event_type=LedgerEventType.OBSERVATION_RECORDED,
+                        payload={
+                            "observation_id": observation.id,
+                            "kind": observation.kind.value,
+                            "summary": observation.summary,
+                        },
+                    ),
+                )
+                session.flush()
+                return PatchResolutionView(
+                    intake=self._to_patch_intake_view(patch_intake),
+                    message="Patch was applied strictly and the run is now completed.",
+                )
+
+            resolution_map = {
+                PatchApplyOutcome.BASE_HASH_CONFLICT: PatchResolutionCode.BASE_HASH_CONFLICT,
+                PatchApplyOutcome.APPLY_CHECK_FAILED: PatchResolutionCode.APPLY_CHECK_FAILED,
+                PatchApplyOutcome.VALIDATION_FAILED: PatchResolutionCode.VALIDATION_FAILED,
+            }
+            patch_intake.status = PatchIntakeStatus.REJECTED
+            patch_intake.resolved_at = apply_receipt.finished_at
+            patch_intake.resolution_code = resolution_map[apply_receipt.outcome]
+            patch_intake.resolution_reason = apply_receipt.summary
+            patch_intake.validation_command = apply_receipt.validation_command
+            run.status = RunStatus.READY
+            session.add(
+                EventLedgerRecord(
+                    run_id=run.id,
+                    event_type=LedgerEventType.PATCH_INTAKE_REJECTED,
+                    payload={
+                        "patch_intake_id": patch_intake.id,
+                        "task_id": task.id,
+                        "patch_artifact_id": patch_artifact.id,
+                        "validation_artifact_id": validation_artifact.id,
+                        "resolution_code": patch_intake.resolution_code.value,
+                    },
+                ),
+            )
+            observation = ObservationRecord(
+                run_id=run.id,
+                kind=ObservationKind.SYSTEM_AUDIT,
+                summary="Founder approved the patch review, but intake was rejected by strict apply or validation.",
+                details=(
+                    f"error_code={patch_intake.resolution_code.value}; "
+                    f"patch_intake_id={patch_intake.id}; "
+                    f"validation_artifact_id={validation_artifact.id}; "
+                    f"reason={patch_intake.resolution_reason}."
+                ),
+            )
+            session.add(observation)
+            session.flush()
+            session.add(
+                EventLedgerRecord(
+                    run_id=run.id,
+                    event_type=LedgerEventType.OBSERVATION_RECORDED,
+                    payload={
+                        "observation_id": observation.id,
+                        "kind": observation.kind.value,
+                        "summary": observation.summary,
+                    },
+                ),
+            )
+            session.flush()
+            return PatchResolutionView(
+                intake=self._to_patch_intake_view(patch_intake),
+                message=patch_intake.resolution_reason or "Patch intake was rejected.",
+            )
+
+    def reject_patch_intake(self, patch_intake_id: str, *, reason: str) -> PatchResolutionView:
+        self.ensure_schema()
+        normalized_reason = self._normalize_optional_text(reason)
+        if normalized_reason is None:
+            raise ValueError("Patch rejection requires a non-blank founder reason.")
+        with self.session() as session:
+            patch_intake = session.get(PatchIntakeRecord, patch_intake_id)
+            if patch_intake is None:
+                raise LookupError(f"Patch intake {patch_intake_id} was not found.")
+            if patch_intake.status != PatchIntakeStatus.PENDING:
+                raise ValueError(
+                    f"Patch intake {patch_intake_id} is already {patch_intake.status.value} and cannot be rejected again.",
+                )
+            run = session.get(RunRecord, patch_intake.run_id)
+            if run is None:
+                raise LookupError(f"Run {patch_intake.run_id} was not found.")
+
+            patch_intake.status = PatchIntakeStatus.REJECTED
+            patch_intake.resolved_at = utc_now()
+            patch_intake.resolution_code = PatchResolutionCode.FOUNDER_REJECTED
+            patch_intake.resolution_reason = normalized_reason
+            run.status = RunStatus.READY
+
+            session.add(
+                EventLedgerRecord(
+                    run_id=run.id,
+                    event_type=LedgerEventType.PATCH_INTAKE_REJECTED,
+                    payload={
+                        "patch_intake_id": patch_intake.id,
+                        "task_id": patch_intake.task_id,
+                        "patch_artifact_id": patch_intake.patch_artifact_id,
+                        "resolution_code": patch_intake.resolution_code.value,
+                    },
+                ),
+            )
+            observation = ObservationRecord(
+                run_id=run.id,
+                kind=ObservationKind.SYSTEM_AUDIT,
+                summary="Founder rejected the worker patch intake.",
+                details=(
+                    f"error_code={patch_intake.resolution_code.value}; "
+                    f"patch_intake_id={patch_intake.id}; "
+                    f"reason={patch_intake.resolution_reason}."
+                ),
+            )
+            session.add(observation)
+            session.flush()
+            session.add(
+                EventLedgerRecord(
+                    run_id=run.id,
+                    event_type=LedgerEventType.OBSERVATION_RECORDED,
+                    payload={
+                        "observation_id": observation.id,
+                        "kind": observation.kind.value,
+                        "summary": observation.summary,
+                    },
+                ),
+            )
+            session.flush()
+            return PatchResolutionView(
+                intake=self._to_patch_intake_view(patch_intake),
+                message="Founder rejected the patch intake. The run is ready for a new planning cycle.",
+            )
+
     def build_run_replay(self, run_id: str) -> RunReplayView:
         """Build a fixed-query replay projection for one run."""
 
@@ -642,11 +939,39 @@ class LedgerStore:
                     .order_by(PlannerAttemptRecord.created_at.asc(), PlannerAttemptRecord.id.asc()),
                 ).all(),
             )
+            patch_intake_records = list(
+                session.scalars(
+                    select(PatchIntakeRecord)
+                    .where(PatchIntakeRecord.run_id == run_id)
+                    .order_by(PatchIntakeRecord.created_at.asc(), PatchIntakeRecord.id.asc()),
+                ).all(),
+            )
             founder_intervention_records = list(
                 session.scalars(
                     select(FounderInterventionRecord)
                     .where(FounderInterventionRecord.run_id == run_id)
                     .order_by(FounderInterventionRecord.created_at.asc(), FounderInterventionRecord.id.asc()),
+                ).all(),
+            )
+            patch_intake_records = list(
+                session.scalars(
+                    select(PatchIntakeRecord)
+                    .where(PatchIntakeRecord.run_id == run_id)
+                    .order_by(PatchIntakeRecord.created_at.asc(), PatchIntakeRecord.id.asc()),
+                ).all(),
+            )
+            patch_intake_records = list(
+                session.scalars(
+                    select(PatchIntakeRecord)
+                    .where(PatchIntakeRecord.run_id == run_id)
+                    .order_by(PatchIntakeRecord.created_at.asc(), PatchIntakeRecord.id.asc()),
+                ).all(),
+            )
+            patch_intake_records = list(
+                session.scalars(
+                    select(PatchIntakeRecord)
+                    .where(PatchIntakeRecord.run_id == run_id)
+                    .order_by(PatchIntakeRecord.created_at.asc(), PatchIntakeRecord.id.asc()),
                 ).all(),
             )
             ledger_events = list(
@@ -660,6 +985,7 @@ class LedgerStore:
             founder_interventions = [
                 self._to_founder_intervention_view(record) for record in founder_intervention_records
             ]
+            patch_intakes = [self._to_patch_intake_view(record) for record in patch_intake_records]
 
             decision_map = {str(decision.id): decision for decision in decisions}
             task_map = {record.id: self._to_task_view(record) for record in task_records}
@@ -701,12 +1027,14 @@ class LedgerStore:
                 tasks=task_replays,
                 planner_attempts=planner_attempts,
                 founder_interventions=founder_interventions,
+                patch_intakes=patch_intakes,
                 observations=observations,
                 orphan_artifacts=orphan_artifacts,
                 consistency_warnings=self._build_consistency_warnings(
                     run=self._to_run_view(run_record),
                     approvals=approvals,
                     tasks=task_replays,
+                    patch_intakes=patch_intakes,
                     orphan_artifacts=orphan_artifacts,
                     ledger_events=ledger_events,
                 ),
@@ -772,6 +1100,13 @@ class LedgerStore:
                     .order_by(FounderInterventionRecord.created_at.asc(), FounderInterventionRecord.id.asc()),
                 ).all(),
             )
+            patch_intake_records = list(
+                session.scalars(
+                    select(PatchIntakeRecord)
+                    .where(PatchIntakeRecord.run_id == run_id)
+                    .order_by(PatchIntakeRecord.created_at.asc(), PatchIntakeRecord.id.asc()),
+                ).all(),
+            )
 
             pending_approval = next(
                 (approval for approval in reversed(approvals) if approval.status == ApprovalStatus.PENDING),
@@ -796,6 +1131,12 @@ class LedgerStore:
                 observation_records=observation_records,
                 founder_intervention_records=founder_intervention_records,
             )
+            patch_intakes = [self._to_patch_intake_view(record) for record in patch_intake_records]
+            pending_patch_intake = next(
+                (item for item in reversed(patch_intakes) if item.status == PatchIntakeStatus.PENDING),
+                None,
+            )
+            latest_patch_intake = patch_intakes[-1] if patch_intakes else None
             founder_interventions = [
                 self._to_founder_intervention_view(record) for record in founder_intervention_records
             ]
@@ -817,6 +1158,7 @@ class LedgerStore:
                 run=self._to_run_view(run_record),
                 pending_approval=pending_approval,
                 latest_rejection_reason=latest_rejection_reason,
+                latest_patch_intake=latest_patch_intake,
                 task_summary=task_summary,
                 latest_task=latest_task,
                 latest_artifact=latest_artifact,
@@ -834,9 +1176,19 @@ class LedgerStore:
                 "pending_founder_escalation": (
                     pending_founder_escalation.model_dump(mode="json") if pending_founder_escalation else None
                 ),
+                "pending_patch_intake": (
+                    pending_patch_intake.model_dump(mode="json") if pending_patch_intake else None
+                ),
                 "latest_founder_intervention_summary": latest_founder_intervention_summary,
                 "latest_rejection_reason": latest_rejection_reason,
                 "latest_decision_summary": latest_decision_summary,
+                "latest_patch_intake_status": latest_patch_intake.status.value if latest_patch_intake else None,
+                "latest_patch_intake_summary": latest_patch_intake.summary if latest_patch_intake else None,
+                "latest_patch_rejection_reason": (
+                    latest_patch_intake.resolution_reason
+                    if latest_patch_intake is not None and latest_patch_intake.status == PatchIntakeStatus.REJECTED
+                    else None
+                ),
                 "planner_phase_key": planner_governance.phase_key,
                 "planner_budget_limit": planner_governance.budget_limit,
                 "planner_budget_used": planner_governance.budget_used,
@@ -864,9 +1216,17 @@ class LedgerStore:
                 action_state_reason="Possible actions have not been evaluated yet.",
                 pending_approval=pending_approval,
                 pending_founder_escalation=pending_founder_escalation,
+                pending_patch_intake=self._build_pending_patch_intake(pending_patch_intake),
                 latest_founder_intervention_summary=latest_founder_intervention_summary,
                 latest_rejection_reason=latest_rejection_reason,
                 latest_decision_summary=latest_decision_summary,
+                latest_patch_intake_status=latest_patch_intake.status if latest_patch_intake else None,
+                latest_patch_intake_summary=latest_patch_intake.summary if latest_patch_intake else None,
+                latest_patch_rejection_reason=(
+                    latest_patch_intake.resolution_reason
+                    if latest_patch_intake is not None and latest_patch_intake.status == PatchIntakeStatus.REJECTED
+                    else None
+                ),
                 planner_phase_key=planner_governance.phase_key,
                 planner_budget_limit=planner_governance.budget_limit,
                 planner_budget_used=planner_governance.budget_used,
@@ -928,6 +1288,7 @@ class LedgerStore:
             next_step_hint=self._sanitize_planner_text(next_step_hint, limit=500),
             pending_approval=snapshot.pending_approval,
             pending_founder_escalation=snapshot.pending_founder_escalation,
+            pending_patch_intake=snapshot.pending_patch_intake,
             planner_budget_remaining=snapshot.planner_budget_remaining,
             planner_phase_exhausted=snapshot.planner_phase_exhausted,
             planner_stale_quota_remaining=snapshot.planner_stale_quota_remaining,
@@ -1066,6 +1427,11 @@ class LedgerStore:
             raise PlannerPhaseExhaustedError(
                 "Planner phase budget is exhausted for the current state segment. "
                 "Use `v2-spring planner recharge <run-id> --reason ...` before proposing again.",
+            )
+        if snapshot.pending_patch_intake is not None:
+            raise PermissionError(
+                "Founder patch review is still required before new planner proposals are allowed. "
+                f"Pending patch intake={snapshot.pending_patch_intake.intake_id}.",
             )
         if snapshot.pending_founder_escalation is not None:
             raise PermissionError(
@@ -1383,6 +1749,13 @@ class LedgerStore:
                     .order_by(PlannerAttemptRecord.created_at.asc(), PlannerAttemptRecord.id.asc()),
                 ).all(),
             )
+            patch_intake_records = list(
+                session.scalars(
+                    select(PatchIntakeRecord)
+                    .where(PatchIntakeRecord.run_id == run_id)
+                    .order_by(PatchIntakeRecord.created_at.asc(), PatchIntakeRecord.id.asc()),
+                ).all(),
+            )
 
             pending_approval = next(
                 (approval for approval in reversed(approvals) if approval.status == ApprovalStatus.PENDING),
@@ -1402,11 +1775,17 @@ class LedgerStore:
                 if artifact_records
                 else None
             )
+            latest_patch_intake = (
+                self._to_patch_intake_view(patch_intake_records[-1])
+                if patch_intake_records
+                else None
+            )
             task_summary = self._build_task_status_summary(task_records)
             phase_key = self._build_planner_phase_key(
                 run=self._to_run_view(run_record),
                 pending_approval=pending_approval,
                 latest_rejection_reason=latest_rejection_reason,
+                latest_patch_intake=latest_patch_intake,
                 task_summary=task_summary,
                 latest_task=latest_task,
                 latest_artifact=latest_artifact,
@@ -2203,6 +2582,197 @@ class LedgerStore:
                 stderr=f"Artifact persistence failed after execution: {exc}",
             )
 
+    def dispatch_isolated_worker_task(
+        self,
+        *,
+        run_id: str,
+        workspace: Path,
+        artifact_root: Path,
+        timeout_seconds: int = 30,
+    ) -> IsolatedWorkerDispatchResult:
+        """Dispatch one bounded isolated-worker proof and persist its trail."""
+
+        self.ensure_schema()
+        workspace = workspace.expanduser().resolve()
+        artifact_root = artifact_root.expanduser().resolve()
+        requirements = ExecutionRequirements(
+            task_complexity="low",
+            needs_isolation=True,
+            requires_network=False,
+            needs_multi_file_context=False,
+            write_scope="single_file",
+            expected_output_kind="unified_patch",
+        )
+
+        inspection = self.inspect_task_route(run_id, requirements=requirements, record=True)
+        if not isinstance(inspection.outcome, RoutingDecision):
+            raise PermissionError(
+                f"Run {run_id} cannot be dispatched to the isolated worker: {inspection.outcome.message}",
+            )
+        if inspection.outcome.runtime != ExecutionRuntime.ISOLATED_WORKER:
+            raise PermissionError(
+                f"Run {run_id} currently routes to {inspection.outcome.runtime.value}, not isolated_worker.",
+            )
+
+        with self.session() as session:
+            run = self._get_run_for_execution(session, run_id)
+            existing_task_count = session.scalar(
+                select(TaskRecord).where(TaskRecord.run_id == run.id).limit(1),
+            )
+            if existing_task_count is not None:
+                raise PermissionError(
+                    f"Run {run_id} already has execution evidence and cannot dispatch another proof in Step 12-b.",
+                )
+
+            decision = DecisionRecord(
+                run_id=run.id,
+                kind=DecisionKind.ISOLATED_WORKER_SELECTED,
+                summary="An isolated worker proof was selected for dispatch.",
+                rationale=(
+                    "Step 12-b intentionally proves one soft-isolated worker lane before broader execution-plane "
+                    "fan-out is introduced."
+                ),
+            )
+            session.add(decision)
+            session.flush()
+            session.add(
+                EventLedgerRecord(
+                    run_id=run.id,
+                    event_type=LedgerEventType.DECISION_RECORDED,
+                    payload={
+                        "decision_id": decision.id,
+                        "kind": decision.kind.value,
+                        "summary": decision.summary,
+                        "runtime": inspection.outcome.runtime.value,
+                        "routing_policy": inspection.outcome.matched_policy,
+                    },
+                ),
+            )
+
+            execution_context_id = str(uuid4())
+            sandbox_cwd = str(artifact_root / run_id / execution_context_id / "sandbox")
+            task = TaskRecord(
+                run_id=run.id,
+                decision_id=decision.id,
+                kind=TaskKind.ISOLATED_WORKER_PROOF,
+                status=TaskStatus.READY,
+                summary="Run one bounded patch-producing proof inside an isolated worker sandbox.",
+                execution_context_id=execution_context_id,
+                command=f"isolated_worker_proof --workspace {workspace}",
+                cwd=sandbox_cwd,
+                timeout_seconds=timeout_seconds,
+            )
+            session.add(task)
+            session.flush()
+            session.add(
+                EventLedgerRecord(
+                    run_id=run.id,
+                    event_type=LedgerEventType.TASK_CREATED,
+                    payload={
+                        "task_id": task.id,
+                        "decision_id": decision.id,
+                        "kind": task.kind.value,
+                        "summary": task.summary,
+                        "status": task.status.value,
+                        "runtime": inspection.outcome.runtime.value,
+                        "requirements": requirements.model_dump(mode="json"),
+                    },
+                ),
+            )
+
+            task.status = TaskStatus.RUNNING
+            task.started_at = utc_now()
+            run.status = RunStatus.RUNNING
+            session.add(
+                EventLedgerRecord(
+                    run_id=run.id,
+                    event_type=LedgerEventType.TASK_STARTED,
+                    payload={
+                        "task_id": task.id,
+                        "decision_id": decision.id,
+                        "kind": task.kind.value,
+                        "status": task.status.value,
+                        "workspace": str(workspace),
+                        "runtime": inspection.outcome.runtime.value,
+                        "snapshot_hash": inspection.snapshot_hash,
+                        "base_context": {
+                            "source_action": inspection.source_action.value if inspection.source_action else None,
+                            "requirements": requirements.model_dump(mode="json"),
+                        },
+                    },
+                ),
+            )
+            session.flush()
+            task_id = task.id
+
+        try:
+            receipt = execute_isolated_worker_proof(
+                workspace=workspace,
+                timeout_seconds=timeout_seconds,
+                execution_context_id=execution_context_id,
+            )
+        except (IsolatedWorkerTimeout, FileNotFoundError, NotADirectoryError) as exc:
+            synthetic_receipt = self._build_failed_isolated_receipt(
+                workspace=workspace,
+                execution_context_id=execution_context_id,
+                timeout_seconds=timeout_seconds,
+                summary=str(exc),
+            )
+            return self._finalize_failed_isolated_task(
+                run_id=run_id,
+                task_id=task_id,
+                artifact_root=artifact_root,
+                receipt=synthetic_receipt,
+                failure_summary=str(exc),
+            )
+        except Exception as exc:  # pragma: no cover - defensive guard
+            synthetic_receipt = self._build_failed_isolated_receipt(
+                workspace=workspace,
+                execution_context_id=execution_context_id,
+                timeout_seconds=timeout_seconds,
+                summary=f"Unexpected isolated worker failure: {exc}",
+            )
+            return self._finalize_failed_isolated_task(
+                run_id=run_id,
+                task_id=task_id,
+                artifact_root=artifact_root,
+                receipt=synthetic_receipt,
+                failure_summary=f"Unexpected isolated worker failure: {exc}",
+            )
+
+        if receipt.timed_out or receipt.returncode not in (0, None):
+            failure_summary = receipt.summary
+            return self._finalize_failed_isolated_task(
+                run_id=run_id,
+                task_id=task_id,
+                artifact_root=artifact_root,
+                receipt=receipt,
+                failure_summary=failure_summary,
+            )
+        if not receipt.patch_body:
+            return self._finalize_failed_isolated_task(
+                run_id=run_id,
+                task_id=task_id,
+                artifact_root=artifact_root,
+                receipt=receipt,
+                failure_summary="Isolated worker proof completed without producing a bounded patch.",
+            )
+        try:
+            return self._finalize_completed_isolated_task(
+                run_id=run_id,
+                task_id=task_id,
+                artifact_root=artifact_root,
+                receipt=receipt,
+            )
+        except Exception as exc:
+            return self._finalize_failed_isolated_task(
+                run_id=run_id,
+                task_id=task_id,
+                artifact_root=artifact_root,
+                receipt=receipt,
+                failure_summary=f"Patch/receipt persistence failed after isolated execution: {exc}",
+            )
+
     @staticmethod
     def _build_run_created_event(record: RunRecord) -> EventLedgerRecord:
         return EventLedgerRecord(
@@ -2297,6 +2867,11 @@ class LedgerStore:
         latest_task = snapshot.latest_task
         if latest_task is None:
             return None
+        if snapshot.pending_patch_intake is not None:
+            return (
+                f"{latest_task.summary} produced a patch and is waiting for founder review "
+                f"({snapshot.pending_patch_intake.touched_file_count} touched file(s))."
+            )
         if latest_task.status == TaskStatus.FAILED:
             return (
                 f"{latest_task.summary} failed"
@@ -2327,6 +2902,14 @@ class LedgerStore:
                 "Founder reply is blocking the next planner step.",
                 snapshot.pending_founder_escalation.summary,
                 "Respond with a hint, bounded override, or reject to close the founder-help lane.",
+            )
+        if snapshot.pending_patch_intake is not None:
+            return (
+                ProgressSurfaceStatus.WAITING_ON_FOUNDER,
+                ProgressActionOwner.FOUNDER,
+                "Founder patch review is blocking the next execution-plane step.",
+                snapshot.pending_patch_intake.summary,
+                "Review the compact patch summary and choose approve or reject.",
             )
         if snapshot.pending_approval is not None:
             return (
@@ -2428,6 +3011,29 @@ class LedgerStore:
                             f"v2-spring approval resolve {snapshot.pending_approval.id} --approve"
                         ),
                         purpose="Approve the current gate or swap --approve for --reject --reason-file ./approval_reason.txt.",
+                    ),
+                ],
+            )
+        elif surface_status == ProgressSurfaceStatus.WAITING_ON_FOUNDER and snapshot.pending_patch_intake is not None:
+            commands.extend(
+                [
+                    ProgressCommandHintView(
+                        label="Patch review",
+                        command=f"v2-spring patch review {run_id}",
+                        purpose="Open the compact patch review surface with warnings and inline diff.",
+                    ),
+                    ProgressCommandHintView(
+                        label="Patch approve",
+                        command=f"v2-spring patch approve {snapshot.pending_patch_intake.intake_id}",
+                        purpose="Apply the current patch through the strict all-or-nothing intake gate.",
+                    ),
+                    ProgressCommandHintView(
+                        label="Patch reject",
+                        command=(
+                            f"v2-spring patch reject {snapshot.pending_patch_intake.intake_id} "
+                            "--reason-file ./patch_reject_reason.txt"
+                        ),
+                        purpose="Reject the current patch and reopen planning with the founder rejection recorded.",
                     ),
                 ],
             )
@@ -2861,6 +3467,469 @@ class LedgerStore:
                 artifact_path.unlink()
             raise
 
+    def _build_failed_isolated_receipt(
+        self,
+        *,
+        workspace: Path,
+        execution_context_id: str,
+        timeout_seconds: int,
+        summary: str,
+    ) -> IsolatedWorkerReceipt:
+        now = utc_now()
+        return IsolatedWorkerReceipt(
+            execution_context_id=execution_context_id,
+            command=f"isolated_worker_proof --workspace {workspace}",
+            source_workspace=str(workspace),
+            sandbox_cwd=str(workspace),
+            started_at=now,
+            finished_at=now,
+            timeout_seconds=timeout_seconds,
+            returncode=None,
+            timed_out=False,
+            stdout_preview="",
+            stderr_preview=summary,
+            stdout_bytes=0,
+            stderr_bytes=len(summary.encode("utf-8")),
+            stderr_truncated=False,
+            changed_files=[],
+            patch_body=None,
+            summary=summary,
+            base_file_hashes={},
+            excluded_names=[],
+            env_allowlist=[],
+            secret_surface_present=False,
+        )
+
+    def _finalize_failed_isolated_task(
+        self,
+        *,
+        run_id: str,
+        task_id: str,
+        artifact_root: Path,
+        receipt: IsolatedWorkerReceipt,
+        failure_summary: str,
+    ) -> IsolatedWorkerDispatchResult:
+        artifact_directory = artifact_root / run_id / task_id
+        artifact_directory.mkdir(parents=True, exist_ok=True)
+        receipt_path = artifact_directory / "isolated-worker-receipt.json"
+        receipt_path.write_text(
+            json.dumps(receipt.model_dump(mode="json"), indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        receipt_bytes = receipt_path.read_bytes()
+        receipt_hash = sha256(receipt_bytes).hexdigest()
+
+        with self.session() as session:
+            run = session.get(RunRecord, run_id)
+            task = session.get(TaskRecord, task_id)
+            if run is None or task is None:
+                raise LookupError("Isolated task finalization failed because the run or task no longer exists.")
+
+            task.execution_context_id = receipt.execution_context_id
+            task.command = receipt.command
+            task.cwd = receipt.sandbox_cwd
+            task.timeout_seconds = receipt.timeout_seconds
+            task.stdout = receipt.stdout_preview
+            task.stderr = receipt.stderr_preview or failure_summary
+            task.completed_at = receipt.finished_at
+            task.status = TaskStatus.FAILED
+            run.status = RunStatus.FAILED
+
+            receipt_artifact = ArtifactRecord(
+                run_id=run.id,
+                task_id=task.id,
+                decision_id=task.decision_id,
+                artifact_type=ArtifactType.EXECUTION_RECEIPT,
+                title="Isolated worker execution receipt",
+                storage_kind=ArtifactStorageKind.FILESYSTEM_PATH,
+                path=str(receipt_path),
+                size_bytes=len(receipt_bytes),
+                sha256=receipt_hash,
+                execution_context_id=receipt.execution_context_id,
+                command=receipt.command,
+                cwd=receipt.sandbox_cwd,
+            )
+            session.add(receipt_artifact)
+            session.flush()
+
+            observation = ObservationRecord(
+                run_id=run.id,
+                kind=ObservationKind.TASK_EXECUTION,
+                summary="Isolated worker proof failed before a patch could be accepted.",
+                details=failure_summary,
+            )
+            session.add(observation)
+            session.flush()
+
+            session.add(
+                EventLedgerRecord(
+                    run_id=run.id,
+                    event_type=LedgerEventType.ARTIFACT_RECORDED,
+                    payload={
+                        "artifact_id": receipt_artifact.id,
+                        "task_id": task.id,
+                        "decision_id": task.decision_id,
+                        "execution_context_id": receipt_artifact.execution_context_id,
+                        "path": receipt_artifact.path,
+                        "sha256": receipt_artifact.sha256,
+                    },
+                ),
+            )
+            session.add(
+                EventLedgerRecord(
+                    run_id=run.id,
+                    event_type=LedgerEventType.TASK_FAILED,
+                    payload={
+                        "task_id": task.id,
+                        "decision_id": task.decision_id,
+                        "execution_context_id": task.execution_context_id,
+                        "status": task.status.value,
+                        "error": failure_summary,
+                        "timed_out": receipt.timed_out,
+                    },
+                ),
+            )
+            session.add(
+                EventLedgerRecord(
+                    run_id=run.id,
+                    event_type=LedgerEventType.OBSERVATION_RECORDED,
+                    payload={
+                        "observation_id": observation.id,
+                        "kind": observation.kind.value,
+                        "summary": observation.summary,
+                    },
+                ),
+            )
+            session.flush()
+            return IsolatedWorkerDispatchResult(
+                task=self._to_task_view(task),
+                artifacts=[self._to_artifact_view(receipt_artifact)],
+                observation=self._to_observation_view(observation),
+                receipt=receipt,
+            )
+
+    def _finalize_completed_isolated_task(
+        self,
+        *,
+        run_id: str,
+        task_id: str,
+        artifact_root: Path,
+        receipt: IsolatedWorkerReceipt,
+    ) -> IsolatedWorkerDispatchResult:
+        artifact_directory = artifact_root / run_id / task_id
+        artifact_directory.mkdir(parents=True, exist_ok=True)
+        patch_path = artifact_directory / "isolated-worker-proof.patch"
+        receipt_path = artifact_directory / "isolated-worker-receipt.json"
+        patch_path.write_text(receipt.patch_body or "", encoding="utf-8")
+        receipt_path.write_text(
+            json.dumps(receipt.model_dump(mode="json"), indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        patch_bytes = patch_path.read_bytes()
+        receipt_bytes = receipt_path.read_bytes()
+        patch_hash = sha256(patch_bytes).hexdigest()
+        receipt_hash = sha256(receipt_bytes).hexdigest()
+
+        try:
+            with self.session() as session:
+                run = session.get(RunRecord, run_id)
+                task = session.get(TaskRecord, task_id)
+                if run is None or task is None:
+                    raise LookupError("Isolated task finalization failed because the run or task no longer exists.")
+
+                task.execution_context_id = receipt.execution_context_id
+                task.command = receipt.command
+                task.cwd = receipt.sandbox_cwd
+                task.timeout_seconds = receipt.timeout_seconds
+                task.stdout = receipt.stdout_preview
+                task.stderr = receipt.stderr_preview
+                task.completed_at = receipt.finished_at
+                task.status = TaskStatus.COMPLETED
+                run.status = RunStatus.READY
+
+                patch_warnings, risk_class, auto_apply_eligible = self._build_patch_review_policy(
+                    patch_body=receipt.patch_body or "",
+                    changed_files=receipt.changed_files,
+                )
+
+                patch_artifact = ArtifactRecord(
+                    run_id=run.id,
+                    task_id=task.id,
+                    decision_id=task.decision_id,
+                    artifact_type=ArtifactType.UNIFIED_PATCH,
+                    title="Isolated worker proof patch",
+                    storage_kind=ArtifactStorageKind.FILESYSTEM_PATH,
+                    path=str(patch_path),
+                    size_bytes=len(patch_bytes),
+                    sha256=patch_hash,
+                    execution_context_id=receipt.execution_context_id,
+                    command=receipt.command,
+                    cwd=receipt.sandbox_cwd,
+                )
+                receipt_artifact = ArtifactRecord(
+                    run_id=run.id,
+                    task_id=task.id,
+                    decision_id=task.decision_id,
+                    artifact_type=ArtifactType.EXECUTION_RECEIPT,
+                    title="Isolated worker execution receipt",
+                    storage_kind=ArtifactStorageKind.FILESYSTEM_PATH,
+                    path=str(receipt_path),
+                    size_bytes=len(receipt_bytes),
+                    sha256=receipt_hash,
+                    execution_context_id=receipt.execution_context_id,
+                    command=receipt.command,
+                    cwd=receipt.sandbox_cwd,
+                )
+                session.add(patch_artifact)
+                session.add(receipt_artifact)
+                session.flush()
+
+                patch_intake = PatchIntakeRecord(
+                    run_id=run.id,
+                    task_id=task.id,
+                    patch_artifact_id=patch_artifact.id,
+                    receipt_artifact_id=receipt_artifact.id,
+                    status=PatchIntakeStatus.PENDING,
+                    summary=(
+                        f"Founder review is required before applying a patch touching {len(receipt.changed_files)} file(s)."
+                    ),
+                    source_workspace=receipt.source_workspace,
+                    changed_files=receipt.changed_files,
+                    touched_file_count=len(receipt.changed_files),
+                    patch_size_bytes=len(patch_bytes),
+                    patch_sha256=patch_hash,
+                    risk_class=risk_class,
+                    auto_apply_eligible=auto_apply_eligible,
+                    warnings=[warning.model_dump(mode="json") for warning in patch_warnings],
+                )
+                session.add(patch_intake)
+                session.flush()
+
+                observation = ObservationRecord(
+                    run_id=run.id,
+                    kind=ObservationKind.TASK_EXECUTION,
+                    summary="Isolated worker proof completed and is waiting on founder patch review.",
+                    details=(
+                        f"Task {task.id} produced patch artifact {patch_artifact.id}, receipt artifact {receipt_artifact.id}, "
+                        f"and patch intake {patch_intake.id}. Changed files: {', '.join(receipt.changed_files) if receipt.changed_files else '-'}."
+                    ),
+                )
+                session.add(observation)
+                session.flush()
+
+                for artifact in (patch_artifact, receipt_artifact):
+                    session.add(
+                        EventLedgerRecord(
+                            run_id=run.id,
+                            event_type=LedgerEventType.ARTIFACT_RECORDED,
+                            payload={
+                                "artifact_id": artifact.id,
+                                "task_id": task.id,
+                                "decision_id": task.decision_id,
+                                "execution_context_id": artifact.execution_context_id,
+                                "path": artifact.path,
+                                "sha256": artifact.sha256,
+                            },
+                        ),
+                    )
+                session.add(
+                    EventLedgerRecord(
+                        run_id=run.id,
+                        event_type=LedgerEventType.PATCH_INTAKE_RECORDED,
+                        payload={
+                            "patch_intake_id": patch_intake.id,
+                            "task_id": task.id,
+                            "patch_artifact_id": patch_artifact.id,
+                            "receipt_artifact_id": receipt_artifact.id,
+                            "risk_class": patch_intake.risk_class.value,
+                            "auto_apply_eligible": patch_intake.auto_apply_eligible,
+                            "warning_count": len(patch_warnings),
+                        },
+                    ),
+                )
+                session.add(
+                    EventLedgerRecord(
+                        run_id=run.id,
+                        event_type=LedgerEventType.TASK_COMPLETED,
+                        payload={
+                            "task_id": task.id,
+                            "decision_id": task.decision_id,
+                            "execution_context_id": task.execution_context_id,
+                            "status": task.status.value,
+                            "runtime": "isolated_worker",
+                            "changed_files": receipt.changed_files,
+                            "base_file_hashes": receipt.base_file_hashes,
+                            "patch_intake_id": patch_intake.id,
+                        },
+                    ),
+                )
+                session.add(
+                    EventLedgerRecord(
+                        run_id=run.id,
+                        event_type=LedgerEventType.OBSERVATION_RECORDED,
+                        payload={
+                            "observation_id": observation.id,
+                            "kind": observation.kind.value,
+                            "summary": observation.summary,
+                        },
+                    ),
+                )
+                session.flush()
+                return IsolatedWorkerDispatchResult(
+                    task=self._to_task_view(task),
+                    artifacts=[
+                        self._to_artifact_view(patch_artifact),
+                        self._to_artifact_view(receipt_artifact),
+                    ],
+                    observation=self._to_observation_view(observation),
+                    receipt=receipt,
+                )
+        except Exception:
+            if patch_path.exists():
+                patch_path.unlink()
+            if receipt_path.exists():
+                receipt_path.unlink()
+            raise
+
+    @staticmethod
+    def _build_patch_review_policy(
+        *,
+        patch_body: str,
+        changed_files: list[str],
+    ) -> tuple[list[PatchReviewWarningView], PatchRiskClass, bool]:
+        warnings: list[PatchReviewWarningView] = []
+        lowered_patch = patch_body.lower()
+        danger_terms = (
+            "os.system(",
+            "subprocess.run(",
+            "subprocess.popen(",
+            "rm -rf",
+            "shutil.rmtree(",
+            "eval(",
+            "exec(",
+        )
+        if any(term in lowered_patch for term in danger_terms):
+            warnings.append(
+                PatchReviewWarningView(
+                    code=PatchWarningCode.DANGEROUS_KEYWORD,
+                    message="Dangerous execution keywords were detected in the patch body.",
+                ),
+            )
+        sensitive_prefixes = (".github/workflows/", ".env", "pyproject.toml", "src/v2_spring/ledger/")
+        if any(
+            changed_file == prefix or changed_file.startswith(prefix)
+            for changed_file in changed_files
+            for prefix in sensitive_prefixes
+        ):
+            warnings.append(
+                PatchReviewWarningView(
+                    code=PatchWarningCode.SENSITIVE_PATH,
+                    message="The patch touches a sensitive path and should be reviewed carefully.",
+                ),
+            )
+        if len(changed_files) >= 4:
+            warnings.append(
+                PatchReviewWarningView(
+                    code=PatchWarningCode.MANY_FILES,
+                    message="The patch touches several files and may be too broad for a trivial founder review.",
+                ),
+            )
+        if len(patch_body.encode("utf-8")) >= 12000:
+            warnings.append(
+                PatchReviewWarningView(
+                    code=PatchWarningCode.LARGE_PATCH,
+                    message="The patch is large and may need to be split or reviewed through the raw diff view.",
+                ),
+            )
+
+        if any(warning.code in {PatchWarningCode.DANGEROUS_KEYWORD, PatchWarningCode.SENSITIVE_PATH} for warning in warnings):
+            risk_class = PatchRiskClass.HIGH
+        elif warnings:
+            risk_class = PatchRiskClass.MEDIUM
+        else:
+            risk_class = PatchRiskClass.LOW
+        auto_apply_eligible = risk_class == PatchRiskClass.LOW and len(changed_files) <= 1
+        return warnings, risk_class, auto_apply_eligible
+
+    @staticmethod
+    def _count_patch_lines(patch_body: str) -> tuple[int, int]:
+        added = 0
+        removed = 0
+        for line in patch_body.splitlines():
+            if line.startswith("+++") or line.startswith("---") or line.startswith("@@"):
+                continue
+            if line.startswith("+"):
+                added += 1
+            elif line.startswith("-"):
+                removed += 1
+        return added, removed
+
+    @staticmethod
+    def _build_pending_patch_intake(view: PatchIntakeView | None) -> PendingPatchIntakeView | None:
+        if view is None:
+            return None
+        return PendingPatchIntakeView(
+            intake_id=view.id,
+            task_id=view.task_id,
+            patch_artifact_id=view.patch_artifact_id,
+            summary=view.summary,
+            risk_class=view.risk_class,
+            warning_count=len(view.warnings),
+            touched_file_count=view.touched_file_count,
+            created_at=view.created_at,
+        )
+
+    def _persist_validation_receipt_artifact(
+        self,
+        *,
+        session: Session,
+        run: RunRecord,
+        task: TaskRecord,
+        patch_intake: PatchIntakeRecord,
+        patch_artifact: ArtifactRecord,
+        receipt: PatchApplyReceipt,
+    ) -> ArtifactRecord:
+        artifact_directory = Path(patch_artifact.path).resolve().parent
+        artifact_directory.mkdir(parents=True, exist_ok=True)
+        validation_path = artifact_directory / "patch-validation-receipt.json"
+        validation_path.write_text(
+            json.dumps(receipt.model_dump(mode="json"), indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        validation_bytes = validation_path.read_bytes()
+        validation_hash = sha256(validation_bytes).hexdigest()
+        artifact = ArtifactRecord(
+            run_id=run.id,
+            task_id=task.id,
+            decision_id=task.decision_id,
+            artifact_type=ArtifactType.VALIDATION_RECEIPT,
+            title="Patch intake validation receipt",
+            storage_kind=ArtifactStorageKind.FILESYSTEM_PATH,
+            path=str(validation_path),
+            size_bytes=len(validation_bytes),
+            sha256=validation_hash,
+            execution_context_id=task.execution_context_id,
+            command=receipt.validation_command,
+            cwd=str(Path(patch_intake.source_workspace).resolve()),
+        )
+        session.add(artifact)
+        session.flush()
+        session.add(
+            EventLedgerRecord(
+                run_id=run.id,
+                event_type=LedgerEventType.ARTIFACT_RECORDED,
+                payload={
+                    "artifact_id": artifact.id,
+                    "task_id": task.id,
+                    "decision_id": task.decision_id,
+                    "execution_context_id": artifact.execution_context_id,
+                    "path": artifact.path,
+                    "sha256": artifact.sha256,
+                },
+            ),
+        )
+        return artifact
+
     @staticmethod
     def _to_run_view(record: RunRecord) -> RunView:
         return RunView.model_validate(
@@ -2934,6 +4003,34 @@ class LedgerStore:
                 "expires_at": record.expires_at,
                 "resolved_at": record.resolved_at,
                 "resolution_reason": record.resolution_reason,
+            },
+        )
+
+    @staticmethod
+    def _to_patch_intake_view(record: PatchIntakeRecord) -> PatchIntakeView:
+        return PatchIntakeView.model_validate(
+            {
+                "id": record.id,
+                "run_id": record.run_id,
+                "task_id": record.task_id,
+                "patch_artifact_id": record.patch_artifact_id,
+                "receipt_artifact_id": record.receipt_artifact_id,
+                "validation_artifact_id": record.validation_artifact_id,
+                "status": record.status,
+                "summary": record.summary,
+                "source_workspace": record.source_workspace,
+                "changed_files": list(record.changed_files or []),
+                "touched_file_count": record.touched_file_count,
+                "patch_size_bytes": record.patch_size_bytes,
+                "patch_sha256": record.patch_sha256,
+                "risk_class": record.risk_class,
+                "auto_apply_eligible": record.auto_apply_eligible,
+                "warnings": list(record.warnings or []),
+                "created_at": record.created_at,
+                "resolved_at": record.resolved_at,
+                "resolution_code": record.resolution_code,
+                "resolution_reason": record.resolution_reason,
+                "validation_command": record.validation_command,
             },
         )
 
@@ -3073,6 +4170,7 @@ class LedgerStore:
         run: RunView,
         approvals: list[ApprovalView],
         tasks: list[TaskReplayView],
+        patch_intakes: list[PatchIntakeView],
         orphan_artifacts: list[ArtifactInspectionView],
         ledger_events: list[EventLedgerRecord],
     ) -> list[str]:
@@ -3092,6 +4190,11 @@ class LedgerStore:
             for event in ledger_events
             if event.event_type == LedgerEventType.ARTIFACT_RECORDED
         }
+        patch_intake_recorded_ids = {
+            str(event.payload.get("patch_intake_id"))
+            for event in ledger_events
+            if event.event_type == LedgerEventType.PATCH_INTAKE_RECORDED
+        }
 
         if orphan_artifacts:
             warnings.append("At least one artifact is not linked to a known task.")
@@ -3100,6 +4203,10 @@ class LedgerStore:
             task.task.status == TaskStatus.COMPLETED for task in tasks
         ):
             warnings.append("Run is marked completed but no completed task is present.")
+        if run.status == RunStatus.COMPLETED and any(
+            intake.status == PatchIntakeStatus.PENDING for intake in patch_intakes
+        ):
+            warnings.append("Run is marked completed while a patch intake is still pending founder review.")
 
         if run.status == RunStatus.FAILED and not any(
             task.task.status == TaskStatus.FAILED for task in tasks
@@ -3145,6 +4252,11 @@ class LedgerStore:
                     warnings.append(
                         f"Artifact {artifact.artifact.id} exists in state but is missing ARTIFACT_RECORDED in the ledger.",
                     )
+        for intake in patch_intakes:
+            if str(intake.id) not in patch_intake_recorded_ids:
+                warnings.append(
+                    f"Patch intake {intake.id} exists in state but is missing PATCH_INTAKE_RECORDED in the ledger.",
+                )
         return warnings
 
     @staticmethod
@@ -3153,6 +4265,7 @@ class LedgerStore:
         run: RunView,
         pending_approval: ApprovalView | None,
         latest_rejection_reason: str | None,
+        latest_patch_intake: PatchIntakeView | None,
         task_summary: TaskStatusSummary,
         latest_task: TaskHeadlineView | None,
         latest_artifact: ArtifactHeadlineView | None,
@@ -3169,6 +4282,7 @@ class LedgerStore:
             },
             "pending_approval": pending_approval.model_dump(mode="json") if pending_approval else None,
             "latest_rejection_reason": latest_rejection_reason,
+            "latest_patch_intake": latest_patch_intake.model_dump(mode="json") if latest_patch_intake else None,
             "task_summary": task_summary.model_dump(mode="json"),
             "latest_task": latest_task.model_dump(mode="json") if latest_task else None,
             "latest_artifact": latest_artifact.model_dump(mode="json") if latest_artifact else None,

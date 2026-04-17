@@ -10,7 +10,12 @@ from v2_spring.domain.approval import ApprovalView
 from v2_spring.domain.founder_intervention import FounderInterventionDigest
 from v2_spring.domain.observation import ObservationKind
 from v2_spring.domain.run import RunView
-from v2_spring.domain.snapshot import ArtifactHeadlineView, PendingFounderEscalationView, SnapshotActionState
+from v2_spring.domain.snapshot import (
+    ArtifactHeadlineView,
+    PendingFounderEscalationView,
+    PendingPatchIntakeView,
+    SnapshotActionState,
+)
 
 
 class ProgressSurfaceStatus(StrEnum):
@@ -102,6 +107,7 @@ class ProgressSummaryView(BaseModel):
     next_step_hint: str | None = Field(default=None, max_length=500)
     pending_approval: ApprovalView | None = None
     pending_founder_escalation: PendingFounderEscalationView | None = None
+    pending_patch_intake: PendingPatchIntakeView | None = None
     planner_budget_remaining: int = Field(ge=0)
     planner_phase_exhausted: bool = False
     planner_stale_quota_remaining: int = Field(ge=0)
