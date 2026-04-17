@@ -29,8 +29,11 @@ Step 18까지 오면서 execution ownership, reclaim, fencing은 현재 스코�
 - runtime capability failure observation 누적
 - runtime trust state / strike / downgrade metadata
 - static-first preflight에서 selective dynamic preflight로 승격되는 규칙
+  - 초기 정책은 **3회 연속 mismatch 시 승격**
+  - dynamic lane에서 **2회 성공 시 static-first로 복귀**
 - repeated mismatch에 대한 typed refusal / repairable feedback
 - claim renewal write coalescing 또는 bounded renewal cadence 강화
+  - worker local clock이 아니라 **store/server time**만 expiry truth로 사용
 - renewal churn에 대한 founder/operator-visible audit summary
 - ADR / implementation note / risk register 반영
 
@@ -50,6 +53,13 @@ Step 18까지 오면서 execution ownership, reclaim, fencing은 현재 스코�
 - `RISK-0039`, `RISK-0049`가 Step 19 범위에서 직접 줄거나 닫힌다
 - `RISK-0051`은 여전히 networked/external-effect runtime 전용 리스크로 분리 유지된다
 
+## 구현 메모
+
+- trust 승격 임계치는 strict-1회가 아니라 conservative-3회로 시작
+- noisy failure를 흡수하기 위해 recovery streak를 같이 둔다
+- stale metadata cache는 local cache가 아니라 중앙 ledger truth를 매 dispatch에서 읽는
+  방식으로 회피한다
+
 ## 리스크 연결
 
 - 직접 타깃:
@@ -68,6 +78,7 @@ Step 18까지 오면서 execution ownership, reclaim, fencing은 현재 스코�
 
 - `docs/issues/STEP_18_LEASE_RENEWAL_AND_FENCED_RECLAIM_HARDENING.md`
 - `docs/adr/0016-lease-renewal-fencing-and-stale-result-rejection.md`
+- `docs/adr/0017-runtime-trust-feedback-and-heartbeat-hygiene.md`
 - `docs/risk-register/entries/2026-04-17-manifest-reality-gap.md`
 - `docs/risk-register/entries/2026-04-17-heartbeat-storm-under-lease-renewal.md`
 - `docs/risk-register/entries/2026-04-17-external-side-effect-ghost-after-reclaim.md`

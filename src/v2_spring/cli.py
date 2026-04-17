@@ -36,6 +36,7 @@ from v2_spring.domain.progress import ProgressSummaryView, ProgressTraceMode
 from v2_spring.domain.proposal import PlannerProposalInput, PlannerProposalView
 from v2_spring.domain.replay import ArtifactInspectionView, RunReplayView, TaskReplayView
 from v2_spring.domain.routing import (
+    ExecutionRuntime,
     ExecutionRequirements,
     ExpectedOutputKind,
     RoutingDecision,
@@ -44,6 +45,7 @@ from v2_spring.domain.routing import (
     TaskComplexity,
     WriteScope,
 )
+from v2_spring.domain.runtime_trust import RuntimeTrustView
 from v2_spring.domain.snapshot import PossibleActionEvaluationView, PossibleActionName, RunSnapshotView
 from v2_spring.ledger.store import (
     BoundedExecutionResult,
@@ -375,6 +377,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output format. Defaults to pretty.",
     )
     task_reconcile_claims_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Override DATABASE_URL for this invocation.",
+    )
+
+    runtime_parser = subparsers.add_parser("runtime", help="Inspect runtime trust and execution guardrails.")
+    runtime_subparsers = runtime_parser.add_subparsers(dest="runtime_command")
+
+    runtime_trust_parser = runtime_subparsers.add_parser(
+        "trust",
+        help="Show runtime trust feedback and dynamic-preflight state.",
+    )
+    runtime_trust_parser.add_argument(
+        "--runtime",
+        choices=[runtime.value for runtime in ExecutionRuntime],
+        default=None,
+        help="Optional runtime filter. Defaults to listing every tracked runtime.",
+    )
+    runtime_trust_parser.add_argument(
+        "--format",
+        default="pretty",
+        choices=["pretty", "json"],
+        help="Output format. Defaults to pretty.",
+    )
+    runtime_trust_parser.add_argument(
         "--database-url",
         default=None,
         help="Override DATABASE_URL for this invocation.",
@@ -1176,10 +1203,40 @@ def _render_execution_claim(claim: ExecutionClaimView | None) -> str:
         acquired_at:         {claim.acquired_at.isoformat()}
         heartbeat_at:        {claim.heartbeat_at.isoformat()}
         expires_at:          {claim.expires_at.isoformat()}
+        renew_threshold_s:   {claim.renew_threshold_seconds if claim.renew_threshold_seconds is not None else '-'}
+        renew_cadence_s:     {claim.min_renew_cadence_seconds if claim.min_renew_cadence_seconds is not None else '-'}
+        renewal_pressure:    {claim.renewal_pressure.value if claim.renewal_pressure is not None else '-'}
         released_at:         {claim.released_at.isoformat() if claim.released_at else '-'}
         reclaim_reason:      {claim.reclaim_reason or '-'}
         """,
     ).strip()
+
+
+def _render_runtime_trust(trust_items: list[RuntimeTrustView]) -> str:
+    if not trust_items:
+        return "No runtime trust state is currently recorded."
+    blocks: list[str] = []
+    for item in trust_items:
+        blocks.append(
+            dedent(
+                f"""\
+                Runtime trust
+                -------------
+                runtime:                 {item.runtime.value}
+                mode:                    {item.mode.value}
+                dynamic_preflight:       {item.dynamic_preflight_required}
+                strike_threshold:        {item.mismatch_strike_threshold}
+                recovery_threshold:      {item.recovery_success_threshold}
+                consecutive_failures:    {item.consecutive_mismatch_failures}
+                total_failures:          {item.total_mismatch_failures}
+                recovery_success_streak: {item.recovery_success_streak}
+                last_failure_reason:     {item.last_failure_reason or '-'}
+                last_failure_at:         {item.last_failure_at.isoformat() if item.last_failure_at else '-'}
+                last_success_at:         {item.last_success_at.isoformat() if item.last_success_at else '-'}
+                """,
+            ).strip(),
+        )
+    return "\n\n".join(blocks)
 
 
 def _render_execution_requirements(
@@ -2457,6 +2514,18 @@ def main() -> None:
                 for claim in reclaimed:
                     print()
                     print(_render_execution_claim(claim))
+        return
+
+    if args.command == "runtime" and args.runtime_command == "trust":
+        store = _build_store(args.database_url)
+        if args.runtime is not None:
+            trust_items = [store.get_runtime_trust(ExecutionRuntime(args.runtime))]
+        else:
+            trust_items = store.list_runtime_trust()
+        if args.format == "json":
+            print(json.dumps([item.model_dump(mode="json") for item in trust_items], indent=2, ensure_ascii=False))
+        else:
+            print(_render_runtime_trust(trust_items))
         return
 
     if args.command == "artifact" and args.artifact_command == "list":

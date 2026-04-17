@@ -22,6 +22,7 @@ from v2_spring.domain.decision import DecisionKind, DecisionView
 from v2_spring.domain.execution_claim import (
     ExecutionClaimRefusalCode,
     ExecutionClaimRefusalView,
+    ExecutionClaimRenewalPressure,
     ExecutionClaimStatus,
     ExecutionClaimView,
 )
@@ -83,6 +84,7 @@ from v2_spring.domain.routing import (
     route_task,
 )
 from v2_spring.domain.run import RunCreateInput, RunStatus, RunView
+from v2_spring.domain.runtime_trust import RuntimeTrustMode, RuntimeTrustView
 from v2_spring.domain.snapshot import (
     ArtifactHeadlineView,
     PendingPatchIntakeView,
@@ -115,6 +117,7 @@ from v2_spring.ledger.models import (
     PatchIntakeRecord,
     PlannerAttemptRecord,
     RunRecord,
+    RuntimeTrustRecord,
     TaskRecord,
     utc_now,
 )
@@ -197,6 +200,9 @@ class LedgerStore:
     _PATCH_AUTO_APPLY_MAX_CHANGED_LINES = 10
     _EXECUTION_LEASE_SLACK = timedelta(seconds=15)
     _EXECUTION_LEASE_RENEW_THRESHOLD = timedelta(seconds=10)
+    _EXECUTION_LEASE_MIN_RENEW_CADENCE = timedelta(seconds=5)
+    _RUNTIME_TRUST_MISMATCH_STRIKE_THRESHOLD = 3
+    _RUNTIME_TRUST_RECOVERY_SUCCESS_THRESHOLD = 2
 
     def __init__(self, database_url: str) -> None:
         self._engine = create_engine(database_url, future=True)
@@ -265,6 +271,13 @@ class LedgerStore:
         )
 
     @staticmethod
+    def _build_execution_claim_renew_cadence(timeout_seconds: int) -> timedelta:
+        return min(
+            timedelta(seconds=max(2, timeout_seconds // 6)),
+            LedgerStore._EXECUTION_LEASE_MIN_RENEW_CADENCE,
+        )
+
+    @staticmethod
     def _coerce_utc_datetime(value: datetime | None) -> datetime | None:
         if value is None:
             return None
@@ -273,7 +286,31 @@ class LedgerStore:
         return value.astimezone(timezone.utc)
 
     @classmethod
-    def _to_execution_claim_view(cls, record: ExecutionClaimRecord) -> ExecutionClaimView:
+    def _to_execution_claim_view(
+        cls,
+        record: ExecutionClaimRecord,
+        *,
+        task_timeout_seconds: int | None = None,
+    ) -> ExecutionClaimView:
+        renew_threshold_seconds: int | None = None
+        min_renew_cadence_seconds: int | None = None
+        renewal_pressure: ExecutionClaimRenewalPressure | None = None
+        if task_timeout_seconds is not None and task_timeout_seconds > 0:
+            renew_threshold = cls._build_execution_claim_renew_threshold(task_timeout_seconds)
+            renew_cadence = cls._build_execution_claim_renew_cadence(task_timeout_seconds)
+            renew_threshold_seconds = int(renew_threshold.total_seconds())
+            min_renew_cadence_seconds = int(renew_cadence.total_seconds())
+            expires_at = cls._coerce_utc_datetime(record.expires_at)
+            heartbeat_at = cls._coerce_utc_datetime(record.heartbeat_at)
+            if expires_at is not None and heartbeat_at is not None:
+                now = utc_now()
+                remaining = expires_at - now
+                if remaining > renew_threshold:
+                    renewal_pressure = ExecutionClaimRenewalPressure.HEALTHY
+                elif now - heartbeat_at < renew_cadence:
+                    renewal_pressure = ExecutionClaimRenewalPressure.COALESCED
+                else:
+                    renewal_pressure = ExecutionClaimRenewalPressure.RENEW_WINDOW
         return ExecutionClaimView.model_validate(
             {
                 "id": record.id,
@@ -289,12 +326,58 @@ class LedgerStore:
                 "expires_at": cls._coerce_utc_datetime(record.expires_at),
                 "released_at": cls._coerce_utc_datetime(record.released_at),
                 "reclaim_reason": record.reclaim_reason,
+                "renew_threshold_seconds": renew_threshold_seconds,
+                "min_renew_cadence_seconds": min_renew_cadence_seconds,
+                "renewal_pressure": renewal_pressure,
             },
         )
 
     @staticmethod
     def _load_execution_claim(session: Session, run_id: str) -> ExecutionClaimRecord | None:
         return session.scalar(select(ExecutionClaimRecord).where(ExecutionClaimRecord.run_id == run_id).limit(1))
+
+    @classmethod
+    def _to_runtime_trust_view(cls, record: RuntimeTrustRecord) -> RuntimeTrustView:
+        return RuntimeTrustView.model_validate(
+            {
+                "runtime": record.runtime,
+                "mode": record.mode,
+                "dynamic_preflight_required": record.dynamic_preflight_required,
+                "mismatch_strike_threshold": record.mismatch_strike_threshold,
+                "recovery_success_threshold": record.recovery_success_threshold,
+                "consecutive_mismatch_failures": record.consecutive_mismatch_failures,
+                "total_mismatch_failures": record.total_mismatch_failures,
+                "recovery_success_streak": record.recovery_success_streak,
+                "last_failure_reason": record.last_failure_reason,
+                "last_failure_at": cls._coerce_utc_datetime(record.last_failure_at),
+                "last_success_at": cls._coerce_utc_datetime(record.last_success_at),
+            },
+        )
+
+    @staticmethod
+    def _load_runtime_trust(session: Session, runtime: ExecutionRuntime) -> RuntimeTrustRecord | None:
+        return session.get(RuntimeTrustRecord, runtime)
+
+    def _ensure_runtime_trust_record(self, session: Session, runtime: ExecutionRuntime) -> RuntimeTrustRecord:
+        record = self._load_runtime_trust(session, runtime)
+        if record is not None:
+            return record
+        record = RuntimeTrustRecord(
+            runtime=runtime,
+            mode=RuntimeTrustMode.STATIC_MANIFEST,
+            dynamic_preflight_required=False,
+            mismatch_strike_threshold=self._RUNTIME_TRUST_MISMATCH_STRIKE_THRESHOLD,
+            recovery_success_threshold=self._RUNTIME_TRUST_RECOVERY_SUCCESS_THRESHOLD,
+            consecutive_mismatch_failures=0,
+            total_mismatch_failures=0,
+            recovery_success_streak=0,
+            last_failure_reason=None,
+            last_failure_at=None,
+            last_success_at=None,
+        )
+        session.add(record)
+        session.flush()
+        return record
 
     def _raise_execution_claim_conflict(self, record: ExecutionClaimRecord, *, mutation_name: str) -> None:
         claim = self._to_execution_claim_view(record)
@@ -318,6 +401,18 @@ class LedgerStore:
             and claim.lease_token == task.execution_claim_token
             and claim.version == task.execution_claim_fencing_token
         )
+
+    def _build_execution_claim_view(
+        self,
+        session: Session,
+        claim: ExecutionClaimRecord,
+    ) -> ExecutionClaimView:
+        task_timeout_seconds: int | None = None
+        if claim.task_id is not None:
+            task = session.get(TaskRecord, claim.task_id)
+            if task is not None:
+                task_timeout_seconds = task.timeout_seconds
+        return self._to_execution_claim_view(claim, task_timeout_seconds=task_timeout_seconds)
 
     def _reclaim_execution_claim_locked(
         self,
@@ -627,7 +722,7 @@ class LedgerStore:
             claim = self._load_execution_claim(session, run_id)
             if claim is None:
                 return None
-            return self._to_execution_claim_view(claim)
+            return self._build_execution_claim_view(session, claim)
 
     def renew_execution_claim(
         self,
@@ -657,7 +752,19 @@ class LedgerStore:
             if claim_expires_at is not None:
                 remaining = claim_expires_at - now
                 if remaining > self._build_execution_claim_renew_threshold(timeout_seconds):
-                    return self._to_execution_claim_view(claim)
+                    cadence = self._build_execution_claim_renew_cadence(timeout_seconds)
+                    last_heartbeat = self._coerce_utc_datetime(claim.heartbeat_at)
+                    if last_heartbeat is not None and now - last_heartbeat < cadence:
+                        return self._to_execution_claim_view(
+                            claim,
+                            task_timeout_seconds=timeout_seconds,
+                        )
+                    return self._to_execution_claim_view(claim, task_timeout_seconds=timeout_seconds)
+
+            last_heartbeat = self._coerce_utc_datetime(claim.heartbeat_at)
+            cadence = self._build_execution_claim_renew_cadence(timeout_seconds)
+            if last_heartbeat is not None and now - last_heartbeat < cadence:
+                return self._to_execution_claim_view(claim, task_timeout_seconds=timeout_seconds)
 
             expires_at = now + self._build_execution_claim_ttl(timeout_seconds)
             update_result = session.execute(
@@ -718,7 +825,7 @@ class LedgerStore:
                     },
                 ),
             )
-            return self._to_execution_claim_view(claim)
+            return self._to_execution_claim_view(claim, task_timeout_seconds=timeout_seconds)
 
     def reclaim_execution_claims(self, run_id: str | None = None) -> list[ExecutionClaimView]:
         self.ensure_schema()
@@ -741,9 +848,152 @@ class LedgerStore:
                     claim=claim,
                     reason="Execution lease expired and was reclaimed by the Step 17 reconciliation path.",
                 )
-                reclaimed.append(self._to_execution_claim_view(reclaimed_record))
+                reclaimed.append(self._build_execution_claim_view(session, reclaimed_record))
             session.flush()
             return reclaimed
+
+    def get_runtime_trust(self, runtime: ExecutionRuntime) -> RuntimeTrustView:
+        self.ensure_schema()
+        with self.session() as session:
+            record = self._ensure_runtime_trust_record(session, runtime)
+            return self._to_runtime_trust_view(record)
+
+    def list_runtime_trust(self) -> list[RuntimeTrustView]:
+        self.ensure_schema()
+        with self.session() as session:
+            records = list(session.scalars(select(RuntimeTrustRecord).order_by(RuntimeTrustRecord.runtime)).all())
+            if not records:
+                self._ensure_runtime_trust_record(session, ExecutionRuntime.CONTAINERIZED_WORKER)
+                records = list(session.scalars(select(RuntimeTrustRecord).order_by(RuntimeTrustRecord.runtime)).all())
+            return [self._to_runtime_trust_view(record) for record in records]
+
+    @staticmethod
+    def _classify_container_runtime_mismatch(
+        *,
+        receipt: ContainerizedWorkerReceipt | None = None,
+        preflight_refusal_code: str | None = None,
+        failure_summary: str | None = None,
+    ) -> str | None:
+        if preflight_refusal_code == "dynamic_tool_check_failed":
+            return "dynamic_tool_check_failed"
+        text = "\n".join(
+            part
+            for part in (
+                failure_summary,
+                receipt.summary if receipt is not None else None,
+                receipt.stderr_preview if receipt is not None else None,
+            )
+            if part
+        ).lower()
+        if any(
+            token in text
+            for token in (
+                "command not found",
+                "not found",
+                "no such file or directory",
+                "exec format error",
+            )
+        ):
+            return "runtime_tool_missing_or_broken"
+        return None
+
+    def _record_runtime_trust_failure(
+        self,
+        *,
+        run_id: str,
+        runtime: ExecutionRuntime,
+        reason_code: str,
+        details: str,
+    ) -> RuntimeTrustView:
+        self.ensure_schema()
+        with self.session() as session:
+            record = self._ensure_runtime_trust_record(session, runtime)
+            now = utc_now()
+            record.consecutive_mismatch_failures += 1
+            record.total_mismatch_failures += 1
+            record.recovery_success_streak = 0
+            record.last_failure_reason = reason_code
+            record.last_failure_at = now
+            if record.consecutive_mismatch_failures >= record.mismatch_strike_threshold:
+                record.dynamic_preflight_required = True
+                record.mode = RuntimeTrustMode.DYNAMIC_PROMOTED
+
+            observation = ObservationRecord(
+                run_id=run_id,
+                kind=ObservationKind.SYSTEM_AUDIT,
+                summary="Runtime trust strike recorded after a capability mismatch.",
+                details=(
+                    f"error_code=runtime_trust_strike_recorded; runtime={runtime.value}; reason_code={reason_code}; "
+                    f"consecutive_failures={record.consecutive_mismatch_failures}; total_failures={record.total_mismatch_failures}; "
+                    f"dynamic_preflight_required={record.dynamic_preflight_required}; "
+                    f"details={self._sanitize_planner_text(details, limit=1800) or '-'}."
+                ),
+            )
+            session.add(observation)
+            session.flush()
+            session.add(
+                EventLedgerRecord(
+                    run_id=run_id,
+                    event_type=LedgerEventType.OBSERVATION_RECORDED,
+                    payload={
+                        "observation_id": observation.id,
+                        "kind": observation.kind.value,
+                        "summary": observation.summary,
+                    },
+                ),
+            )
+            return self._to_runtime_trust_view(record)
+
+    def _record_runtime_trust_success(
+        self,
+        *,
+        run_id: str,
+        runtime: ExecutionRuntime,
+        dynamic_preflight_performed: bool,
+    ) -> RuntimeTrustView:
+        self.ensure_schema()
+        with self.session() as session:
+            record = self._ensure_runtime_trust_record(session, runtime)
+            now = utc_now()
+            record.last_success_at = now
+            record.consecutive_mismatch_failures = 0
+
+            should_emit_recovery_observation = False
+            if record.dynamic_preflight_required and dynamic_preflight_performed:
+                record.recovery_success_streak += 1
+                if record.recovery_success_streak >= record.recovery_success_threshold:
+                    record.dynamic_preflight_required = False
+                    record.mode = RuntimeTrustMode.STATIC_MANIFEST
+                    record.recovery_success_streak = 0
+                    should_emit_recovery_observation = True
+            else:
+                record.recovery_success_streak = 0
+
+            if should_emit_recovery_observation:
+                observation = ObservationRecord(
+                    run_id=run_id,
+                    kind=ObservationKind.SYSTEM_AUDIT,
+                    summary="Runtime trust recovered back to static-first preflight.",
+                    details=(
+                        f"error_code=runtime_trust_recovered; runtime={runtime.value}; "
+                        f"recovery_success_threshold={record.recovery_success_threshold}; "
+                        "dynamic_preflight_required=false."
+                    ),
+                )
+                session.add(observation)
+                session.flush()
+                session.add(
+                    EventLedgerRecord(
+                        run_id=run_id,
+                        event_type=LedgerEventType.OBSERVATION_RECORDED,
+                        payload={
+                            "observation_id": observation.id,
+                            "kind": observation.kind.value,
+                            "summary": observation.summary,
+                        },
+                    ),
+                )
+            return self._to_runtime_trust_view(record)
 
     def create_run(self, run_input: RunCreateInput) -> RunView:
         self.ensure_schema()
@@ -1379,7 +1629,7 @@ class LedgerStore:
             )
             execution_claim = self._load_execution_claim(session, run_id)
             active_execution_claim = (
-                self._to_execution_claim_view(execution_claim)
+                self._build_execution_claim_view(session, execution_claim)
                 if execution_claim is not None and execution_claim.status == ExecutionClaimStatus.ACTIVE
                 else None
             )
@@ -1546,7 +1796,7 @@ class LedgerStore:
             )
             execution_claim = self._load_execution_claim(session, run_id)
             active_execution_claim = (
-                self._to_execution_claim_view(execution_claim)
+                self._build_execution_claim_view(session, execution_claim)
                 if execution_claim is not None and execution_claim.status == ExecutionClaimStatus.ACTIVE
                 else None
             )
@@ -3401,6 +3651,7 @@ class LedgerStore:
             raise PermissionError(
                 f"Run {run_id} currently routes to {inspection.outcome.runtime.value}, not containerized_worker.",
             )
+        runtime_trust = self.get_runtime_trust(ExecutionRuntime.CONTAINERIZED_WORKER)
 
         with self.session() as session:
             run = self._get_run_for_execution(session, run_id)
@@ -3499,6 +3750,7 @@ class LedgerStore:
                 execution_context_id=execution_context_id,
                 run_id=run_id,
                 requirements=requirements,
+                force_dynamic_preflight=runtime_trust.dynamic_preflight_required,
             )
         except ContainerizedWorkerPreflightRefusal as exc:
             summary = f"Containerized worker preflight refusal: {exc}"
@@ -3509,13 +3761,25 @@ class LedgerStore:
                 summary=summary,
                 preflight_refusal_code=exc.refusal_code,
             )
-            return self._finalize_failed_isolated_task(
+            result = self._finalize_failed_isolated_task(
                 run_id=run_id,
                 task_id=task_id,
                 artifact_root=artifact_root,
                 receipt=synthetic_receipt,
                 failure_summary=summary,
             )
+            reason_code = self._classify_container_runtime_mismatch(
+                preflight_refusal_code=exc.refusal_code,
+                failure_summary=summary,
+            )
+            if reason_code is not None:
+                self._record_runtime_trust_failure(
+                    run_id=run_id,
+                    runtime=ExecutionRuntime.CONTAINERIZED_WORKER,
+                    reason_code=reason_code,
+                    details=summary,
+                )
+            return result
         except (ContainerizedWorkerTimeout, FileNotFoundError, NotADirectoryError) as exc:
             synthetic_receipt = self._build_failed_containerized_receipt(
                 workspace=workspace,
@@ -3523,59 +3787,127 @@ class LedgerStore:
                 timeout_seconds=timeout_seconds,
                 summary=str(exc),
             )
-            return self._finalize_failed_isolated_task(
+            result = self._finalize_failed_isolated_task(
                 run_id=run_id,
                 task_id=task_id,
                 artifact_root=artifact_root,
                 receipt=synthetic_receipt,
                 failure_summary=str(exc),
             )
+            reason_code = self._classify_container_runtime_mismatch(
+                receipt=synthetic_receipt,
+                failure_summary=str(exc),
+            )
+            if reason_code is not None:
+                self._record_runtime_trust_failure(
+                    run_id=run_id,
+                    runtime=ExecutionRuntime.CONTAINERIZED_WORKER,
+                    reason_code=reason_code,
+                    details=str(exc),
+                )
+            return result
         except Exception as exc:  # pragma: no cover - defensive guard
+            failure_summary = f"Unexpected containerized worker failure: {exc}"
             synthetic_receipt = self._build_failed_containerized_receipt(
                 workspace=workspace,
                 execution_context_id=execution_context_id,
                 timeout_seconds=timeout_seconds,
-                summary=f"Unexpected containerized worker failure: {exc}",
+                summary=failure_summary,
             )
-            return self._finalize_failed_isolated_task(
+            result = self._finalize_failed_isolated_task(
                 run_id=run_id,
                 task_id=task_id,
                 artifact_root=artifact_root,
                 receipt=synthetic_receipt,
-                failure_summary=f"Unexpected containerized worker failure: {exc}",
+                failure_summary=failure_summary,
             )
+            reason_code = self._classify_container_runtime_mismatch(
+                receipt=synthetic_receipt,
+                failure_summary=failure_summary,
+            )
+            if reason_code is not None:
+                self._record_runtime_trust_failure(
+                    run_id=run_id,
+                    runtime=ExecutionRuntime.CONTAINERIZED_WORKER,
+                    reason_code=reason_code,
+                    details=failure_summary,
+                )
+            return result
 
         if receipt.timed_out or receipt.returncode not in (0, None):
-            return self._finalize_failed_isolated_task(
+            result = self._finalize_failed_isolated_task(
                 run_id=run_id,
                 task_id=task_id,
                 artifact_root=artifact_root,
                 receipt=receipt,
                 failure_summary=receipt.summary,
             )
+            reason_code = self._classify_container_runtime_mismatch(
+                receipt=receipt,
+                failure_summary=receipt.summary,
+            )
+            if reason_code is not None:
+                self._record_runtime_trust_failure(
+                    run_id=run_id,
+                    runtime=ExecutionRuntime.CONTAINERIZED_WORKER,
+                    reason_code=reason_code,
+                    details=receipt.summary,
+                )
+            return result
         if not receipt.patch_body:
-            return self._finalize_failed_isolated_task(
+            result = self._finalize_failed_isolated_task(
                 run_id=run_id,
                 task_id=task_id,
                 artifact_root=artifact_root,
                 receipt=receipt,
                 failure_summary="Containerized worker proof completed without producing a bounded patch.",
             )
+            reason_code = self._classify_container_runtime_mismatch(
+                receipt=receipt,
+                failure_summary=receipt.summary,
+            )
+            if reason_code is not None:
+                self._record_runtime_trust_failure(
+                    run_id=run_id,
+                    runtime=ExecutionRuntime.CONTAINERIZED_WORKER,
+                    reason_code=reason_code,
+                    details=receipt.summary,
+                )
+            return result
         try:
-            return self._finalize_completed_isolated_task(
+            result = self._finalize_completed_isolated_task(
                 run_id=run_id,
                 task_id=task_id,
                 artifact_root=artifact_root,
                 receipt=receipt,
             )
+            self._record_runtime_trust_success(
+                run_id=run_id,
+                runtime=ExecutionRuntime.CONTAINERIZED_WORKER,
+                dynamic_preflight_performed=receipt.dynamic_check_performed,
+            )
+            return result
         except Exception as exc:
-            return self._finalize_failed_isolated_task(
+            failure_summary = f"Patch/receipt persistence failed after containerized execution: {exc}"
+            result = self._finalize_failed_isolated_task(
                 run_id=run_id,
                 task_id=task_id,
                 artifact_root=artifact_root,
                 receipt=receipt,
-                failure_summary=f"Patch/receipt persistence failed after containerized execution: {exc}",
+                failure_summary=failure_summary,
             )
+            reason_code = self._classify_container_runtime_mismatch(
+                receipt=receipt,
+                failure_summary=failure_summary,
+            )
+            if reason_code is not None:
+                self._record_runtime_trust_failure(
+                    run_id=run_id,
+                    runtime=ExecutionRuntime.CONTAINERIZED_WORKER,
+                    reason_code=reason_code,
+                    details=failure_summary,
+                )
+            return result
 
     @staticmethod
     def _build_run_created_event(record: RunRecord) -> EventLedgerRecord:

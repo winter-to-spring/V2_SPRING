@@ -145,7 +145,7 @@ Observed In:
 - [RISK-0036 Container worker image growth may inflate pull latency and erode execution-plane responsiveness](entries/2026-04-17-container-image-bloat-and-pull-latency.md)
 - ~~[RISK-0037 Local metadata snapshots may drift across environments and make routing decisions non-deterministic](entries/2026-04-17-metadata-snapshot-fragmentation.md)~~
 - ~~[RISK-0038 Tail-only log hygiene may hide the real root cause when failures originate at process startup](entries/2026-04-17-log-diagnostic-sandwich-blindspot.md)~~
-- [RISK-0039 Static capability manifests may drift away from actual runtime health and create false preflight confidence](entries/2026-04-17-manifest-reality-gap.md)
+- ~~[RISK-0039 Static capability manifests may drift away from actual runtime health and create false preflight confidence](entries/2026-04-17-manifest-reality-gap.md)~~
 - ~~[RISK-0040 Semantic chain reaction may bypass founder review when low-risk auto-apply touches central files](entries/2026-04-17-semantic-chain-reaction-on-auto-apply.md)~~
 - ~~[RISK-0041 Planner may game bounded auto-apply by slicing one risky change into many trivial patches](entries/2026-04-17-auto-apply-salami-attack.md)~~
 - ~~[RISK-0042 Obfuscated dangerous patterns may bypass simple keyword scans in bounded auto-apply](entries/2026-04-17-obfuscated-dangerous-pattern-bypass.md)~~
@@ -155,6 +155,6 @@ Observed In:
 - ~~[RISK-0046 Lease TTL may starve long-running work or delay reclaim when ownership lasts too long](entries/2026-04-17-lease-starvation-and-reclaim-deadlock.md)~~
 - ~~[RISK-0047 Execution claim acquisition may still depend on store-level serialization without stronger atomic CAS semantics](entries/2026-04-17-atomic-claim-failure.md)~~
 - ~~[RISK-0048 Reclaim may reopen ownership before old worker side-effects are fully fenced](entries/2026-04-17-reclaim-side-effects-without-fencing.md)~~
-- [RISK-0049 Lease renewal heartbeats may amplify control-plane write load as worker count grows](entries/2026-04-17-heartbeat-storm-under-lease-renewal.md)
+- ~~[RISK-0049 Lease renewal heartbeats may amplify control-plane write load as worker count grows](entries/2026-04-17-heartbeat-storm-under-lease-renewal.md)~~
 - ~~[RISK-0050 Lease expiry may become non-deterministic when worker clocks drift from store/server time](entries/2026-04-17-clock-drift-in-lease-expiry.md)~~
 - [RISK-0051 External side-effects may outlive reclaimed lease ownership even when stale results are fenced](entries/2026-04-17-external-side-effect-ghost-after-reclaim.md)

@@ -16,7 +16,9 @@ from v2_spring.domain.founder_intervention import FounderReplyKind
 from v2_spring.domain.observation import ObservationKind
 from v2_spring.domain.patch_intake import PatchIntakeStatus, PatchResolutionCode, PatchRiskClass
 from v2_spring.domain.planner_attempt import PlannerAttemptOutcome
+from v2_spring.domain.routing import ExecutionRuntime
 from v2_spring.domain.run import RiskLevel, RunStatus, UrgencyLevel
+from v2_spring.domain.runtime_trust import RuntimeTrustMode
 from v2_spring.domain.task import TaskKind, TaskStatus
 
 
@@ -297,6 +299,35 @@ class ExecutionClaimRecord(Base):
 
     run: Mapped[RunRecord] = relationship(back_populates="execution_claims")
     task: Mapped["TaskRecord | None"] = relationship(back_populates="execution_claims")
+
+
+class RuntimeTrustRecord(Base):
+    __tablename__ = "runtime_trust"
+
+    runtime: Mapped[ExecutionRuntime] = mapped_column(
+        Enum(ExecutionRuntime, native_enum=False),
+        primary_key=True,
+    )
+    mode: Mapped[RuntimeTrustMode] = mapped_column(
+        Enum(RuntimeTrustMode, native_enum=False),
+        nullable=False,
+        default=RuntimeTrustMode.STATIC_MANIFEST,
+    )
+    dynamic_preflight_required: Mapped[bool] = mapped_column(nullable=False, default=False)
+    mismatch_strike_threshold: Mapped[int] = mapped_column(nullable=False, default=3)
+    recovery_success_threshold: Mapped[int] = mapped_column(nullable=False, default=2)
+    consecutive_mismatch_failures: Mapped[int] = mapped_column(nullable=False, default=0)
+    total_mismatch_failures: Mapped[int] = mapped_column(nullable=False, default=0)
+    recovery_success_streak: Mapped[int] = mapped_column(nullable=False, default=0)
+    last_failure_reason: Mapped[str | None] = mapped_column(String(240), nullable=True)
+    last_failure_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=utc_now,
+        onupdate=utc_now,
+    )
 
 
 class ArtifactRecord(Base):

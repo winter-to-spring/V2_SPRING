@@ -1,7 +1,7 @@
 # Risk ID: RISK-0049
-Title: Lease renewal heartbeats may amplify control-plane write load as worker count grows
+Title: ~~Lease renewal heartbeats may amplify control-plane write load as worker count grows~~
 Class: Before Scale
-Status: Mitigating
+Status: Resolved
 Owner: Execution scheduler / lease heartbeat policy
 Observed In: Step 18 lease renewal hardening
 
@@ -36,8 +36,11 @@ The lease model has to remain operationally cheaper than the work it governs.
 
 Current mitigation:
 
-- Step 18 adds thresholded renewal rather than unconditional heartbeat writes
-- healthy leases do not emit renewal events
+- Step 18 introduced thresholded renewal instead of unconditional heartbeat
+  writes
+- Step 19 adds a minimum renewal cadence so repeated renew attempts inside the
+  same window are coalesced
+- healthy leases avoid writes entirely
 - store/server time remains the single source of truth for expiry
 
 ## Capability Gate
@@ -52,13 +55,16 @@ Current mitigation:
 
 ## Doc Links
 - ADR: ../../adr/0016-lease-renewal-fencing-and-stale-result-rejection.md
-- Design note: ../../implementation-notes/STEP_18_LEASE_RENEWAL_AND_FENCED_RECLAIM_HARDENING.md
+- ADR: ../../adr/0017-runtime-trust-feedback-and-heartbeat-hygiene.md
+- Design note: ../../implementation-notes/STEP_19_RUNTIME_TRUST_FEEDBACK_AND_HEARTBEAT_HYGIENE.md
 
 ## Exit Criteria
 
-- renewal traffic remains sublinear relative to worker count in normal operation
 - healthy workers do not generate unnecessary heartbeat writes
-- larger worker fleets have either adaptive renewal cadence or batching
+- repeated renew attempts inside the cadence window do not create duplicate
+  ledger churn
+- renewal pressure is still visible without requiring a write on every heartbeat
 
 ## Last Updated
 - 2026-04-17
+- 2026-04-17 (resolved in Step 19)
