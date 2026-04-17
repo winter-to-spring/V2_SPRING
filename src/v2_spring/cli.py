@@ -22,6 +22,7 @@ from v2_spring.domain.founder_intervention import (
     FounderInterventionView,
 )
 from v2_spring.domain.observation import ObservationKind
+from v2_spring.domain.patch_intake import PatchResolutionView, PatchReviewView
 from v2_spring.domain.planner_adapter import (
     ActionProposal,
     EscalationProposal,
@@ -366,6 +367,71 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output format. Defaults to pretty.",
     )
     artifact_show_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Override DATABASE_URL for this invocation.",
+    )
+
+    patch_parser = subparsers.add_parser("patch", help="Review and resolve worker patch intake gates.")
+    patch_subparsers = patch_parser.add_subparsers(dest="patch_command")
+
+    patch_review_parser = patch_subparsers.add_parser(
+        "review",
+        help="Show the current pending patch intake for one run.",
+    )
+    patch_review_parser.add_argument("run_id", help="Run id to inspect.")
+    patch_review_parser.add_argument(
+        "--format",
+        default="pretty",
+        choices=["pretty", "json"],
+        help="Output format. Defaults to pretty.",
+    )
+    patch_review_parser.add_argument(
+        "--raw",
+        action="store_true",
+        help="Include the raw execution receipt payload alongside the inline diff.",
+    )
+    patch_review_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Override DATABASE_URL for this invocation.",
+    )
+
+    patch_approve_parser = patch_subparsers.add_parser(
+        "approve",
+        help="Apply one pending patch intake through the strict founder review gate.",
+    )
+    patch_approve_parser.add_argument("patch_intake_id", help="Patch intake id to approve.")
+    patch_approve_parser.add_argument(
+        "--format",
+        default="pretty",
+        choices=["pretty", "json"],
+        help="Output format. Defaults to pretty.",
+    )
+    patch_approve_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Override DATABASE_URL for this invocation.",
+    )
+
+    patch_reject_parser = patch_subparsers.add_parser(
+        "reject",
+        help="Reject one pending patch intake with an explicit founder reason.",
+    )
+    patch_reject_parser.add_argument("patch_intake_id", help="Patch intake id to reject.")
+    reject_reason_group = patch_reject_parser.add_mutually_exclusive_group(required=True)
+    reject_reason_group.add_argument("--reason", help="Founder reason for rejecting the patch.")
+    reject_reason_group.add_argument(
+        "--reason-file",
+        help="Path to a text file containing the founder rejection reason.",
+    )
+    patch_reject_parser.add_argument(
+        "--format",
+        default="pretty",
+        choices=["pretty", "json"],
+        help="Output format. Defaults to pretty.",
+    )
+    patch_reject_parser.add_argument(
         "--database-url",
         default=None,
         help="Override DATABASE_URL for this invocation.",
@@ -1085,9 +1151,11 @@ def _render_snapshot(snapshot: RunSnapshotView) -> str:
         f"action_state:        {snapshot.action_state.value}",
         f"action_state_reason: {snapshot.action_state_reason}",
         f"pending_escalation:  {snapshot.pending_founder_escalation.observation_id if snapshot.pending_founder_escalation is not None else '-'}",
+        f"pending_patch_intake:{' ' * 1}{snapshot.pending_patch_intake.intake_id if snapshot.pending_patch_intake is not None else '-'}",
         f"latest_decision:     {snapshot.latest_decision_summary if snapshot.latest_decision_summary else '-'}",
         f"latest_founder:      {snapshot.latest_founder_intervention_summary if snapshot.latest_founder_intervention_summary else '-'}",
         f"latest_rejection:    {snapshot.latest_rejection_reason if snapshot.latest_rejection_reason else '-'}",
+        f"latest_patch_intake: {snapshot.latest_patch_intake_summary if snapshot.latest_patch_intake_summary else '-'}",
         f"planner_budget:      {snapshot.planner_budget_used}/{snapshot.planner_budget_limit}",
         f"planner_remaining:   {snapshot.planner_budget_remaining}",
         f"planner_exhausted:   {snapshot.planner_phase_exhausted}",
@@ -1124,6 +1192,19 @@ def _render_snapshot(snapshot: RunSnapshotView) -> str:
                 f"id:                  {snapshot.pending_founder_escalation.observation_id}",
                 f"summary:             {snapshot.pending_founder_escalation.summary}",
                 f"details:             {snapshot.pending_founder_escalation.details}",
+            ],
+        )
+    if snapshot.pending_patch_intake is not None:
+        lines.extend(
+            [
+                "",
+                "Pending patch intake",
+                "--------------------",
+                f"id:                  {snapshot.pending_patch_intake.intake_id}",
+                f"summary:             {snapshot.pending_patch_intake.summary}",
+                f"risk_class:          {snapshot.pending_patch_intake.risk_class.value}",
+                f"warning_count:       {snapshot.pending_patch_intake.warning_count}",
+                f"touched_file_count:  {snapshot.pending_patch_intake.touched_file_count}",
             ],
         )
     if snapshot.latest_task is not None:
@@ -1211,6 +1292,20 @@ def _render_progress(progress: ProgressSummaryView) -> str:
                 f"id:                  {progress.pending_founder_escalation.observation_id}",
                 f"summary:             {progress.pending_founder_escalation.summary}",
                 f"details:             {progress.pending_founder_escalation.details}",
+            ],
+        )
+
+    if progress.pending_patch_intake is not None:
+        lines.extend(
+            [
+                "",
+                "Pending patch intake",
+                "--------------------",
+                f"id:                  {progress.pending_patch_intake.intake_id}",
+                f"summary:             {progress.pending_patch_intake.summary}",
+                f"risk_class:          {progress.pending_patch_intake.risk_class.value}",
+                f"warning_count:       {progress.pending_patch_intake.warning_count}",
+                f"touched_file_count:  {progress.pending_patch_intake.touched_file_count}",
             ],
         )
 
@@ -1835,6 +1930,16 @@ def _render_replay(replay: RunReplayView, *, verbose: bool) -> str:
         if latest_intervention.override_action is not None:
             lines.append(f"- latest override action: {latest_intervention.override_action.value}")
 
+    if replay.patch_intakes:
+        lines.extend(["", "Patch intake gates", "------------------"])
+        latest_patch_intake = replay.patch_intakes[-1]
+        lines.append(
+            f"- total intakes: {len(replay.patch_intakes)} / latest status: {latest_patch_intake.status.value}",
+        )
+        lines.append(f"- latest summary: {latest_patch_intake.summary}")
+        if latest_patch_intake.resolution_code is not None:
+            lines.append(f"- latest resolution: {latest_patch_intake.resolution_code.value}")
+
     if replay.consistency_warnings:
         lines.extend(["", "Consistency warnings", "--------------------"])
         for warning in replay.consistency_warnings:
@@ -1875,6 +1980,17 @@ def _render_replay(replay: RunReplayView, *, verbose: bool) -> str:
                 )
                 lines.append(f"  detail: {intervention.detail}")
                 lines.append(f"  phase_key: {intervention.phase_key}")
+
+        if replay.patch_intakes:
+            lines.extend(["", "Detailed patch intakes", "--------------------"])
+            for intake in replay.patch_intakes:
+                lines.append(f"- {intake.id}: {intake.status.value} / {intake.summary}")
+                lines.append(f"  risk_class: {intake.risk_class.value}")
+                lines.append(f"  changed_files: {', '.join(intake.changed_files) if intake.changed_files else '-'}")
+                lines.append(
+                    f"  resolution: {intake.resolution_code.value if intake.resolution_code is not None else '-'}"
+                )
+                lines.append(f"  reason: {intake.resolution_reason if intake.resolution_reason else '-'}")
 
     return "\n".join(lines)
 
@@ -1941,6 +2057,58 @@ def _render_artifact_detail(artifact: ArtifactInspectionView) -> str:
         command:            {item.command}
         cwd:                {item.cwd}
         created_at:         {item.created_at.isoformat()}
+        """,
+    ).strip()
+
+
+def _render_patch_review(review: PatchReviewView) -> str:
+    intake = review.intake
+    lines = [
+        "Patch review",
+        "------------",
+        f"patch_intake_id:     {intake.id}",
+        f"run_id:              {intake.run_id}",
+        f"task_id:             {intake.task_id}",
+        f"status:              {intake.status.value}",
+        f"risk_class:          {intake.risk_class.value}",
+        f"auto_apply_eligible: {intake.auto_apply_eligible}",
+        f"summary:             {intake.summary}",
+        f"source_workspace:    {intake.source_workspace}",
+        f"patch_size_bytes:    {intake.patch_size_bytes}",
+        f"touched_files:       {intake.touched_file_count}",
+        f"lines_added:         {review.changed_lines_added}",
+        f"lines_removed:       {review.changed_lines_removed}",
+        f"patch_artifact_id:   {intake.patch_artifact_id}",
+        f"receipt_artifact_id: {intake.receipt_artifact_id}",
+    ]
+    if intake.warnings:
+        lines.extend(["", "Warnings", "--------"])
+        for warning in intake.warnings:
+            lines.append(f"- {warning.code.value}: {warning.message}")
+    if intake.changed_files:
+        lines.extend(["", "Touched files", "-------------"])
+        for changed_file in intake.changed_files:
+            lines.append(f"- {changed_file}")
+    lines.extend(["", "Receipt preview", "---------------", review.receipt_preview])
+    lines.extend(["", "Inline diff", "-----------", review.patch_body.rstrip()])
+    if review.raw_receipt is not None:
+        lines.extend(["", "Raw receipt", "-----------", review.raw_receipt.rstrip()])
+    return "\n".join(lines)
+
+
+def _render_patch_resolution(resolution: PatchResolutionView) -> str:
+    intake = resolution.intake
+    return dedent(
+        f"""\
+        Patch intake
+        ------------
+        id:                 {intake.id}
+        status:             {intake.status.value}
+        resolution_code:    {intake.resolution_code.value if intake.resolution_code is not None else '-'}
+        resolution_reason:  {intake.resolution_reason if intake.resolution_reason else '-'}
+        validation_command: {intake.validation_command if intake.validation_command else '-'}
+        validation_artifact:{' ' * 1}{intake.validation_artifact_id if intake.validation_artifact_id is not None else '-'}
+        message:            {resolution.message}
         """,
     ).strip()
 
@@ -2190,6 +2358,52 @@ def main() -> None:
             print(_render_artifact_detail(artifact))
         return
 
+    if args.command == "patch" and args.patch_command == "review":
+        store = _build_store(args.database_url)
+        try:
+            review = store.build_patch_review(args.run_id, include_raw=args.raw)
+            if args.format == "json":
+                print(json.dumps(review.model_dump(mode="json"), indent=2, ensure_ascii=False))
+            else:
+                print(_render_patch_review(review))
+        except LookupError as exc:
+            print(str(exc))
+            raise SystemExit(1) from exc
+        return
+
+    if args.command == "patch" and args.patch_command == "approve":
+        store = _build_store(args.database_url)
+        try:
+            resolution = store.approve_patch_intake(args.patch_intake_id)
+            if args.format == "json":
+                print(json.dumps(resolution.model_dump(mode="json"), indent=2, ensure_ascii=False))
+            else:
+                print(_render_patch_resolution(resolution))
+        except (LookupError, ValueError, RuntimeError, FileNotFoundError, PermissionError) as exc:
+            print(str(exc))
+            raise SystemExit(1) from exc
+        if resolution.intake.status.value == "rejected":
+            raise SystemExit(1)
+        return
+
+    if args.command == "patch" and args.patch_command == "reject":
+        store = _build_store(args.database_url)
+        try:
+            reason = _load_text_argument(
+                value=args.reason,
+                file_path=args.reason_file,
+                label="Patch reject reason",
+            )
+            resolution = store.reject_patch_intake(args.patch_intake_id, reason=reason)
+            if args.format == "json":
+                print(json.dumps(resolution.model_dump(mode="json"), indent=2, ensure_ascii=False))
+            else:
+                print(_render_patch_resolution(resolution))
+        except (LookupError, ValueError, FileNotFoundError, IsADirectoryError) as exc:
+            print(str(exc))
+            raise SystemExit(1) from exc
+        return
+
     if args.command == "approval" and args.approval_command == "list":
         store = _build_store(args.database_url)
         print(_render_approvals(store, args.status))
@@ -2330,6 +2544,11 @@ def main() -> None:
                     f"Pending escalation={repeated_failure_escalation.observation_id}.",
                 )
             context = store.build_planner_context(args.run_id)
+            if context.snapshot.pending_patch_intake is not None:
+                raise PermissionError(
+                    "Founder patch review is still pending before another planner invoke is allowed. "
+                    f"Pending patch intake={context.snapshot.pending_patch_intake.intake_id}.",
+                )
             if context.snapshot.pending_founder_escalation is not None:
                 raise PermissionError(
                     "Founder reply is still required for the current planner escalation before another planner invoke is allowed. "

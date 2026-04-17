@@ -13,6 +13,7 @@ from v2_spring.domain.artifact import ArtifactStorageKind, ArtifactType
 from v2_spring.domain.decision import DecisionKind
 from v2_spring.domain.founder_intervention import FounderReplyKind
 from v2_spring.domain.observation import ObservationKind
+from v2_spring.domain.patch_intake import PatchIntakeStatus, PatchResolutionCode, PatchRiskClass
 from v2_spring.domain.planner_attempt import PlannerAttemptOutcome
 from v2_spring.domain.run import RiskLevel, RunStatus, UrgencyLevel
 from v2_spring.domain.task import TaskKind, TaskStatus
@@ -37,6 +38,9 @@ class LedgerEventType(StrEnum):
     TASK_COMPLETED = "TASK_COMPLETED"
     TASK_FAILED = "TASK_FAILED"
     ARTIFACT_RECORDED = "ARTIFACT_RECORDED"
+    PATCH_INTAKE_RECORDED = "PATCH_INTAKE_RECORDED"
+    PATCH_INTAKE_APPLIED = "PATCH_INTAKE_APPLIED"
+    PATCH_INTAKE_REJECTED = "PATCH_INTAKE_REJECTED"
     PLANNER_ATTEMPT_RECORDED = "PLANNER_ATTEMPT_RECORDED"
     FOUNDER_INTERVENTION_RECORDED = "FOUNDER_INTERVENTION_RECORDED"
 
@@ -93,6 +97,10 @@ class RunRecord(Base):
         cascade="all, delete-orphan",
     )
     artifacts: Mapped[list["ArtifactRecord"]] = relationship(
+        back_populates="run",
+        cascade="all, delete-orphan",
+    )
+    patch_intakes: Mapped[list["PatchIntakeRecord"]] = relationship(
         back_populates="run",
         cascade="all, delete-orphan",
     )
@@ -234,6 +242,10 @@ class TaskRecord(Base):
         back_populates="task",
         cascade="all, delete-orphan",
     )
+    patch_intakes: Mapped[list["PatchIntakeRecord"]] = relationship(
+        back_populates="task",
+        cascade="all, delete-orphan",
+    )
 
 
 class ArtifactRecord(Base):
@@ -279,6 +291,78 @@ class ArtifactRecord(Base):
     run: Mapped[RunRecord] = relationship(back_populates="artifacts")
     task: Mapped[TaskRecord] = relationship(back_populates="artifacts")
     decision: Mapped["DecisionRecord | None"] = relationship()
+
+
+class PatchIntakeRecord(Base):
+    __tablename__ = "patch_intakes"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("runs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    task_id: Mapped[str] = mapped_column(
+        ForeignKey("tasks.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    patch_artifact_id: Mapped[str] = mapped_column(
+        ForeignKey("artifacts.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    receipt_artifact_id: Mapped[str] = mapped_column(
+        ForeignKey("artifacts.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    validation_artifact_id: Mapped[str | None] = mapped_column(
+        ForeignKey("artifacts.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    status: Mapped[PatchIntakeStatus] = mapped_column(
+        Enum(PatchIntakeStatus, native_enum=False),
+        nullable=False,
+        default=PatchIntakeStatus.PENDING,
+    )
+    summary: Mapped[str] = mapped_column(String(400), nullable=False)
+    source_workspace: Mapped[str] = mapped_column(String(4000), nullable=False)
+    changed_files: Mapped[list[Any]] = mapped_column(JSON, nullable=False, default=list)
+    touched_file_count: Mapped[int] = mapped_column(nullable=False)
+    patch_size_bytes: Mapped[int] = mapped_column(nullable=False)
+    patch_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    risk_class: Mapped[PatchRiskClass] = mapped_column(
+        Enum(PatchRiskClass, native_enum=False),
+        nullable=False,
+    )
+    auto_apply_eligible: Mapped[bool] = mapped_column(nullable=False, default=False)
+    warnings: Mapped[list[Any]] = mapped_column(JSON, nullable=False, default=list)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=utc_now,
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolution_code: Mapped[PatchResolutionCode | None] = mapped_column(
+        Enum(PatchResolutionCode, native_enum=False),
+        nullable=True,
+    )
+    resolution_reason: Mapped[str | None] = mapped_column(String(4000), nullable=True)
+    validation_command: Mapped[str | None] = mapped_column(String(400), nullable=True)
+
+    run: Mapped[RunRecord] = relationship(back_populates="patch_intakes")
+    task: Mapped[TaskRecord] = relationship(back_populates="patch_intakes")
+    patch_artifact: Mapped[ArtifactRecord] = relationship(
+        foreign_keys=[patch_artifact_id],
+    )
+    receipt_artifact: Mapped[ArtifactRecord] = relationship(
+        foreign_keys=[receipt_artifact_id],
+    )
+    validation_artifact: Mapped[ArtifactRecord | None] = relationship(
+        foreign_keys=[validation_artifact_id],
+    )
 
 
 class EventLedgerRecord(Base):

@@ -278,6 +278,9 @@ def _iter_relevant_files(root: Path):
     for path in sorted(root.rglob("*")):
         if not path.is_file():
             continue
+        relative_parts = path.relative_to(root).parts
+        if any(_should_exclude_name(part) for part in relative_parts[:-1]):
+            continue
         if path.name == _CONTROL_FILE_NAME:
             continue
         if _should_exclude_file(path):

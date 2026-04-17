@@ -10,6 +10,7 @@ from v2_spring.domain.actions import PossibleActionName
 from v2_spring.domain.approval import ApprovalView
 from v2_spring.domain.founder_intervention import FounderInterventionDigest
 from v2_spring.domain.artifact import ArtifactType
+from v2_spring.domain.patch_intake import PatchIntakeStatus, PatchRiskClass
 from v2_spring.domain.run import RunView
 from v2_spring.domain.task import TaskKind, TaskStatus
 
@@ -95,6 +96,29 @@ class PendingFounderEscalationView(BaseModel):
         return cleaned
 
 
+class PendingPatchIntakeView(BaseModel):
+    """Open patch intake that still requires founder review before apply/reject."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    intake_id: UUID
+    task_id: UUID
+    patch_artifact_id: UUID
+    summary: str = Field(min_length=1, max_length=400)
+    risk_class: PatchRiskClass
+    warning_count: int = Field(ge=0)
+    touched_file_count: int = Field(ge=0)
+    created_at: datetime
+
+    @field_validator("summary")
+    @classmethod
+    def ensure_text(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("value must not be blank")
+        return cleaned
+
+
 class RunSnapshotView(BaseModel):
     """Planner-ready, founder-readable snapshot of current run state."""
 
@@ -108,9 +132,13 @@ class RunSnapshotView(BaseModel):
     action_state_reason: str = Field(min_length=1, max_length=400)
     pending_approval: ApprovalView | None
     pending_founder_escalation: PendingFounderEscalationView | None
+    pending_patch_intake: PendingPatchIntakeView | None
     latest_founder_intervention_summary: str | None
     latest_rejection_reason: str | None
     latest_decision_summary: str | None
+    latest_patch_intake_status: PatchIntakeStatus | None = None
+    latest_patch_intake_summary: str | None = None
+    latest_patch_rejection_reason: str | None = None
     planner_phase_key: str = Field(min_length=64, max_length=64)
     planner_budget_limit: int = Field(ge=1)
     planner_budget_used: int = Field(ge=0)
@@ -140,6 +168,8 @@ class RunSnapshotView(BaseModel):
         "latest_founder_intervention_summary",
         "latest_rejection_reason",
         "latest_decision_summary",
+        "latest_patch_intake_summary",
+        "latest_patch_rejection_reason",
         "latest_planner_attempt_summary",
     )
     @classmethod
