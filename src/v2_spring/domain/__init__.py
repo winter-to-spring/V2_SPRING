@@ -30,6 +30,24 @@ from v2_spring.domain.progress import (
 )
 from v2_spring.domain.proposal import PlannerProposalInput, PlannerProposalView
 from v2_spring.domain.replay import ArtifactInspectionView, RunReplayView, TaskReplayView
+from v2_spring.domain.routing import (
+    ExpectedOutputKind,
+    ExecutionRequirements,
+    ExecutionRuntime,
+    ROUTING_OUTCOME_ADAPTER,
+    RoutingDecision,
+    RoutingInspectionView,
+    RoutingOutcome,
+    RoutingRefusalCode,
+    RoutingRefusalReceipt,
+    SystemLimits,
+    TaskComplexity,
+    WriteScope,
+    default_requirements_for_bounded_execution,
+    default_system_limits,
+    derive_requirements_for_snapshot,
+    route_task,
+)
 from v2_spring.domain.run import RiskLevel, RunCreateInput, RunStatus, RunView, UrgencyLevel
 from v2_spring.domain.snapshot import (
     ArtifactHeadlineView,
@@ -75,12 +93,23 @@ __all__ = [
     "ProgressTraceMode",
     "PlannerProposalInput",
     "PlannerProposalView",
+    "ExpectedOutputKind",
+    "ExecutionRequirements",
+    "ExecutionRuntime",
     "PossibleActionEvaluationView",
     "PossibleActionName",
     "PossibleActionView",
     "RiskLevel",
+    "ROUTING_OUTCOME_ADAPTER",
+    "RoutingDecision",
+    "RoutingInspectionView",
+    "RoutingOutcome",
+    "RoutingRefusalCode",
+    "RoutingRefusalReceipt",
     "RunReplayView",
     "RunSnapshotView",
+    "SystemLimits",
+    "TaskComplexity",
     "TaskKind",
     "TaskHeadlineView",
     "TaskReplayView",
@@ -93,4 +122,9 @@ __all__ = [
     "RunView",
     "SnapshotActionState",
     "UrgencyLevel",
+    "WriteScope",
+    "default_requirements_for_bounded_execution",
+    "default_system_limits",
+    "derive_requirements_for_snapshot",
+    "route_task",
 ]
