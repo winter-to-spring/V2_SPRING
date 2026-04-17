@@ -120,6 +120,55 @@ class PendingPatchIntakeView(BaseModel):
         return cleaned
 
 
+class SnapshotFreshnessView(BaseModel):
+    """Bounded freshness token carried between founder surfaces and mutations."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    snapshot_hash: str = Field(min_length=64, max_length=64)
+    freshness_generation: int = Field(ge=0)
+
+    @field_validator("snapshot_hash")
+    @classmethod
+    def ensure_sha256(cls, value: str) -> str:
+        cleaned = value.strip().lower()
+        if len(cleaned) != 64 or any(character not in "0123456789abcdef" for character in cleaned):
+            raise ValueError("snapshot_hash must be a 64-character hexadecimal string")
+        return cleaned
+
+
+class SnapshotFreshnessRefusalCode(StrEnum):
+    STALE_SNAPSHOT = "stale_snapshot"
+
+
+class SnapshotFreshnessRefusalView(BaseModel):
+    """Typed refusal emitted when a founder/action uses a stale snapshot anchor."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    code: SnapshotFreshnessRefusalCode
+    mutation_name: str = Field(min_length=1, max_length=120)
+    message: str = Field(min_length=1, max_length=500)
+    expected: SnapshotFreshnessView
+    current: SnapshotFreshnessView
+
+    @field_validator("mutation_name", "message")
+    @classmethod
+    def ensure_text(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("value must not be blank")
+        return cleaned
+
+
+class SnapshotFreshnessConflictError(PermissionError):
+    """Raised when a founder/operator mutation is attempted from a stale snapshot."""
+
+    def __init__(self, refusal: SnapshotFreshnessRefusalView) -> None:
+        super().__init__(refusal.message)
+        self.refusal = refusal
+
+
 class RunSnapshotView(BaseModel):
     """Planner-ready, founder-readable snapshot of current run state."""
 
@@ -128,6 +177,7 @@ class RunSnapshotView(BaseModel):
     snapshot_timestamp: datetime
     policy_version: str = Field(min_length=1, max_length=100)
     state_hash: str = Field(min_length=64, max_length=64)
+    freshness_generation: int = Field(ge=0)
     run: RunView
     action_state: SnapshotActionState
     action_state_reason: str = Field(min_length=1, max_length=400)

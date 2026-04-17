@@ -46,7 +46,13 @@ from v2_spring.domain.routing import (
     WriteScope,
 )
 from v2_spring.domain.runtime_trust import RuntimeTrustView
-from v2_spring.domain.snapshot import PossibleActionEvaluationView, PossibleActionName, RunSnapshotView
+from v2_spring.domain.snapshot import (
+    PossibleActionEvaluationView,
+    PossibleActionName,
+    RunSnapshotView,
+    SnapshotFreshnessConflictError,
+    SnapshotFreshnessRefusalView,
+)
 from v2_spring.ledger.store import (
     BoundedExecutionResult,
     ExecutionClaimConflictError,
@@ -337,6 +343,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Hard timeout for the worker proof. Defaults to 30.",
     )
     task_dispatch_parser.add_argument(
+        "--snapshot-hash",
+        default=None,
+        help="Optional snapshot hash anchor from `v2-spring run snapshot` or `run status`.",
+    )
+    task_dispatch_parser.add_argument(
+        "--freshness-generation",
+        default=None,
+        type=int,
+        help="Optional snapshot freshness generation returned by founder/operator surfaces.",
+    )
+    task_dispatch_parser.add_argument(
         "--format",
         default="pretty",
         choices=["pretty", "json"],
@@ -466,6 +483,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     patch_approve_parser.add_argument("patch_intake_id", help="Patch intake id to approve.")
     patch_approve_parser.add_argument(
+        "--snapshot-hash",
+        default=None,
+        help="Optional snapshot hash anchor copied from `v2-spring patch review`.",
+    )
+    patch_approve_parser.add_argument(
+        "--freshness-generation",
+        default=None,
+        type=int,
+        help="Optional freshness generation copied from `v2-spring patch review`.",
+    )
+    patch_approve_parser.add_argument(
         "--format",
         default="pretty",
         choices=["pretty", "json"],
@@ -482,6 +510,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Reject one pending patch intake with an explicit founder reason.",
     )
     patch_reject_parser.add_argument("patch_intake_id", help="Patch intake id to reject.")
+    patch_reject_parser.add_argument(
+        "--snapshot-hash",
+        default=None,
+        help="Optional snapshot hash anchor copied from `v2-spring patch review`.",
+    )
+    patch_reject_parser.add_argument(
+        "--freshness-generation",
+        default=None,
+        type=int,
+        help="Optional freshness generation copied from `v2-spring patch review`.",
+    )
     reject_reason_group = patch_reject_parser.add_mutually_exclusive_group(required=True)
     reject_reason_group.add_argument("--reason", help="Founder reason for rejecting the patch.")
     reject_reason_group.add_argument(
@@ -1264,6 +1303,7 @@ def _render_snapshot(snapshot: RunSnapshotView) -> str:
         f"snapshot_timestamp:  {snapshot.snapshot_timestamp.isoformat()}",
         f"policy_version:      {snapshot.policy_version}",
         f"state_hash:          {snapshot.state_hash}",
+        f"freshness_generation:{' ' * 1}{snapshot.freshness_generation}",
         f"status:              {snapshot.run.status.value}",
         f"action_state:        {snapshot.action_state.value}",
         f"action_state_reason: {snapshot.action_state_reason}",
@@ -1376,6 +1416,7 @@ def _render_progress(progress: ProgressSummaryView) -> str:
         f"action_required_by:  {progress.action_required_by.value}",
         f"generated_at:        {progress.generated_at.isoformat()}",
         f"snapshot_hash:       {progress.snapshot_hash}",
+        f"snapshot_generation: {progress.snapshot_generation}",
         f"action_state:        {progress.action_state.value}",
         f"headline:            {progress.headline}",
         f"blocker_reason:      {progress.blocker_reason if progress.blocker_reason else '-'}",
@@ -1803,10 +1844,10 @@ def _record_transport_error_audit(
     error: PlannerTransportError,
 ) -> None:
     if error.code == "cancelled":
-        summary = (
+        intent_summary = (
             f"Planner transport via {error.provider.value} was interrupted locally before a structured response was accepted."
         )
-        details = (
+        intent_details = (
             f"error_code={error.code}; "
             f"provider={error.provider.value}; "
             f"model={error.model}; "
@@ -1823,8 +1864,25 @@ def _record_transport_error_audit(
         store.record_observation(
             run_id=run_id,
             kind=ObservationKind.SYSTEM_AUDIT,
-            summary=summary,
-            details=details,
+            summary=intent_summary,
+            details=intent_details,
+        )
+        store.record_observation(
+            run_id=run_id,
+            kind=ObservationKind.SYSTEM_AUDIT,
+            summary=(
+                f"Planner cancellation for {error.provider.value} was reconciled locally; remote completion remains unconfirmed."
+            ),
+            details=(
+                "error_code=planner_cancel_reconciled_local; "
+                f"provider={error.provider.value}; "
+                f"model={error.model}; "
+                f"timeout_seconds={error.timeout_seconds if error.timeout_seconds is not None else '-'}; "
+                f"orphan_risk_possible={error.orphan_risk_possible}; "
+                "cancellation_scope=local_cli_only; "
+                "final_state=cancelled_local_bounded_orphan_risk; "
+                "recommended_action=inspect runtime/provider telemetry before relying on cancellation finality."
+            ),
         )
         return
     store.record_observation(
@@ -2197,6 +2255,8 @@ def _render_patch_review(review: PatchReviewView) -> str:
         f"lines_removed:       {review.changed_lines_removed}",
         f"patch_artifact_id:   {intake.patch_artifact_id}",
         f"receipt_artifact_id: {intake.receipt_artifact_id}",
+        f"snapshot_hash:       {review.snapshot_hash}",
+        f"freshness_generation:{' ' * 1}{review.freshness_generation}",
     ]
     if intake.warnings:
         lines.extend(["", "Warnings", "--------"])
@@ -2207,6 +2267,21 @@ def _render_patch_review(review: PatchReviewView) -> str:
         for changed_file in intake.changed_files:
             lines.append(f"- {changed_file}")
     lines.extend(["", "Receipt preview", "---------------", review.receipt_preview])
+    lines.extend(
+        [
+            "",
+            "Freshness-safe follow-ups",
+            "-------------------------",
+            (
+                f"approve: v2-spring patch approve {intake.id} --snapshot-hash {review.snapshot_hash} "
+                f"--freshness-generation {review.freshness_generation}"
+            ),
+            (
+                f"reject:  v2-spring patch reject {intake.id} --reason ... --snapshot-hash {review.snapshot_hash} "
+                f"--freshness-generation {review.freshness_generation}"
+            ),
+        ],
+    )
     lines.extend(["", "Inline diff", "-----------", review.patch_body.rstrip()])
     if review.raw_receipt is not None:
         lines.extend(["", "Raw receipt", "-----------", review.raw_receipt.rstrip()])
@@ -2238,6 +2313,22 @@ def _render_patch_resolution(resolution: PatchResolutionView) -> str:
         validation_command: {intake.validation_command if intake.validation_command else '-'}
         validation_artifact:{' ' * 1}{intake.validation_artifact_id if intake.validation_artifact_id is not None else '-'}
         message:            {resolution.message}
+        """,
+    ).strip()
+
+
+def _render_snapshot_freshness_refusal(refusal: SnapshotFreshnessRefusalView) -> str:
+    return dedent(
+        f"""\
+        Snapshot freshness refusal
+        -------------------------
+        code:                 {refusal.code.value}
+        mutation_name:        {refusal.mutation_name}
+        expected_hash:        {refusal.expected.snapshot_hash}
+        expected_generation:  {refusal.expected.freshness_generation}
+        current_hash:         {refusal.current.snapshot_hash}
+        current_generation:   {refusal.current.freshness_generation}
+        message:              {refusal.message}
         """,
     ).strip()
 
@@ -2450,6 +2541,8 @@ def main() -> None:
                     workspace=Path(args.workspace),
                     artifact_root=Path(args.artifact_root),
                     timeout_seconds=args.timeout_seconds,
+                    snapshot_hash=args.snapshot_hash,
+                    freshness_generation=args.freshness_generation,
                 )
             else:
                 result = store.dispatch_isolated_worker_task(
@@ -2457,6 +2550,8 @@ def main() -> None:
                     workspace=Path(args.workspace),
                     artifact_root=Path(args.artifact_root),
                     timeout_seconds=args.timeout_seconds,
+                    snapshot_hash=args.snapshot_hash,
+                    freshness_generation=args.freshness_generation,
                 )
             if args.format == "json":
                 print(
@@ -2473,6 +2568,12 @@ def main() -> None:
                 )
             else:
                 print(_render_isolated_worker_result(result))
+        except SnapshotFreshnessConflictError as exc:
+            if args.format == "json":
+                print(json.dumps(exc.refusal.model_dump(mode="json"), indent=2, ensure_ascii=False))
+            else:
+                print(_render_snapshot_freshness_refusal(exc.refusal))
+            raise SystemExit(1) from exc
         except ExecutionClaimConflictError as exc:
             if args.format == "json":
                 print(json.dumps(exc.refusal.model_dump(mode="json"), indent=2, ensure_ascii=False))
@@ -2561,11 +2662,21 @@ def main() -> None:
     if args.command == "patch" and args.patch_command == "approve":
         store = _build_store(args.database_url)
         try:
-            resolution = store.approve_patch_intake(args.patch_intake_id)
+            resolution = store.approve_patch_intake(
+                args.patch_intake_id,
+                snapshot_hash=args.snapshot_hash,
+                freshness_generation=args.freshness_generation,
+            )
             if args.format == "json":
                 print(json.dumps(resolution.model_dump(mode="json"), indent=2, ensure_ascii=False))
             else:
                 print(_render_patch_resolution(resolution))
+        except SnapshotFreshnessConflictError as exc:
+            if args.format == "json":
+                print(json.dumps(exc.refusal.model_dump(mode="json"), indent=2, ensure_ascii=False))
+            else:
+                print(_render_snapshot_freshness_refusal(exc.refusal))
+            raise SystemExit(1) from exc
         except (LookupError, ValueError, RuntimeError, FileNotFoundError, PermissionError) as exc:
             print(str(exc))
             raise SystemExit(1) from exc
@@ -2581,12 +2692,23 @@ def main() -> None:
                 file_path=args.reason_file,
                 label="Patch reject reason",
             )
-            resolution = store.reject_patch_intake(args.patch_intake_id, reason=reason)
+            resolution = store.reject_patch_intake(
+                args.patch_intake_id,
+                reason=reason,
+                snapshot_hash=args.snapshot_hash,
+                freshness_generation=args.freshness_generation,
+            )
             if args.format == "json":
                 print(json.dumps(resolution.model_dump(mode="json"), indent=2, ensure_ascii=False))
             else:
                 print(_render_patch_resolution(resolution))
-        except (LookupError, ValueError, FileNotFoundError, IsADirectoryError) as exc:
+        except SnapshotFreshnessConflictError as exc:
+            if args.format == "json":
+                print(json.dumps(exc.refusal.model_dump(mode="json"), indent=2, ensure_ascii=False))
+            else:
+                print(_render_snapshot_freshness_refusal(exc.refusal))
+            raise SystemExit(1) from exc
+        except (LookupError, ValueError, FileNotFoundError, IsADirectoryError, PermissionError) as exc:
             print(str(exc))
             raise SystemExit(1) from exc
         return

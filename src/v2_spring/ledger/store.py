@@ -12,7 +12,7 @@ import textwrap
 from typing import Iterator
 from uuid import uuid4
 
-from sqlalchemy import create_engine, inspect, select, text, update
+from sqlalchemy import create_engine, func, inspect, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -94,6 +94,10 @@ from v2_spring.domain.snapshot import (
     PossibleActionName,
     RunSnapshotView,
     SnapshotActionState,
+    SnapshotFreshnessConflictError,
+    SnapshotFreshnessRefusalCode,
+    SnapshotFreshnessRefusalView,
+    SnapshotFreshnessView,
     TaskHeadlineView,
     TaskStatusSummary,
 )
@@ -1414,6 +1418,7 @@ class LedgerStore:
 
     def build_patch_review(self, run_id: str, *, include_raw: bool = False) -> PatchReviewView:
         self.ensure_schema()
+        snapshot = self.build_run_snapshot(run_id)
         with self.session() as session:
             record = next(
                 (
@@ -1448,6 +1453,8 @@ class LedgerStore:
 
             return PatchReviewView(
                 intake=self._to_patch_intake_view(record),
+                snapshot_hash=snapshot.state_hash,
+                freshness_generation=snapshot.freshness_generation,
                 patch_body=patch_body,
                 receipt_preview=(
                     f"runtime={receipt_payload.get('runtime', '-')}; "
@@ -1459,8 +1466,25 @@ class LedgerStore:
                 raw_receipt=raw_receipt if include_raw else None,
             )
 
-    def approve_patch_intake(self, patch_intake_id: str) -> PatchResolutionView:
+    def approve_patch_intake(
+        self,
+        patch_intake_id: str,
+        *,
+        snapshot_hash: str | None = None,
+        freshness_generation: int | None = None,
+    ) -> PatchResolutionView:
         self.ensure_schema()
+        with self.session() as session:
+            patch_intake = session.get(PatchIntakeRecord, patch_intake_id)
+            if patch_intake is None:
+                raise LookupError(f"Patch intake {patch_intake_id} was not found.")
+            run_id = patch_intake.run_id
+        self._assert_snapshot_freshness(
+            run_id=run_id,
+            mutation_name="patch approval",
+            snapshot_hash=snapshot_hash,
+            freshness_generation=freshness_generation,
+        )
         with self.session() as session:
             patch_intake = session.get(PatchIntakeRecord, patch_intake_id)
             if patch_intake is None:
@@ -1497,11 +1521,29 @@ class LedgerStore:
                 message=message,
             )
 
-    def reject_patch_intake(self, patch_intake_id: str, *, reason: str) -> PatchResolutionView:
+    def reject_patch_intake(
+        self,
+        patch_intake_id: str,
+        *,
+        reason: str,
+        snapshot_hash: str | None = None,
+        freshness_generation: int | None = None,
+    ) -> PatchResolutionView:
         self.ensure_schema()
         normalized_reason = self._normalize_optional_text(reason)
         if normalized_reason is None:
             raise ValueError("Patch rejection requires a non-blank founder reason.")
+        with self.session() as session:
+            patch_intake = session.get(PatchIntakeRecord, patch_intake_id)
+            if patch_intake is None:
+                raise LookupError(f"Patch intake {patch_intake_id} was not found.")
+            run_id = patch_intake.run_id
+        self._assert_snapshot_freshness(
+            run_id=run_id,
+            mutation_name="patch rejection",
+            snapshot_hash=snapshot_hash,
+            freshness_generation=freshness_generation,
+        )
         with self.session() as session:
             patch_intake = session.get(PatchIntakeRecord, patch_intake_id)
             if patch_intake is None:
@@ -1639,6 +1681,14 @@ class LedgerStore:
                     .where(FounderInterventionRecord.run_id == run_id)
                     .order_by(FounderInterventionRecord.created_at.asc(), FounderInterventionRecord.id.asc()),
                 ).all(),
+            )
+            freshness_generation = int(
+                session.scalar(
+                    select(func.count())
+                    .select_from(EventLedgerRecord)
+                    .where(EventLedgerRecord.run_id == run_id),
+                )
+                or 0,
             )
             patch_intake_records = list(
                 session.scalars(
@@ -1794,6 +1844,14 @@ class LedgerStore:
                     .order_by(PatchIntakeRecord.created_at.asc(), PatchIntakeRecord.id.asc()),
                 ).all(),
             )
+            freshness_generation = int(
+                session.scalar(
+                    select(func.count())
+                    .select_from(EventLedgerRecord)
+                    .where(EventLedgerRecord.run_id == run_id),
+                )
+                or 0,
+            )
             execution_claim = self._load_execution_claim(session, run_id)
             active_execution_claim = (
                 self._build_execution_claim_view(session, execution_claim)
@@ -1864,6 +1922,7 @@ class LedgerStore:
 
             snapshot_payload = {
                 "policy_version": POSSIBLE_ACTIONS_ENGINE_VERSION,
+                "freshness_generation": freshness_generation,
                 "run": self._to_run_view(run_record).model_dump(mode="json"),
                 "pending_approval": pending_approval.model_dump(mode="json") if pending_approval else None,
                 "pending_founder_escalation": (
@@ -1907,6 +1966,7 @@ class LedgerStore:
                 snapshot_timestamp=utc_now(),
                 policy_version=POSSIBLE_ACTIONS_ENGINE_VERSION,
                 state_hash=state_hash,
+                freshness_generation=freshness_generation,
                 run=self._to_run_view(run_record),
                 action_state=SnapshotActionState.STUCK,
                 action_state_reason="Possible actions have not been evaluated yet.",
@@ -1939,6 +1999,52 @@ class LedgerStore:
                 latest_artifact=latest_artifact,
                 recent_founder_interventions=recent_founder_interventions,
             )
+
+    @staticmethod
+    def _build_snapshot_freshness_view(snapshot: RunSnapshotView) -> SnapshotFreshnessView:
+        return SnapshotFreshnessView(
+            snapshot_hash=snapshot.state_hash,
+            freshness_generation=snapshot.freshness_generation,
+        )
+
+    def _assert_snapshot_freshness(
+        self,
+        *,
+        run_id: str,
+        mutation_name: str,
+        snapshot_hash: str | None = None,
+        freshness_generation: int | None = None,
+    ) -> None:
+        if snapshot_hash is None and freshness_generation is None:
+            return
+
+        current_snapshot = self.build_run_snapshot(run_id)
+        current = self._build_snapshot_freshness_view(current_snapshot)
+        hash_mismatch = snapshot_hash is not None and snapshot_hash != current.snapshot_hash
+        generation_mismatch = (
+            freshness_generation is not None and freshness_generation != current.freshness_generation
+        )
+        if not hash_mismatch and not generation_mismatch:
+            return
+
+        expected = SnapshotFreshnessView(
+            snapshot_hash=snapshot_hash or current.snapshot_hash,
+            freshness_generation=(
+                current.freshness_generation if freshness_generation is None else freshness_generation
+            ),
+        )
+        raise SnapshotFreshnessConflictError(
+            SnapshotFreshnessRefusalView(
+                code=SnapshotFreshnessRefusalCode.STALE_SNAPSHOT,
+                mutation_name=mutation_name,
+                message=(
+                    f"Run {run_id} changed since the snapshot you inspected; {mutation_name} is blocked until "
+                    "you refresh the current founder/operator surface."
+                ),
+                expected=expected,
+                current=current,
+            ),
+        )
 
     def build_run_progress(
         self,
@@ -1977,6 +2083,7 @@ class LedgerStore:
             trace_mode=trace_mode,
             run=snapshot.run,
             snapshot_hash=snapshot.state_hash,
+            snapshot_generation=snapshot.freshness_generation,
             action_state=snapshot.action_state,
             surface_status=surface_status,
             action_required_by=action_required_by,
@@ -3429,10 +3536,18 @@ class LedgerStore:
         workspace: Path,
         artifact_root: Path,
         timeout_seconds: int = 30,
+        snapshot_hash: str | None = None,
+        freshness_generation: int | None = None,
     ) -> IsolatedWorkerDispatchResult:
         """Dispatch one bounded isolated-worker proof and persist its trail."""
 
         self.ensure_schema()
+        self._assert_snapshot_freshness(
+            run_id=run_id,
+            mutation_name="task dispatch",
+            snapshot_hash=snapshot_hash,
+            freshness_generation=freshness_generation,
+        )
         workspace = workspace.expanduser().resolve()
         artifact_root = artifact_root.expanduser().resolve()
         requirements = ExecutionRequirements(
@@ -3621,10 +3736,18 @@ class LedgerStore:
         workspace: Path,
         artifact_root: Path,
         timeout_seconds: int = 30,
+        snapshot_hash: str | None = None,
+        freshness_generation: int | None = None,
     ) -> IsolatedWorkerDispatchResult:
         """Dispatch one bounded containerized-worker proof and persist its trail."""
 
         self.ensure_schema()
+        self._assert_snapshot_freshness(
+            run_id=run_id,
+            mutation_name="task dispatch",
+            snapshot_hash=snapshot_hash,
+            freshness_generation=freshness_generation,
+        )
         workspace = workspace.expanduser().resolve()
         artifact_root = artifact_root.expanduser().resolve()
         requirements = ExecutionRequirements(

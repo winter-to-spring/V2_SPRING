@@ -1316,11 +1316,15 @@ def test_planner_invoke_cli_records_local_cancel_with_orphan_risk_metadata(
 
     store = LedgerStore(database_url)
     observations = store.list_observations_for_run(run_id)
-    audit = observations[-1]
-    assert "error_code=cancelled" in audit.details
-    assert "orphan_risk_possible=True" in audit.details
-    assert "timeout_seconds=19" in audit.details
-    assert "cancellation_scope=local_cli_only" in audit.details
+    intent_audit = observations[-2]
+    reconciliation_audit = observations[-1]
+    assert "error_code=cancelled" in intent_audit.details
+    assert "orphan_risk_possible=True" in intent_audit.details
+    assert "timeout_seconds=19" in intent_audit.details
+    assert "cancellation_scope=local_cli_only" in intent_audit.details
+    assert "error_code=planner_cancel_reconciled_local" in reconciliation_audit.details
+    assert "final_state=cancelled_local_bounded_orphan_risk" in reconciliation_audit.details
+    assert "orphan_risk_possible=True" in reconciliation_audit.details
 
 
 def test_founder_hint_cli_reopens_pending_escalation_and_lists_interventions(

@@ -100,6 +100,7 @@ class ProgressSummaryView(BaseModel):
     trace_mode: ProgressTraceMode
     run: RunView
     snapshot_hash: str = Field(min_length=64, max_length=64)
+    snapshot_generation: int = Field(ge=0)
     action_state: SnapshotActionState
     surface_status: ProgressSurfaceStatus
     action_required_by: ProgressActionOwner
