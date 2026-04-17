@@ -1,6 +1,6 @@
-# Decision Log
+# 의사결정 로그
 
-Lightweight decision records that do not require a full ADR.
+전체 ADR까지 필요하지는 않지만 남겨둘 가치가 있는 가벼운 결정 기록입니다.
 
-Use this for execution-time judgments, tradeoff notes, and temporary
-decision breadcrumbs that still need to remain inspectable.
+구현 시점 판단, 트레이드오프 메모, 그리고 나중에도 추적 가능해야 하는
+임시 결정 흔적을 이곳에 남깁니다.

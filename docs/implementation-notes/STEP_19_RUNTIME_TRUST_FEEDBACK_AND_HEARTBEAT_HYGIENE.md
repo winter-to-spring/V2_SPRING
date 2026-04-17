@@ -41,3 +41,12 @@
   coalesced instead of writing on every heartbeat
 - `RISK-0051` remains deferred until networked or external-side-effect
   runtimes are opened
+
+## Feedback Incorporated
+
+- Runtime-trust feedback pushed this slice beyond static manifests into strike-
+  based trust promotion and recovery.
+- Operational feedback on heartbeat storms also drove the coalesced renewal
+  cadence and founder-visible renewal pressure surface.
+- The trust model stays centrally stored so one noisy worker cannot fork local
+  truth.

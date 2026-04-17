@@ -36,3 +36,13 @@ Once this slice is stable, the next expansions should be:
 3. `Artifact`
 4. `Approval`
 5. `run replay`
+
+## Feedback Incorporated
+
+- No separate post-spec feedback log existed for this earliest slice, so this
+  note now serves as the retroactive baseline.
+- Later feedback consistently reinforced the Step 1 choice to keep
+  state tables authoritative while preserving an append-only ledger for audit
+  and replay.
+- The typed CLI/store boundary introduced here remained the foundation for the
+  later governance and replay hardening work.

@@ -63,3 +63,12 @@ competing mutations around the same run or claim row.
   tables from ORM metadata
 - `RISK-0057` moves to mitigating through row-lock helpers, claim hot-path
   indexing, and targeted regression coverage
+
+## Feedback Incorporated
+
+- Migration feedback pushed this slice to treat Postgres as a transactional
+  concurrency upgrade, not just a storage swap.
+- That pressure directly produced Alembic-managed bootstrap, fail-closed schema
+  behavior, and a clear migration path before multi-worker scale.
+- Review guidance also narrowed the migration order to leases/claims first,
+  then broader ledger concerns, with planner persistence explicitly later.

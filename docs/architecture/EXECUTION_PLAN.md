@@ -1,34 +1,35 @@
-# V2_SPRING Execution Plan
+# V2_SPRING 실행 계획
 
-## Intent
+## 의도
 
-V2_SPRING is a clean-room rebuild of the autonomous software studio.
+V2_SPRING은 자율 소프트웨어 스튜디오를 클린룸 방식으로 다시 만드는
+프로젝트입니다.
 
-We are not carrying V1 forward as the product core. We will only reuse proven
-ideas, documents, and infrastructure direction from earlier work.
+우리는 V1을 제품 코어로 그대로 끌고 가지 않습니다. 이전 작업에서 검증된
+아이디어, 문서, 인프라 방향만 선별해 재사용합니다.
 
-## Phase 1. Charter And Boundaries
+## Phase 1. 차터와 경계
 
-Goal:
-- lock the system charter before implementation expands again
+목표:
+- 구현이 다시 커지기 전에 시스템 차터를 잠근다
 
-Deliverables:
-- system purpose and non-goals
-- human-in-the-loop boundaries
-- success criteria for "autonomous but governable"
-- initial ADR set
+산출물:
+- 시스템 목적과 비목표
+- human-in-the-loop 경계
+- "자율적이지만 통제 가능한가"에 대한 성공 기준
+- 초기 ADR 세트
 
-Questions this phase must answer:
-- what is the product actually for
-- what decisions remain human-approved
-- what must never depend on agent memory
+이 단계가 답해야 할 질문:
+- 제품은 실제로 무엇을 위한 것인가
+- 어떤 결정은 계속 사람이 승인해야 하는가
+- 무엇은 절대 agent memory에 의존하면 안 되는가
 
-## Phase 2. Core State Model
+## Phase 2. 핵심 상태 모델
 
-Goal:
-- define the stable domain model before building orchestration
+목표:
+- 오케스트레이션을 만들기 전에 안정적인 도메인 모델을 정의한다
 
-Core entities:
+핵심 엔티티:
 - Project
 - Run
 - Module
@@ -41,120 +42,120 @@ Core entities:
 - Risk
 - Observation
 
-Deliverables:
-- domain model
-- lifecycle definitions
-- invariants
-- event ledger design
+산출물:
+- 도메인 모델
+- 라이프사이클 정의
+- 불변식
+- 이벤트 원장 설계
 
-Questions this phase must answer:
-- what is the source of truth
-- what can change when agents scale
-- what must remain invariant even if many agents are added
+이 단계가 답해야 할 질문:
+- 진실의 원천은 무엇인가
+- agent 수가 늘어나면 무엇이 바뀔 수 있는가
+- agent가 많이 늘어나도 무엇은 반드시 invariant로 남아야 하는가
 
-## Phase 3. Deterministic Substrate
+## Phase 3. 결정론적 substrate
 
-Goal:
-- build the reliable system of record first
+목표:
+- 신뢰할 수 있는 system of record를 먼저 만든다
 
-Scope:
-- Postgres for record
-- Redis for coordination
-- queue and lease semantics
-- approvals and budget policies
-- cancellation, retry, and resume semantics
+범위:
+- 기록 저장소로 Postgres
+- 조정 수단으로 Redis
+- queue와 lease semantics
+- approval과 budget 정책
+- cancellation, retry, resume semantics
 
-Deliverables:
-- app skeleton
-- infra bootstrap
-- deterministic executor contracts
-- event storage and replay foundation
+산출물:
+- 앱 골격
+- 인프라 부트스트랩
+- 결정론적 executor 계약
+- 이벤트 저장과 replay 기반
 
-Questions this phase must answer:
-- how state is persisted
-- how concurrent execution is kept safe
-- how a run ends, pauses, resumes, or is cancelled
+이 단계가 답해야 할 질문:
+- 상태는 어떻게 저장되는가
+- 동시 실행은 어떻게 안전하게 유지되는가
+- run은 어떻게 종료/일시정지/재개/취소되는가
 
 ## Phase 4. Planner And Replanner Layer
 
-Goal:
-- move from hardcoded routing to action selection
+목표:
+- 하드코딩 라우팅에서 action selection으로 이동한다
 
-Scope:
+범위:
 - state snapshot
 - possible actions
 - policy guard
 - planner output schema
 - replanning loop
 
-Primary target:
-- LangGraph as planner and replanner
+주요 타깃:
+- planner와 replanner로서의 LangGraph
 
-Questions this phase must answer:
-- how next actions are generated
-- how risk and approval affect planning
-- how the system re-enters a run after blockers or feedback
+이 단계가 답해야 할 질문:
+- 다음 행동은 어떻게 생성되는가
+- risk와 approval은 planning에 어떻게 영향을 주는가
+- blocker나 feedback 이후 시스템은 어떻게 run으로 재진입하는가
 
 ## Phase 5. Execution Workforce
 
-Goal:
-- attach specialist execution crews without changing the substrate
+목표:
+- substrate를 바꾸지 않고 specialist execution crew를 붙인다
 
-Scope:
+범위:
 - capability registry
-- execution pools
-- module builders
-- QA and integration workers
+- execution pool
+- module builder
+- QA / integration worker
 
-Primary target:
-- CrewAI as execution workforce
+주요 타깃:
+- execution workforce로서의 CrewAI
 
-Questions this phase must answer:
-- who is fit for a task
-- how additional agents affect capacity rather than topology
-- how execution feedback returns to the planner
+이 단계가 답해야 할 질문:
+- 어떤 task에 누가 적합한가
+- agent 추가는 topology가 아니라 capacity를 어떻게 바꾸는가
+- execution feedback은 planner로 어떻게 돌아오는가
 
 ## Phase 6. Founder Verification Surface
 
-Goal:
-- make the full process inspectable by a human without reading raw logs
+목표:
+- 사람이 raw log를 읽지 않고도 전체 과정을 검사할 수 있게 만든다
 
-Scope:
-- request input
+범위:
+- 요청 입력
 - live process trail
-- approval interactions
-- artifact and result storage
-- run history and replay
+- approval interaction
+- artifact/result 저장
+- run history와 replay
 
-Questions this phase must answer:
-- what was requested
-- how it was handled
-- who worked on it
-- what documents and artifacts were produced
-- what risks remain
+이 단계가 답해야 할 질문:
+- 무엇이 요청되었는가
+- 어떻게 처리되었는가
+- 누가 작업했는가
+- 어떤 문서와 artifact가 생산되었는가
+- 어떤 리스크가 남아 있는가
 
-## Phase 7. Autonomy Expansion
+## Phase 7. 자율성 확장
 
-Goal:
-- expand bounded autonomy without losing control
+목표:
+- 통제를 잃지 않고 bounded autonomy를 확장한다
 
-Scope:
+범위:
 - hiring proposal flow
 - budget review flow
-- observer roles
+- observer role
 - external health monitoring
-- self-improvement loops
+- self-improvement loop
 
-Questions this phase must answer:
-- what the system may decide by itself
-- when it must escalate
-- how to improve itself without drifting from founder intent
+이 단계가 답해야 할 질문:
+- 시스템은 무엇을 스스로 결정할 수 있는가
+- 언제 에스컬레이션해야 하는가
+- founder intent에서 벗어나지 않으면서 어떻게 스스로를 개선하는가
 
-## Immediate Priority
+## 즉시 우선순위
 
-We should start with:
-1. Phase 1 charter
-2. Phase 2 state model
-3. Phase 3 deterministic substrate
+우리는 다음부터 시작해야 합니다.
+1. Phase 1 차터
+2. Phase 2 상태 모델
+3. Phase 3 결정론적 substrate
 
-The planner, crews, and UI should sit on top of those three foundations.
+planner, crew, UI는 이 세 기반 위에 올라가야 합니다.

@@ -126,3 +126,12 @@ This command shows:
 - any current masking
 - the parsed planner output
 - the recorded decision id or escalation observation id
+
+## Feedback Incorporated
+
+- Feedback around planner/provider coupling pushed this slice to keep the
+  LangGraph adapter narrow and contract-driven.
+- That pressure is why the CLI exposes bounded context and parsed outputs
+  directly, instead of hiding planner behavior behind framework internals.
+- Multi-provider transport and richer founder interaction were intentionally
+  left for later slices rather than folded into this adapter step.

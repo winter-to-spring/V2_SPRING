@@ -80,3 +80,13 @@ system refused to honor it.
 - remaining follow-on risks are:
   - `RISK-0049`
   - `RISK-0051`
+
+## Feedback Incorporated
+
+- Lease-hardening feedback pushed this slice to use thresholded renewal,
+  server-side time truth, and fencing tokens rather than optimistic late
+  acceptance.
+- Reclaim feedback also required stale worker results to be rejected through a
+  typed, replay-visible path.
+- Follow-on concerns about renewal churn and external side effects were kept as
+  separate risks instead of overloading this step.

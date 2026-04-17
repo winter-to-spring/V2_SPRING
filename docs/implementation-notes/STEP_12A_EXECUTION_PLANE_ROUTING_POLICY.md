@@ -79,3 +79,12 @@ audit trails, founder surfaces, and later planner failure reports.
 - `RISK-0022`: intentionally deferred by keeping Step 12-a single-lane and
   non-distributed
 - `RISK-0026`: opened intentionally as a later hardening concern
+
+## Feedback Incorporated
+
+- Routing feedback strongly favored requirement-based dispatch over exposing
+  runtime names to the planner.
+- Additional review pressure required the dispatcher to normalize and distrust
+  planner requirements instead of accepting them at face value.
+- That is why refusals became typed governance outcomes and the first routing
+  implementation stayed explicit-rule based instead of scoring-driven.

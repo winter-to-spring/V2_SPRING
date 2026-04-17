@@ -79,3 +79,14 @@ Step 14 hardens the Step 13 containerized worker runtime with three new layers:
 - `PYTHONPATH=src pytest -q tests/test_step14_containerized_worker.py tests/test_step13_containerized_worker.py`
 - `python3 -m compileall src`
 - `PYTHONPATH=src pytest -q`
+
+## Feedback Incorporated
+
+- Provenance feedback pushed this slice to use a repo-managed metadata
+  registry, digest-pinned runtime identity, and migration-safe guardrails
+  instead of live registry lookups.
+- Diagnostic feedback also drove the move from blunt truncation to
+  sandwich-style log capture.
+- Preflight feedback favored static-first checks with selective dynamic
+  escalation, which is why manifest trust is mitigated rather than declared
+  solved absolutely.

@@ -117,3 +117,12 @@ runtime:
   - timeout reclaim
   - CLI JSON surface
 - full test suite remains green after the new runtime lane is added
+
+## Feedback Incorporated
+
+- Container hardening feedback required this slice to include least-privilege
+  launch rules, ownership normalization, and orphan garbage collection as core
+  acceptance criteria instead of optional polish.
+- Additional review pushed the design toward static-image, copy-in/copy-out
+  execution rather than live host mounts.
+- The result is a stricter but more replayable container runtime boundary.

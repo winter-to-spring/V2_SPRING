@@ -1,6 +1,6 @@
 # Operator UI
 
-Operator-facing observability and intervention surface.
+Operator가 관측과 개입에 사용하는 표면입니다.
 
-This is intentionally deferred until after the deterministic substrate and
-tracer bullet have been proven.
+이 영역은 결정론적 substrate와 tracer bullet이 먼저 증명된 뒤로
+의도적으로 미뤄두었습니다.

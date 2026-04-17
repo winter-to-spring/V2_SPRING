@@ -1,67 +1,65 @@
-# ADR 0008: Founder Reply Contract
+# ADR 0008: Founder Reply 계약
 
-## Status
+## 상태
 
 Accepted
 
-## Context
+## 배경
 
-Step 10-a introduced `EscalationProposal` as a bounded planner output.
+Step 10-a는 bounded planner output으로 `EscalationProposal`을 도입했습니다.
 
-That created a new gap:
+그 결과 새로운 공백이 생겼습니다.
 
-- the founder could receive a planner escalation
-- but the founder response itself was not yet typed
-- and the system had no deterministic answer for what hint, override, or reject
-  should do next
+- founder는 planner escalation을 받을 수 있게 되었지만
+- founder의 응답 자체는 아직 typed되지 않았고
+- hint, override, reject가 다음에 정확히 무엇을 하게 만드는지도 결정되지 않았습니다
 
-Without a founder reply contract, the human-in-the-loop lane would drift back
-into free-form chat semantics and replay would lose meaning.
+founder reply contract가 없으면, human-in-the-loop lane은 다시 free-form chat
+semantics로 돌아가고 replay의 의미도 약해집니다.
 
-## Decision
+## 결정
 
-We standardize founder replies as a discriminated union with three bounded
-response kinds:
+founder reply를 세 가지 bounded response kind를 가진 discriminated union으로
+표준화합니다.
 
 1. `hint`
 2. `override`
 3. `reject`
 
-Additional rules:
+추가 규칙:
 
-- founder replies bind to the **target escalation observation id**, not the
-  current snapshot hash
-- `override` is a **bounded override** and may only select an action that is
-  currently present in the legal-actions set
-- `reject` does not force the planner to guess again; it closes the current
-  founder-help lane and exhausts the current planner phase
-- `hint` does **not** auto-approve the next planner proposal; the planner must
-  still re-enter the normal legality and governance path
-- founder hint ping-pong is bounded with a **phase-scoped quota**; the current
-  policy allows at most two founder hints before the next escalation attempt
-  exhausts the current phase
-- founder interventions are stored as replayable founder-specific records and
-  summarized back into the next planner context window
+- founder reply는 현재 snapshot hash가 아니라 **target escalation observation id**
+  에 묶입니다
+- `override`는 **bounded override**이며, 현재 legal-actions set 안에 있는 action만
+  선택할 수 있습니다
+- `reject`는 planner에게 다시 추측하게 하지 않습니다. 현재 founder-help lane을
+  닫고 current planner phase를 exhausted 상태로 보냅니다
+- `hint`는 다음 planner proposal을 auto-approve하지 않습니다. planner는 다시
+  normal legality / governance path를 통과해야 합니다
+- founder hint ping-pong는 **phase-scoped quota**로 bounded됩니다. 현재 정책은
+  다음 escalation attempt가 phase를 exhausted시키기 전까지 founder hint를 최대
+  두 번 허용합니다
+- founder intervention은 replay 가능한 founder-specific record로 저장되며, 다음
+  planner context window에 요약되어 다시 주입됩니다
 
-## Consequences
+## 결과
 
-### Positive
+### 긍정적
 
-- founder interventions are explicit, replayable, and machine-readable
-- planner/founder handoff no longer relies on ambiguous free text alone
-- bounded override preserves legality guarantees without opening god mode
-- reject semantics prevent the planner from hallucinating a random action after
-  a failed founder-help request
+- founder intervention이 명시적이고 replay 가능하며 machine-readable해짐
+- planner/founder handoff가 모호한 자유 텍스트에만 의존하지 않게 됨
+- bounded override가 god mode를 열지 않고 legality guarantee를 보존함
+- reject semantics가 failed founder-help 요청 뒤 planner가 임의 action을
+  hallucinate하는 것을 막음
 
-### Negative
+### 부정적
 
-- the CLI surface becomes more structured and slightly heavier to use
-- founder intervention policy must stay in sync with planner governance policy
-- richer founder surfaces will still be needed later to reduce CLI typing
-  friction
+- CLI 표면이 더 구조화되어 사용감이 조금 무거워짐
+- founder intervention policy를 planner governance policy와 계속 맞춰야 함
+- CLI 타이핑 마찰을 줄이려면 이후 richer founder surface가 여전히 필요함
 
-## Follow-up
+## 후속
 
-- Step 10-b implements the founder reply contract and proof CLI
-- Step 10-c will harden production transport, prompt policy, and richer founder
-  feedback handling
+- Step 10-b가 founder reply contract와 proof CLI를 구현한다
+- Step 10-c가 production transport, prompt policy, richer founder feedback
+  handling을 하드닝한다

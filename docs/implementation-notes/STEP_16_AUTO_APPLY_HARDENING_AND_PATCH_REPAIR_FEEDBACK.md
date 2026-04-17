@@ -67,3 +67,12 @@ Once the repair quota is exhausted:
 - shadow centrality beyond the initial protected-file boundary remains open
 - stronger structural analysis remains future hardening
 - broader trust expansion should stay bounded and issue-driven
+
+## Feedback Incorporated
+
+- Auto-apply trust feedback forced this slice to add protected-file force
+  review, anti-salami quotas, and stronger structural scan semantics.
+- Repair-loop feedback also required bounded, detailed repair feedback rather
+  than vague "try again" failure signals.
+- The result is a harder trust boundary that still keeps narrow automation
+  alive.

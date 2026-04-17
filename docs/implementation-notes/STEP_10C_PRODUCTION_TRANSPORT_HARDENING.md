@@ -78,3 +78,12 @@ Current cancellation guardrails:
 
 The risk remains because this is still foreground CLI cancellation, not true
 provider-side request abort or worker-safe cancellation.
+
+## Feedback Incorporated
+
+- Provider integration feedback pushed this slice to normalize transport
+  behavior at the adapter edge instead of letting provider quirks leak inward.
+- Cancellation feedback also forced the system to classify local aborts as
+  typed transport outcomes with audit visibility rather than silent drops.
+- This laid the groundwork for later cancellation reconciliation and runtime
+  trust work.

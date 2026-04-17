@@ -82,3 +82,12 @@ observability for `RISK-0055`, `RISK-0057`, and `RISK-0061`.
   instead of assumed
 - `RISK-0061` moves to mitigating through explicit controller-boundary
   diagnostics rather than remaining opaque
+
+## Feedback Incorporated
+
+- Contention feedback pushed this slice to move from "Postgres boots" to "we
+  can observe who is blocking whom under load".
+- That directly led to lock-wait diagnostics, controller-boundary visibility,
+  and live contention smoke against disposable Postgres.
+- Deadlock feedback also forced a more explicit lock acquisition order in the
+  claim hot path instead of relying on incidental ORM ordering.

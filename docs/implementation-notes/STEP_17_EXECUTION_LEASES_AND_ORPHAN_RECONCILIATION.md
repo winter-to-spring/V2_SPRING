@@ -88,3 +88,12 @@ claims.
   - `RISK-0046`
   - `RISK-0047`
   - `RISK-0048`
+
+## Feedback Incorporated
+
+- Concurrency feedback pushed this slice to make execution ownership explicit
+  instead of inferred from task status.
+- Orphan-handling feedback also required reconcile and claim visibility to stay
+  founder/operator visible rather than becoming silent background behavior.
+- This step intentionally established the lease model first and deferred
+  renewal, atomicity hardening, and fencing into Step 18.

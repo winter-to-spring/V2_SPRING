@@ -110,3 +110,13 @@ leases and distributed coordination remain a separate scaling concern.
 
 Those are still important, but they belong to the next scaling and concurrency
 phase rather than this tracer-bullet hardening step.
+
+## Feedback Incorporated
+
+- Later feedback around approval deadlock and stale writer races reinforced the
+  decision to add guarded mutation checks instead of trusting in-memory
+  readiness alone.
+- The note now makes explicit that current-scope approval safety was tightened
+  while multi-worker coordination stayed intentionally deferred.
+- This slice became the bridge between basic approval semantics and the later
+  lease/fencing work.

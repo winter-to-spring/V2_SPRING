@@ -98,3 +98,12 @@ ledger trail disagree in obvious ways, such as:
 - planner-driven branch visualizations
 
 Those belong to later scaling and multi-agent slices.
+
+## Feedback Incorporated
+
+- Follow-up replay and audit feedback pushed hard on trustworthiness rather
+  than pretty summaries.
+- That pressure reinforced checksum validation and inconsistency warnings
+  instead of assuming artifacts and ledger state always agree.
+- Later founder/operator and planner surfaces depended on this stricter replay
+  honesty instead of introducing a separate truth source.

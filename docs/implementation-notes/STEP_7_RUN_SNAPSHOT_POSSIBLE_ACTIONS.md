@@ -104,3 +104,13 @@ This slice intentionally does **not** fully solve:
 
 Those risks remain documented in the shared risk register and should gate later
 planner/scale work.
+
+## Feedback Incorporated
+
+- Later planner-facing feedback repeatedly asked for a legal-move surface that
+  separates "blocked" from "terminal" from "unexpected gap".
+- That validated the Step 7 action-state model and the decision to keep
+  snapshots derived from authoritative state instead of materializing a second
+  mutable projection.
+- Snapshot freshness concerns raised here stayed open until the Step 20
+  freshness-anchor hardening.

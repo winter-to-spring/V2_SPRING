@@ -1,27 +1,27 @@
-# System Charter
+# 시스템 차터
 
-## Product Intention
+## 제품 의도
 
-Build a founder-controlled autonomous software studio that can:
-- accept high-level goals
-- plan and replan work
-- execute bounded tasks
-- request approval for risky actions
-- record all important decisions and outcomes
-- allow full replay and verification
+다음을 할 수 있는 founder-controlled 자율 소프트웨어 스튜디오를 만든다.
+- 높은 수준의 목표를 받는다
+- 작업을 계획하고 재계획한다
+- bounded task를 실행한다
+- 위험한 행동에 대해 승인을 요청한다
+- 중요한 결정과 결과를 모두 기록한다
+- 전체 replay와 검증을 허용한다
 
-## Non-Goals
+## 비목표
 
-V2_SPRING will not begin as:
-- a UI-first product
-- a patchwork continuation of Paperclip V1
-- a fully autonomous no-governance system
-- a state model driven by prompts or summaries
+V2_SPRING은 처음부터 다음으로 시작하지 않는다.
+- UI-first 제품
+- Paperclip V1을 대충 이어 붙인 연장선
+- 거버넌스 없는 완전 자율 시스템
+- 프롬프트나 요약이 상태 모델을 대신하는 시스템
 
-## Immediate Success Criterion
+## 즉시 성공 기준
 
-The first success criterion is a CLI-verifiable tracer bullet that proves:
-- durable state
-- deterministic execution
-- human approval
-- replayability
+첫 번째 성공 기준은 다음을 증명하는 CLI 검증 가능 tracer bullet이다.
+- 영속 상태
+- 결정론적 실행
+- 사람 승인
+- replay 가능성

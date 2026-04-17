@@ -1,4 +1,21 @@
-# Implementation Notes
+# 구현 노트
 
-Execution-time notes that document what was actually discovered while building
-the system. These notes complement ADRs by capturing reality, not just intent.
+구현 노트는 시스템을 만드는 동안 **실제로 무엇을 발견했는지**를 기록하는
+문서입니다. ADR이 의도를 남긴다면, 구현 노트는 실제 구현 과정에서 드러난
+현실을 남깁니다.
+
+## 피드백 추적 규칙
+
+모든 step note는 마지막에 `## Feedback Incorporated` 섹션을 두는 것을
+원칙으로 합니다.
+
+이 섹션은 가볍게 유지합니다. 대신 아래 내용을 꼭 요약합니다.
+
+- 어떤 피드백 또는 리뷰 압력이 이 slice를 바꾸었는지
+- 어떤 risk, ADR, follow-up 방향에 영향을 주었는지
+- 무엇을 흡수했고, 무엇을 의도적으로 미뤘는지
+
+이 규칙이 생기기 전에 작성된 옛 note들은 나중에라도 짧은 요약을 추가해,
+독자가 다음 흐름을 추적할 수 있게 합니다.
+
+`feedback -> risk -> decision -> implementation`

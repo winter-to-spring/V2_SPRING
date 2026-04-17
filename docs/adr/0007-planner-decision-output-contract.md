@@ -1,138 +1,82 @@
-# ADR 0007: Structured Planner Decision Output Contract
+# ADR 0007: 구조화된 Planner Decision Output 계약
 
-## Context
+## 배경
 
-Step 10 is the first point where a real planner adapter enters the V2_SPRING
-control plane.
+Step 10은 실제 planner adapter가 V2_SPRING control plane에 처음 진입하는
+지점입니다.
 
-By Step 9 we already had:
+Step 9까지 이미 갖춘 것은 아래와 같습니다.
 
-- typed run/task/approval/task-artifact state
-- replayable planner attempts
-- bounded planner phase budgets
+- typed run/task/approval/task-artifact 상태
+- replay 가능한 planner attempt
+- bounded planner phase budget
 - deterministic legal-action evaluation
 
-The next risk was not only "can an LLM answer?" but "can an LLM answer without
-either suffocating into V1-style rigidity or escaping the governance model?".
+다음 리스크는 단순히 "LLM이 답할 수 있는가?"가 아니라, "LLM이 V1처럼
+질식할 정도로 경직되지 않으면서도 governance 모델을 벗어나지 않고 답할 수
+있는가?"였습니다.
 
-Two failures had to be avoided at the same time:
+동시에 피해야 할 실패는 두 가지였습니다.
 
-1. free-form text outputs that are hard to parse, govern, or audit
-2. overly narrow schemas that force the planner to guess an action even when it
-   should escalate
+1. parse, govern, audit가 어려운 free-form text output
+2. escalate해야 할 상황에서도 action 하나를 억지로 찍게 만드는 지나치게
+   좁은 schema
 
-## Decision
+## 결정
 
-Step 10 adopts a **structured, discriminated-union planner output contract**.
+Step 10은 **structured, discriminated-union planner output contract**를
+채택합니다.
 
-The planner adapter returns one of two legal proposal shapes:
+planner adapter는 아래 두 legal proposal shape 중 하나를 반환합니다.
 
 - `ActionProposal`
 - `EscalationProposal`
 
-Both proposals are schema-validated and selected via the explicit `kind`
-discriminator.
+두 proposal 모두 schema validation을 거치며, 명시적 `kind` discriminator로
+선택됩니다.
 
-## Why Structured Outputs
+## 왜 Structured Output인가
 
-V2_SPRING needs a planner slot that is:
+V2_SPRING이 planner slot에 요구하는 것은 아래와 같습니다.
 
 - machine-readable
 - replayable
-- bounded by governance
-- robust against parser drift
+- governance에 bounded됨
+- parser drift에 강함
 
-Free-form text makes parser loops and hidden planner drift too easy.
+free-form text는 parser loop와 숨은 planner drift를 너무 쉽게 허용합니다.
 
-Therefore Step 10 keeps structured outputs as the default path.
+따라서 Step 10은 structured output을 기본 경로로 유지합니다.
 
 ## ActionProposal vs EscalationProposal
 
-`ActionProposal` is for a normal next move that already exists inside the
-deterministic legal-action engine.
+`ActionProposal`은 이미 deterministic legal-action engine 안에 존재하는
+정상 next move를 표현합니다.
 
-`EscalationProposal` is for founder-facing governance requests when the planner
-cannot safely choose a next action.
+`EscalationProposal`은 planner가 안전하게 next action을 고를 수 없을 때,
+founder-facing governance request를 표현합니다.
 
-This separation preserves domain purity:
+이 분리는 domain purity를 지켜줍니다.
 
-- the legal-action engine remains an execution-domain component
-- escalation remains a governance-domain component
+- legal-action engine은 execution-domain component로 남음
+- escalation은 governance-domain component로 남음
 
-We do **not** encode escalation as a normal action enum.
+우리는 escalation을 일반 action enum 안에 넣지 않습니다.
 
-## Reasoning Summary Policy
+## Reasoning Summary 정책
 
-The planner must still be allowed to explain itself.
+planner는 여전히 자기 판단을 설명할 수 있어야 합니다.
 
-However, V2_SPRING does not store raw chain-of-thought.
+하지만 V2_SPRING은 raw chain-of-thought를 저장하지 않습니다.
 
-Instead, the contract requires bounded reasoning metadata such as:
+대신 이 계약은 아래와 같은 bounded reasoning metadata를 요구합니다.
 
 - `analysis_summary`
 - `confidence`
 - `blocking_reason`
 - `requested_help`
 
-This preserves observability without turning the ledger into a chain-of-thought
-dump.
+이렇게 하면 ledger를 chain-of-thought dump로 만들지 않으면서도 관측 가능성을
+유지할 수 있습니다.
 
-`confidence` is treated as an observational signal, not a safety authority.
-
-## Hint-First / Override-Available Policy
-
-Founder interaction follows this policy:
-
-- default path: the founder gives a structured hint and the planner proposes
-  again
-- exception path: founder override remains available for future governance
-  surfaces
-
-This keeps planner autonomy meaningful without removing founder control.
-
-Step 10 only formalizes the **hint-first** side of this policy; override
-handling remains a follow-up capability.
-
-## Failure Reporting Policy
-
-Planner input does not receive raw ledger events.
-
-Instead, Step 10 uses a bounded `StructuredFailureReport` that contains enough
-signal for self-correction without exposing the full raw ledger.
-
-At minimum the planner receives:
-
-- failure class
-- normalized error code
-- short sanitized traceback
-- normalized failure signature
-- previous rationale
-- observed outcome
-
-This is intentionally a summarized report, not raw log replay.
-
-## Consequences
-
-Benefits:
-
-- the planner can think inside a typed contract without being forced to fake an
-  action
-- governance remains explicit and replayable
-- parser drift becomes observable and bounded
-- action selection and escalation are no longer conflated
-
-Costs:
-
-- the summarizer now matters more; if it loses key failure details, planner
-  quality drops
-- founder reply semantics need their own contract later
-- escalation can still thrash if not governed by future policies
-
-## Follow-up
-
-This ADR leaves follow-up work for later phases:
-
-- founder reply contract for hint vs override
-- escalation throttling / cooldown policy
-- stronger failure-report fidelity checks
-- production transport integration beyond scripted proof mode
+`confidence`는 safety authority가 아니라 observational signal로 취급합니다.

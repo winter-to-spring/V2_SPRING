@@ -1,4 +1,4 @@
-# ADR Index
+# ADR 인덱스
 
 1. `0001-system-charter.md`
 2. `0002-human-in-the-loop-boundaries.md`

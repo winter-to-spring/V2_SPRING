@@ -1,48 +1,47 @@
 # Risk ID: RISK-0055
-Title: PostgreSQL connection exhaustion may appear when worker/controller fanout grows
+Title: worker/controller fanout이 커질 때 PostgreSQL connection exhaustion이 나타날 수 있음
 Class: Before Next Phase
 Status: Mitigating
 Owner: Storage / Execution plane
 Observed In: Step 21 planning
 
-## Description
+## 설명
 
-Once V2_SPRING moves from SQLite-first local execution to PostgreSQL-backed
-multi-writer execution, careless connection ownership can become a new failure
-mode.
+V2_SPRING이 SQLite-first 로컬 실행에서 PostgreSQL 기반 multi-writer 실행으로
+이동하면, 부주의한 connection ownership이 새로운 장애 모드가 될 수 있습니다.
 
-If workers, containers, or multiple controller processes all try to open direct
-database connections aggressively, the connection pool can saturate quickly.
+worker, container, 또는 여러 controller process가 직접 DB 연결을 공격적으로
+열기 시작하면 connection pool이 빠르게 포화될 수 있습니다.
 
-## Impact
+## 영향
 
-- claims, renewals, and reconciliations may block on pool exhaustion
-- founder/operator CLI can appear unhealthy even when application code is fine
-- background execution fanout can degrade the whole control plane
+- claim, renewal, reconciliation이 pool exhaustion 때문에 막힐 수 있음
+- 애플리케이션 코드는 멀쩡해도 founder/operator CLI가 불안정해 보일 수 있음
+- background execution fanout이 전체 control plane을 느리게 만들 수 있음
 
-## Why This Matters
+## 왜 중요한가
 
-Postgres solves transactional correctness, but only if we keep access patterns
-disciplined enough that the store remains available under load.
+Postgres는 transactional correctness를 해결해주지만, 접근 패턴이 충분히
+절제되어야만 부하 상황에서도 저장소 가용성을 유지할 수 있습니다.
 
-## Suggested Mitigation
+## 권장 완화책
 
-- keep DB access controller-mediated by default
-- configure explicit SQLAlchemy pool sizing and overflow limits
-- avoid letting isolated/containerized workers talk to Postgres directly
-- add operational tests that simulate fanout and observe pool pressure
+- 기본적으로 DB 접근을 controller-mediated로 유지한다
+- 명시적인 SQLAlchemy pool sizing과 overflow limit를 설정한다
+- isolated/containerized worker가 Postgres에 직접 접근하지 못하게 한다
+- fanout을 재현하고 pool pressure를 관측하는 운영 테스트를 추가한다
 
-Current mitigation:
+현재 완화 상태:
 
-- Step 21 adds PostgreSQL-specific engine defaults with pool pre-ping enabled
-- controller-mediated DB access remains the default boundary; workers do not
-  gain direct ledger writes in this slice
-- the migration issue now treats connection ownership as a first-class design
-  constraint instead of an afterthought
-- Step 22 exposes pool sizing, checked-out connections, overflow, and
-  utilization through `v2-spring doctor`
-- Step 22 adds a live PostgreSQL contention smoke probe so pool pressure is
-  observed rather than assumed
+- Step 21은 pool pre-ping이 켜진 PostgreSQL 전용 engine 기본값을 추가함
+- controller-mediated DB access가 기본 경계로 유지되며, 이 단계에서 worker는
+  direct ledger write를 얻지 못함
+- migration issue는 이제 connection ownership을 부수 고려사항이 아니라
+  핵심 설계 제약으로 다룸
+- Step 22는 `v2-spring doctor`를 통해 pool sizing, checked-out connection,
+  overflow, utilization을 노출함
+- Step 22는 live PostgreSQL contention smoke probe를 추가해 pool pressure를
+  가정이 아니라 실제 관측 대상으로 만듦
 
 ## Capability Gate
 - Capability: multi-worker / multi-agent execution on Postgres
@@ -60,11 +59,10 @@ Current mitigation:
 - Design note: ../../implementation-notes/STEP_21_POSTGRES_MIGRATION_AND_TRANSACTIONAL_CONCURRENCY.md
 - Design note: ../../implementation-notes/STEP_22_POSTGRES_CONTENTION_AND_CONTROLLER_DB_BOUNDARY.md
 
-## Exit Criteria
+## 종료 기준
 
-- worker fanout cannot exhaust the primary DB through unbounded direct
-  connections
-- controller pool behavior is configured and tested under expected load
+- worker fanout이 무제한 direct connection으로 primary DB를 고갈시키지 못한다
+- controller pool 동작이 예상 부하 아래에서 설정되고 검증된다
 
 ## Last Updated
 - 2026-04-17

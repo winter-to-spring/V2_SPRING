@@ -1,169 +1,82 @@
-# ADR 0006: Bounded Replanning Loop and Planner Attempt Governance
+# ADR 0006: Bounded Replanning Loop와 Planner Attempt 거버넌스
 
-## Context
+## 배경
 
-Step 8 introduced a typed planner proposal contract and a legal-action guard,
-but it intentionally stopped short of governing repeated planner failure.
+Step 8은 typed planner proposal contract와 legal-action guard를 도입했지만,
+반복되는 planner failure를 어떻게 다룰지는 의도적으로 미뤄두었습니다.
 
-Before attaching any real LangGraph adapter or automatic replanning loop, the
-system must answer four questions deterministically:
+실제 LangGraph adapter나 자동 replanning loop를 붙이기 전에, 시스템은 아래 네
+질문에 결정론적으로 답할 수 있어야 합니다.
 
-1. How many planner mistakes are allowed inside one state segment?
-2. Which failures should consume planner retry budget?
-3. How are duplicate submissions handled?
-4. How can a founder explicitly reopen an exhausted planner phase?
+1. 하나의 state segment 안에서 planner 실수는 몇 번까지 허용되는가?
+2. 어떤 failure가 planner retry budget을 소모하는가?
+3. duplicate submission은 어떻게 처리되는가?
+4. exhausted된 planner phase를 founder가 어떻게 다시 열 수 있는가?
 
-Without those answers, a future planner could loop forever on stale hashes,
-illegal actions, or repeated proposals while burning tokens and cluttering the
-ledger.
+이 답이 없으면, future planner는 stale hash, illegal action, repeated proposal로
+무한 루프를 돌며 token을 태우고 ledger를 어지럽힐 수 있습니다.
 
-## Decision
+## 결정
 
-V2_SPRING will use a **phase-scoped planner budget** plus an append-only
-planner-attempt ledger.
+V2_SPRING은 **phase-scoped planner budget**과 append-only planner-attempt
+ledger를 사용합니다.
 
-- Planner retries are bounded per **phase**, not globally for the whole run.
-- A phase is identified by a deterministic `planner_phase_key`.
-- The phase key is derived from meaningful advancement signals only:
+- planner retry는 run 전체 기준이 아니라 **phase** 기준으로 bounded합니다.
+- phase는 결정론적인 `planner_phase_key`로 식별합니다.
+- phase key는 의미 있는 advancement signal만으로 계산됩니다.
   - run status
   - pending approval state
   - latest rejection reason
   - task summary
   - latest task headline
   - latest artifact headline
-- Planner-only traces must **not** advance the phase:
-  - accepted planner decisions
-  - planner escalation records
-  - founder-help lane markers
+- 아래와 같은 planner-only trace는 phase를 전진시키면 안 됩니다.
+  - accepted planner decision
+  - planner escalation record
+  - founder-help lane marker
   - founder hint / reject / override bookkeeping
-  - manual recharge records
-- Examples:
-  - resolving approval or completing a bounded task may advance the phase
-  - opening or clearing a founder escalation must not advance the phase by itself
+  - manual recharge record
+- 예:
+  - approval 해소나 bounded task completion은 phase를 전진시킬 수 있음
+  - founder escalation을 열거나 닫는 것만으로는 phase가 전진하면 안 됨
 
-## Attempt Budget Policy
+## Attempt Budget 정책
 
-- The initial planner phase budget is `3`.
-- These outcomes consume budget:
+- 초기 planner phase budget은 `3`입니다.
+- 아래 outcome은 budget을 소모합니다.
   - `rejected_stale`
   - `rejected_illegal`
   - `rejected_duplicate_cognitive`
-- These outcomes do **not** consume budget:
+- 아래 outcome은 budget을 소모하지 않습니다.
   - `accepted`
   - `rejected_duplicate_transport`
   - `manual_recharge`
-  - execution-time failures outside the planner proposal path
-- When the phase budget is exhausted, the system records a
-  `phase_exhausted` planner attempt and blocks further planner proposals until
-  a founder explicitly recharges the phase.
+  - planner proposal 경로 바깥의 execution-time failure
+- phase budget이 고갈되면 시스템은 `phase_exhausted` planner attempt를 기록하고,
+  founder가 명시적으로 recharge하기 전까지 추가 planner proposal을 막습니다.
 
-## Duplicate Policy
+## Duplicate 정책
 
-Planner duplication is handled in two layers.
+Planner duplicate는 두 층으로 처리합니다.
 
 ### Transport-level duplicate
 
-- Definition: the same `submission_key` is submitted again inside the current
-  active planner phase.
-- Result: explicit rejection with
-  `rejected_duplicate_transport`.
-- Budget effect: does not consume planner budget.
+- 정의: 현재 active planner phase 안에서 같은 `submission_key`가 다시 제출된 경우
+- 결과: `rejected_duplicate_transport`로 명시적 거부
+- budget 영향: budget을 소모하지 않음
 
 ### Cognitive duplicate
 
-- Definition:
-  - the same proposal fingerprint is repeated inside the current active planner
-    phase, or
-  - the same normalized proposal intent signature is repeated for the same
-    action inside the current active planner phase, or
-  - a proposal is submitted after one proposal has already been accepted in the
-    same active planner phase and state has not advanced.
-- Result: explicit rejection with
-  `rejected_duplicate_cognitive`.
-- Budget effect: consumes planner budget.
+- 정의:
+  - 현재 active planner phase 안에서 같은 proposal fingerprint가 반복되거나
+  - 같은 action에 대해 정규화된 proposal intent signature가 반복되거나
+  - 같은 active planner phase 안에서 이미 하나의 proposal이 accepted되었는데도
+    상태가 전진하지 않은 상태에서 또 proposal이 들어온 경우
 
-## Resume Policy
+## 결과
 
-- Reopening a planner phase is a founder-controlled action.
-- `manual_recharge` is allowed only when the current active phase is exhausted.
-- Recharge requires an explicit non-blank reason.
-- The founder can inspect `planner recharge-check` before reopening the phase.
-- Recharge guidance must surface the latest failure / rejection / founder-help
-  context that still affects the current phase.
-- Repeated recharge, deterministic runtime blockage, or still-active rejection
-  context require explicit acknowledgement before the phase can be reopened.
-- Recharge resets the active-budget window for the current phase but does not
-  delete past attempts.
-- Past attempts remain replayable and auditable.
-
-## External Failure Accounting
-
-Planner proposal governance is separate from executor/runtime failure.
-
-- If a proposal is legal and accepted, planner budget stops being the relevant
-  control.
-- Later execution failures such as timeout, filesystem errors, permission
-  problems, or provider outages do **not** consume planner proposal budget.
-- Those failures must be tracked through task / observation / artifact state and
-  can create a new planning phase later.
-- Repeated **deterministic** execution failure is a special case:
-  - it still does not consume planner proposal budget directly
-  - but once the same deterministic execution blocker repeats without state
-    advancement, the system must open a founder-help escalation lane before it
-    accepts another planner proposal
-  - this keeps the planner/executor boundary honest without blaming the planner
-    for one-off runtime noise
-
-## Structured Outcome Contract
-
-Every planner attempt is persisted as an append-only ledger-backed record with:
-
-- `phase_key`
-- `policy_version`
-- `snapshot_hash`
-- `selected_action`
-- `submission_key`
-- `proposal_fingerprint`
-- `outcome`
-- `outcome_reason`
-- `attempt_index`
-- `budget_limit`
-- `budget_used`
-- `budget_remaining`
-
-This keeps replay and future planner analytics grounded in typed evidence
-instead of free-form logs.
-
-## Alternatives Considered
-
-### Global run budget
-
-Rejected for Step 9 because long runs could die late due to a few stale or
-illegal planner attempts that happened much earlier.
-
-### Silent duplicate drops
-
-Rejected because silent drops hide failure from both founders and future
-planners. Duplicate handling must be explicit.
-
-### Budget reset on any new decision
-
-Rejected because planner-only decisions would let the planner refresh its own
-budget without meaningful progress.
-
-## Consequences
-
-### Positive
-
-- Planner failure is finite and auditable.
-- Founder-controlled recharge is possible without deleting history.
-- Duplicate submissions are separated from repeated reasoning failure.
-- A real planner adapter can target a stable legal-action contract later.
-
-### Negative
-
-- Snapshot hashes change as planner governance state changes, which makes
-  manual CLI proof more verbose.
-- Exact semantic duplicate detection is still imperfect and remains a separate
-  risk.
-- Phase-reset abuse still requires future hardening.
+- planner retry는 phase 단위로 bounded되고 replay 가능해집니다.
+- duplicate semantics가 transport-level과 cognitive level로 분리됩니다.
+- founder는 exhausted된 phase를 명시적으로 recharge할 수 있습니다.
+- planner governance가 단순한 "retry count"가 아니라 phase-aware 운영 규칙으로
+  고정됩니다.

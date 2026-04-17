@@ -1,43 +1,41 @@
 # Risk ID: RISK-0061
-Title: Controller-mediated DB access may become a throughput bottleneck or SPOF
+Title: controller-mediated DB access가 throughput 병목이나 SPOF가 될 수 있음
 Class: Before Next Phase
 Status: Mitigating
 Owner: Control plane / Runtime coordination
 Observed In: Step 22 controller-boundary hardening
 
-## Description
+## 설명
 
-Controller-mediated DB access is the right trust boundary for V2_SPRING, but it
-changes the shape of the bottleneck.
+controller-mediated DB access는 V2_SPRING에 맞는 trust boundary지만, 병목의
+형태를 다른 방향으로 바꿉니다.
 
-If every worker, reconcile path, or operational query must flow through the
-controller, the controller itself can become the narrow waist of the system.
+모든 worker, reconcile path, 운영 query가 controller를 통과해야 한다면,
+controller 자체가 시스템의 좁은 허리가 될 수 있습니다.
 
-## Impact
+## 영향
 
-- request backlogs may build even when Postgres itself is healthy
-- founder/operator UX may feel slow for controller reasons rather than DB reasons
-- the system may trade DB safety for a new application-layer bottleneck
+- Postgres가 건강해도 request backlog가 쌓일 수 있음
+- founder/operator UX가 DB가 아니라 controller 때문에 느려질 수 있음
+- 시스템이 DB 안전성과 맞바꿔 새로운 application-layer 병목을 만들 수 있음
 
-## Why This Matters
+## 왜 중요한가
 
-The controller boundary is strategically correct, but Step 22 should make that
-boundary observable and intentionally lightweight, not magical.
+controller boundary는 전략적으로 맞지만, Step 22는 이 경계를 마법처럼
+숨기는 대신 관측 가능하고 의도적으로 가벼운 것으로 만들어야 합니다.
 
-## Suggested Mitigation
+## 권장 완화책
 
-- keep the controller DB mediation path narrow and purpose-built
-- surface whether failures are DB-side or controller-side
-- avoid direct worker DB access while measuring controller throughput separately
-- defer broader cache/queue layers until evidence shows they are needed
+- controller DB mediation path를 좁고 목적 지향적으로 유지한다
+- 장애가 DB 측인지 controller 측인지 드러낸다
+- worker의 direct DB access를 막으면서 controller throughput을 별도로 측정한다
+- 더 넓은 cache/queue layer는 필요하다는 증거가 생길 때까지 미룬다
 
-Current mitigation:
+현재 완화 상태:
 
-- Step 22 makes the controller DB boundary explicit in `v2-spring doctor`
-- the same doctor surface now separates lock waiting / pool pressure from the
-  application boundary itself
-- live contention smoke gives the controller boundary a measurable signal
-  instead of leaving throughput concerns hypothetical
+- Step 22는 `v2-spring doctor`에서 controller DB boundary를 명시적으로 보여준다
+- 같은 doctor surface가 lock waiting / pool pressure와 application boundary를 구분해 보여준다
+- live contention smoke는 controller boundary에 대해 가정이 아닌 측정 가능한 신호를 준다
 
 ## Capability Gate
 - Capability: higher-fanout execution traffic through a controller-owned DB boundary
@@ -52,10 +50,10 @@ Current mitigation:
 - Design note: ../../issues/STEP_22_POSTGRES_CONTENTION_AND_CONTROLLER_DB_BOUNDARY.md
 - Design note: ../../implementation-notes/STEP_22_POSTGRES_CONTENTION_AND_CONTROLLER_DB_BOUNDARY.md
 
-## Exit Criteria
+## 종료 기준
 
-- controller-only DB mediation has a measurable throughput envelope
-- operator surfaces can distinguish controller pressure from DB pressure
+- controller-only DB mediation이 측정 가능한 throughput envelope를 가진다
+- operator surface가 controller pressure와 DB pressure를 구분할 수 있다
 
 ## Last Updated
 - 2026-04-17
