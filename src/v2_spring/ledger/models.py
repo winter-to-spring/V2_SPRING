@@ -5,7 +5,8 @@ from enum import StrEnum
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import DateTime, Enum, ForeignKey, JSON, String, event
+from sqlalchemy import DateTime, Enum, ForeignKey, Index, JSON, String, event
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from v2_spring.domain.approval import ApprovalStatus
@@ -16,7 +17,9 @@ from v2_spring.domain.founder_intervention import FounderReplyKind
 from v2_spring.domain.observation import ObservationKind
 from v2_spring.domain.patch_intake import PatchIntakeStatus, PatchResolutionCode, PatchRiskClass
 from v2_spring.domain.planner_attempt import PlannerAttemptOutcome
+from v2_spring.domain.routing import ExecutionRuntime
 from v2_spring.domain.run import RiskLevel, RunStatus, UrgencyLevel
+from v2_spring.domain.runtime_trust import RuntimeTrustMode
 from v2_spring.domain.task import TaskKind, TaskStatus
 
 
@@ -26,6 +29,9 @@ def utc_now() -> datetime:
 
 class Base(DeclarativeBase):
     pass
+
+
+JSON_VARIANT = JSON().with_variant(JSONB, "postgresql")
 
 
 class LedgerEventType(StrEnum):
@@ -45,8 +51,10 @@ class LedgerEventType(StrEnum):
     PLANNER_ATTEMPT_RECORDED = "PLANNER_ATTEMPT_RECORDED"
     FOUNDER_INTERVENTION_RECORDED = "FOUNDER_INTERVENTION_RECORDED"
     EXECUTION_CLAIM_ACQUIRED = "EXECUTION_CLAIM_ACQUIRED"
+    EXECUTION_CLAIM_RENEWED = "EXECUTION_CLAIM_RENEWED"
     EXECUTION_CLAIM_RELEASED = "EXECUTION_CLAIM_RELEASED"
     EXECUTION_CLAIM_RECLAIMED = "EXECUTION_CLAIM_RECLAIMED"
+    EXECUTION_RESULT_REJECTED = "EXECUTION_RESULT_REJECTED"
 
 
 class RunRecord(Base):
@@ -225,6 +233,8 @@ class TaskRecord(Base):
     )
     summary: Mapped[str] = mapped_column(String(400), nullable=False)
     execution_context_id: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    execution_claim_token: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    execution_claim_fencing_token: Mapped[int | None] = mapped_column(nullable=True)
     command: Mapped[str] = mapped_column(String(400), nullable=False)
     cwd: Mapped[str] = mapped_column(String(4000), nullable=False)
     timeout_seconds: Mapped[int] = mapped_column(nullable=False)
@@ -259,6 +269,10 @@ class TaskRecord(Base):
 
 class ExecutionClaimRecord(Base):
     __tablename__ = "execution_claims"
+    __table_args__ = (
+        Index("ix_execution_claims_status_expires_at", "status", "expires_at"),
+        Index("ix_execution_claims_runtime_status", "runtime", "status"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     run_id: Mapped[str] = mapped_column(
@@ -293,6 +307,35 @@ class ExecutionClaimRecord(Base):
 
     run: Mapped[RunRecord] = relationship(back_populates="execution_claims")
     task: Mapped["TaskRecord | None"] = relationship(back_populates="execution_claims")
+
+
+class RuntimeTrustRecord(Base):
+    __tablename__ = "runtime_trust"
+
+    runtime: Mapped[ExecutionRuntime] = mapped_column(
+        Enum(ExecutionRuntime, native_enum=False),
+        primary_key=True,
+    )
+    mode: Mapped[RuntimeTrustMode] = mapped_column(
+        Enum(RuntimeTrustMode, native_enum=False),
+        nullable=False,
+        default=RuntimeTrustMode.STATIC_MANIFEST,
+    )
+    dynamic_preflight_required: Mapped[bool] = mapped_column(nullable=False, default=False)
+    mismatch_strike_threshold: Mapped[int] = mapped_column(nullable=False, default=3)
+    recovery_success_threshold: Mapped[int] = mapped_column(nullable=False, default=2)
+    consecutive_mismatch_failures: Mapped[int] = mapped_column(nullable=False, default=0)
+    total_mismatch_failures: Mapped[int] = mapped_column(nullable=False, default=0)
+    recovery_success_streak: Mapped[int] = mapped_column(nullable=False, default=0)
+    last_failure_reason: Mapped[str | None] = mapped_column(String(240), nullable=True)
+    last_failure_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=utc_now,
+        onupdate=utc_now,
+    )
 
 
 class ArtifactRecord(Base):
@@ -376,7 +419,7 @@ class PatchIntakeRecord(Base):
     )
     summary: Mapped[str] = mapped_column(String(400), nullable=False)
     source_workspace: Mapped[str] = mapped_column(String(4000), nullable=False)
-    changed_files: Mapped[list[Any]] = mapped_column(JSON, nullable=False, default=list)
+    changed_files: Mapped[list[Any]] = mapped_column(JSON_VARIANT, nullable=False, default=list)
     touched_file_count: Mapped[int] = mapped_column(nullable=False)
     patch_size_bytes: Mapped[int] = mapped_column(nullable=False)
     patch_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -385,7 +428,7 @@ class PatchIntakeRecord(Base):
         nullable=False,
     )
     auto_apply_eligible: Mapped[bool] = mapped_column(nullable=False, default=False)
-    warnings: Mapped[list[Any]] = mapped_column(JSON, nullable=False, default=list)
+    warnings: Mapped[list[Any]] = mapped_column(JSON_VARIANT, nullable=False, default=list)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -414,6 +457,9 @@ class PatchIntakeRecord(Base):
 
 class EventLedgerRecord(Base):
     __tablename__ = "event_ledger"
+    __table_args__ = (
+        Index("ix_event_ledger_run_recorded_at", "run_id", "recorded_at"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     run_id: Mapped[str] = mapped_column(
@@ -425,7 +471,7 @@ class EventLedgerRecord(Base):
         Enum(LedgerEventType, native_enum=False),
         nullable=False,
     )
-    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON_VARIANT, nullable=False)
     recorded_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

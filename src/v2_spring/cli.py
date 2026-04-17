@@ -36,6 +36,7 @@ from v2_spring.domain.progress import ProgressSummaryView, ProgressTraceMode
 from v2_spring.domain.proposal import PlannerProposalInput, PlannerProposalView
 from v2_spring.domain.replay import ArtifactInspectionView, RunReplayView, TaskReplayView
 from v2_spring.domain.routing import (
+    ExecutionRuntime,
     ExecutionRequirements,
     ExpectedOutputKind,
     RoutingDecision,
@@ -44,12 +45,21 @@ from v2_spring.domain.routing import (
     TaskComplexity,
     WriteScope,
 )
-from v2_spring.domain.snapshot import PossibleActionEvaluationView, PossibleActionName, RunSnapshotView
+from v2_spring.domain.runtime_trust import RuntimeTrustView
+from v2_spring.domain.snapshot import (
+    PossibleActionEvaluationView,
+    PossibleActionName,
+    RunSnapshotView,
+    SnapshotFreshnessConflictError,
+    SnapshotFreshnessRefusalView,
+)
 from v2_spring.ledger.store import (
     BoundedExecutionResult,
     ExecutionClaimConflictError,
     IsolatedWorkerDispatchResult,
     LedgerStore,
+    SchemaStatus,
+    SchemaBootstrapRequiredError,
 )
 from v2_spring.planner.actions import evaluate_possible_actions
 from v2_spring.planner.proposals import (
@@ -70,7 +80,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command")
 
-    subparsers.add_parser("doctor", help="Show bootstrap status.")
+    doctor_parser = subparsers.add_parser("doctor", help="Show bootstrap and database status.")
+    doctor_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Override DATABASE_URL for this invocation.",
+    )
+    doctor_parser.add_argument(
+        "--format",
+        default="pretty",
+        choices=["pretty", "json"],
+        help="Output format. Defaults to pretty.",
+    )
     subparsers.add_parser("tracer-bullet", help="Print tracer bullet entrypoint guidance.")
 
     run_parser = subparsers.add_parser("run", help="Manage tracer bullet runs.")
@@ -335,6 +356,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Hard timeout for the worker proof. Defaults to 30.",
     )
     task_dispatch_parser.add_argument(
+        "--snapshot-hash",
+        default=None,
+        help="Optional snapshot hash anchor from `v2-spring run snapshot` or `run status`.",
+    )
+    task_dispatch_parser.add_argument(
+        "--freshness-generation",
+        default=None,
+        type=int,
+        help="Optional snapshot freshness generation returned by founder/operator surfaces.",
+    )
+    task_dispatch_parser.add_argument(
         "--format",
         default="pretty",
         choices=["pretty", "json"],
@@ -375,6 +407,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output format. Defaults to pretty.",
     )
     task_reconcile_claims_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Override DATABASE_URL for this invocation.",
+    )
+
+    runtime_parser = subparsers.add_parser("runtime", help="Inspect runtime trust and execution guardrails.")
+    runtime_subparsers = runtime_parser.add_subparsers(dest="runtime_command")
+
+    runtime_trust_parser = runtime_subparsers.add_parser(
+        "trust",
+        help="Show runtime trust feedback and dynamic-preflight state.",
+    )
+    runtime_trust_parser.add_argument(
+        "--runtime",
+        choices=[runtime.value for runtime in ExecutionRuntime],
+        default=None,
+        help="Optional runtime filter. Defaults to listing every tracked runtime.",
+    )
+    runtime_trust_parser.add_argument(
+        "--format",
+        default="pretty",
+        choices=["pretty", "json"],
+        help="Output format. Defaults to pretty.",
+    )
+    runtime_trust_parser.add_argument(
         "--database-url",
         default=None,
         help="Override DATABASE_URL for this invocation.",
@@ -439,6 +496,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     patch_approve_parser.add_argument("patch_intake_id", help="Patch intake id to approve.")
     patch_approve_parser.add_argument(
+        "--snapshot-hash",
+        default=None,
+        help="Optional snapshot hash anchor copied from `v2-spring patch review`.",
+    )
+    patch_approve_parser.add_argument(
+        "--freshness-generation",
+        default=None,
+        type=int,
+        help="Optional freshness generation copied from `v2-spring patch review`.",
+    )
+    patch_approve_parser.add_argument(
         "--format",
         default="pretty",
         choices=["pretty", "json"],
@@ -455,6 +523,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Reject one pending patch intake with an explicit founder reason.",
     )
     patch_reject_parser.add_argument("patch_intake_id", help="Patch intake id to reject.")
+    patch_reject_parser.add_argument(
+        "--snapshot-hash",
+        default=None,
+        help="Optional snapshot hash anchor copied from `v2-spring patch review`.",
+    )
+    patch_reject_parser.add_argument(
+        "--freshness-generation",
+        default=None,
+        type=int,
+        help="Optional freshness generation copied from `v2-spring patch review`.",
+    )
     reject_reason_group = patch_reject_parser.add_mutually_exclusive_group(required=True)
     reject_reason_group.add_argument("--reason", help="Founder reason for rejecting the patch.")
     reject_reason_group.add_argument(
@@ -816,8 +895,15 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _build_store(database_url_override: str | None) -> LedgerStore:
-    return LedgerStore(load_config(database_url_override).database_url)
+def _build_store(database_url_override: str | None, *, validate_schema: bool = True) -> LedgerStore:
+    store = LedgerStore(load_config(database_url_override).database_url)
+    if validate_schema:
+        try:
+            store.ensure_schema()
+        except SchemaBootstrapRequiredError as exc:
+            print(str(exc))
+            raise SystemExit(1) from exc
+    return store
 
 
 def _parse_cli_datetime(value: str | None) -> datetime | None:
@@ -1172,13 +1258,44 @@ def _render_execution_claim(claim: ExecutionClaimView | None) -> str:
         owner:               {claim.owner}
         status:              {claim.status.value}
         lease_token:         {claim.lease_token}
+        fencing_token:       {claim.fencing_token}
         acquired_at:         {claim.acquired_at.isoformat()}
         heartbeat_at:        {claim.heartbeat_at.isoformat()}
         expires_at:          {claim.expires_at.isoformat()}
+        renew_threshold_s:   {claim.renew_threshold_seconds if claim.renew_threshold_seconds is not None else '-'}
+        renew_cadence_s:     {claim.min_renew_cadence_seconds if claim.min_renew_cadence_seconds is not None else '-'}
+        renewal_pressure:    {claim.renewal_pressure.value if claim.renewal_pressure is not None else '-'}
         released_at:         {claim.released_at.isoformat() if claim.released_at else '-'}
         reclaim_reason:      {claim.reclaim_reason or '-'}
         """,
     ).strip()
+
+
+def _render_runtime_trust(trust_items: list[RuntimeTrustView]) -> str:
+    if not trust_items:
+        return "No runtime trust state is currently recorded."
+    blocks: list[str] = []
+    for item in trust_items:
+        blocks.append(
+            dedent(
+                f"""\
+                Runtime trust
+                -------------
+                runtime:                 {item.runtime.value}
+                mode:                    {item.mode.value}
+                dynamic_preflight:       {item.dynamic_preflight_required}
+                strike_threshold:        {item.mismatch_strike_threshold}
+                recovery_threshold:      {item.recovery_success_threshold}
+                consecutive_failures:    {item.consecutive_mismatch_failures}
+                total_failures:          {item.total_mismatch_failures}
+                recovery_success_streak: {item.recovery_success_streak}
+                last_failure_reason:     {item.last_failure_reason or '-'}
+                last_failure_at:         {item.last_failure_at.isoformat() if item.last_failure_at else '-'}
+                last_success_at:         {item.last_success_at.isoformat() if item.last_success_at else '-'}
+                """,
+            ).strip(),
+        )
+    return "\n\n".join(blocks)
 
 
 def _render_execution_requirements(
@@ -1206,6 +1323,7 @@ def _render_snapshot(snapshot: RunSnapshotView) -> str:
         f"snapshot_timestamp:  {snapshot.snapshot_timestamp.isoformat()}",
         f"policy_version:      {snapshot.policy_version}",
         f"state_hash:          {snapshot.state_hash}",
+        f"freshness_generation:{' ' * 1}{snapshot.freshness_generation}",
         f"status:              {snapshot.run.status.value}",
         f"action_state:        {snapshot.action_state.value}",
         f"action_state_reason: {snapshot.action_state_reason}",
@@ -1307,6 +1425,23 @@ def _render_snapshot(snapshot: RunSnapshotView) -> str:
     return "\n".join(lines)
 
 
+def _render_schema_status(status: SchemaStatus) -> str:
+    missing_tables = ", ".join(status.missing_tables) if status.missing_tables else "-"
+    return dedent(
+        f"""\
+        Database doctor
+        ---------------
+        dialect:              {status.dialect_name}
+        management_mode:      {status.management_mode}
+        ready:                {str(status.ready).lower()}
+        bootstrap_required:   {str(status.bootstrap_required).lower()}
+        migration_controlled: {str(status.migration_controlled).lower()}
+        current_revision:     {status.current_revision or '-'}
+        missing_tables:       {missing_tables}
+        """,
+    ).strip()
+
+
 def _render_progress(progress: ProgressSummaryView) -> str:
     lines = [
         "Run status",
@@ -1318,6 +1453,7 @@ def _render_progress(progress: ProgressSummaryView) -> str:
         f"action_required_by:  {progress.action_required_by.value}",
         f"generated_at:        {progress.generated_at.isoformat()}",
         f"snapshot_hash:       {progress.snapshot_hash}",
+        f"snapshot_generation: {progress.snapshot_generation}",
         f"action_state:        {progress.action_state.value}",
         f"headline:            {progress.headline}",
         f"blocker_reason:      {progress.blocker_reason if progress.blocker_reason else '-'}",
@@ -1745,10 +1881,10 @@ def _record_transport_error_audit(
     error: PlannerTransportError,
 ) -> None:
     if error.code == "cancelled":
-        summary = (
+        intent_summary = (
             f"Planner transport via {error.provider.value} was interrupted locally before a structured response was accepted."
         )
-        details = (
+        intent_details = (
             f"error_code={error.code}; "
             f"provider={error.provider.value}; "
             f"model={error.model}; "
@@ -1765,8 +1901,25 @@ def _record_transport_error_audit(
         store.record_observation(
             run_id=run_id,
             kind=ObservationKind.SYSTEM_AUDIT,
-            summary=summary,
-            details=details,
+            summary=intent_summary,
+            details=intent_details,
+        )
+        store.record_observation(
+            run_id=run_id,
+            kind=ObservationKind.SYSTEM_AUDIT,
+            summary=(
+                f"Planner cancellation for {error.provider.value} was reconciled locally; remote completion remains unconfirmed."
+            ),
+            details=(
+                "error_code=planner_cancel_reconciled_local; "
+                f"provider={error.provider.value}; "
+                f"model={error.model}; "
+                f"timeout_seconds={error.timeout_seconds if error.timeout_seconds is not None else '-'}; "
+                f"orphan_risk_possible={error.orphan_risk_possible}; "
+                "cancellation_scope=local_cli_only; "
+                "final_state=cancelled_local_bounded_orphan_risk; "
+                "recommended_action=inspect runtime/provider telemetry before relying on cancellation finality."
+            ),
         )
         return
     store.record_observation(
@@ -2139,6 +2292,8 @@ def _render_patch_review(review: PatchReviewView) -> str:
         f"lines_removed:       {review.changed_lines_removed}",
         f"patch_artifact_id:   {intake.patch_artifact_id}",
         f"receipt_artifact_id: {intake.receipt_artifact_id}",
+        f"snapshot_hash:       {review.snapshot_hash}",
+        f"freshness_generation:{' ' * 1}{review.freshness_generation}",
     ]
     if intake.warnings:
         lines.extend(["", "Warnings", "--------"])
@@ -2149,6 +2304,21 @@ def _render_patch_review(review: PatchReviewView) -> str:
         for changed_file in intake.changed_files:
             lines.append(f"- {changed_file}")
     lines.extend(["", "Receipt preview", "---------------", review.receipt_preview])
+    lines.extend(
+        [
+            "",
+            "Freshness-safe follow-ups",
+            "-------------------------",
+            (
+                f"approve: v2-spring patch approve {intake.id} --snapshot-hash {review.snapshot_hash} "
+                f"--freshness-generation {review.freshness_generation}"
+            ),
+            (
+                f"reject:  v2-spring patch reject {intake.id} --reason ... --snapshot-hash {review.snapshot_hash} "
+                f"--freshness-generation {review.freshness_generation}"
+            ),
+        ],
+    )
     lines.extend(["", "Inline diff", "-----------", review.patch_body.rstrip()])
     if review.raw_receipt is not None:
         lines.extend(["", "Raw receipt", "-----------", review.raw_receipt.rstrip()])
@@ -2184,13 +2354,47 @@ def _render_patch_resolution(resolution: PatchResolutionView) -> str:
     ).strip()
 
 
+def _render_snapshot_freshness_refusal(refusal: SnapshotFreshnessRefusalView) -> str:
+    return dedent(
+        f"""\
+        Snapshot freshness refusal
+        -------------------------
+        code:                 {refusal.code.value}
+        mutation_name:        {refusal.mutation_name}
+        expected_hash:        {refusal.expected.snapshot_hash}
+        expected_generation:  {refusal.expected.freshness_generation}
+        current_hash:         {refusal.current.snapshot_hash}
+        current_generation:   {refusal.current.freshness_generation}
+        message:              {refusal.message}
+        """,
+    ).strip()
+
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
     if args.command == "doctor":
-        print("V2_SPRING bootstrap is present.")
-        print("Next milestone: deterministic substrate + CLI tracer bullet.")
+        store = _build_store(args.database_url, validate_schema=False)
+        status = store.inspect_schema_status()
+        if args.format == "json":
+            print(
+                json.dumps(
+                    {
+                        "dialect_name": status.dialect_name,
+                        "management_mode": status.management_mode,
+                        "ready": status.ready,
+                        "bootstrap_required": status.bootstrap_required,
+                        "migration_controlled": status.migration_controlled,
+                        "current_revision": status.current_revision,
+                        "missing_tables": list(status.missing_tables),
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                ),
+            )
+        else:
+            print(_render_schema_status(status))
         return
 
     if args.command == "tracer-bullet":
@@ -2392,6 +2596,8 @@ def main() -> None:
                     workspace=Path(args.workspace),
                     artifact_root=Path(args.artifact_root),
                     timeout_seconds=args.timeout_seconds,
+                    snapshot_hash=args.snapshot_hash,
+                    freshness_generation=args.freshness_generation,
                 )
             else:
                 result = store.dispatch_isolated_worker_task(
@@ -2399,6 +2605,8 @@ def main() -> None:
                     workspace=Path(args.workspace),
                     artifact_root=Path(args.artifact_root),
                     timeout_seconds=args.timeout_seconds,
+                    snapshot_hash=args.snapshot_hash,
+                    freshness_generation=args.freshness_generation,
                 )
             if args.format == "json":
                 print(
@@ -2415,6 +2623,12 @@ def main() -> None:
                 )
             else:
                 print(_render_isolated_worker_result(result))
+        except SnapshotFreshnessConflictError as exc:
+            if args.format == "json":
+                print(json.dumps(exc.refusal.model_dump(mode="json"), indent=2, ensure_ascii=False))
+            else:
+                print(_render_snapshot_freshness_refusal(exc.refusal))
+            raise SystemExit(1) from exc
         except ExecutionClaimConflictError as exc:
             if args.format == "json":
                 print(json.dumps(exc.refusal.model_dump(mode="json"), indent=2, ensure_ascii=False))
@@ -2458,6 +2672,18 @@ def main() -> None:
                     print(_render_execution_claim(claim))
         return
 
+    if args.command == "runtime" and args.runtime_command == "trust":
+        store = _build_store(args.database_url)
+        if args.runtime is not None:
+            trust_items = [store.get_runtime_trust(ExecutionRuntime(args.runtime))]
+        else:
+            trust_items = store.list_runtime_trust()
+        if args.format == "json":
+            print(json.dumps([item.model_dump(mode="json") for item in trust_items], indent=2, ensure_ascii=False))
+        else:
+            print(_render_runtime_trust(trust_items))
+        return
+
     if args.command == "artifact" and args.artifact_command == "list":
         store = _build_store(args.database_url)
         print(_render_artifacts(args.run, store))
@@ -2491,11 +2717,21 @@ def main() -> None:
     if args.command == "patch" and args.patch_command == "approve":
         store = _build_store(args.database_url)
         try:
-            resolution = store.approve_patch_intake(args.patch_intake_id)
+            resolution = store.approve_patch_intake(
+                args.patch_intake_id,
+                snapshot_hash=args.snapshot_hash,
+                freshness_generation=args.freshness_generation,
+            )
             if args.format == "json":
                 print(json.dumps(resolution.model_dump(mode="json"), indent=2, ensure_ascii=False))
             else:
                 print(_render_patch_resolution(resolution))
+        except SnapshotFreshnessConflictError as exc:
+            if args.format == "json":
+                print(json.dumps(exc.refusal.model_dump(mode="json"), indent=2, ensure_ascii=False))
+            else:
+                print(_render_snapshot_freshness_refusal(exc.refusal))
+            raise SystemExit(1) from exc
         except (LookupError, ValueError, RuntimeError, FileNotFoundError, PermissionError) as exc:
             print(str(exc))
             raise SystemExit(1) from exc
@@ -2511,12 +2747,23 @@ def main() -> None:
                 file_path=args.reason_file,
                 label="Patch reject reason",
             )
-            resolution = store.reject_patch_intake(args.patch_intake_id, reason=reason)
+            resolution = store.reject_patch_intake(
+                args.patch_intake_id,
+                reason=reason,
+                snapshot_hash=args.snapshot_hash,
+                freshness_generation=args.freshness_generation,
+            )
             if args.format == "json":
                 print(json.dumps(resolution.model_dump(mode="json"), indent=2, ensure_ascii=False))
             else:
                 print(_render_patch_resolution(resolution))
-        except (LookupError, ValueError, FileNotFoundError, IsADirectoryError) as exc:
+        except SnapshotFreshnessConflictError as exc:
+            if args.format == "json":
+                print(json.dumps(exc.refusal.model_dump(mode="json"), indent=2, ensure_ascii=False))
+            else:
+                print(_render_snapshot_freshness_refusal(exc.refusal))
+            raise SystemExit(1) from exc
+        except (LookupError, ValueError, FileNotFoundError, IsADirectoryError, PermissionError) as exc:
             print(str(exc))
             raise SystemExit(1) from exc
         return
@@ -2652,7 +2899,7 @@ def main() -> None:
 
     if args.command == "planner" and args.planner_command == "invoke":
         config = load_config(args.database_url)
-        store = LedgerStore(config.database_url)
+        store = _build_store(args.database_url)
         try:
             repeated_failure_escalation = store.open_repeated_failure_founder_escalation_if_needed(args.run_id)
             if repeated_failure_escalation is not None:
@@ -2839,3 +3086,7 @@ def main() -> None:
         return
 
     parser.print_help()
+
+
+if __name__ == "__main__":
+    main()

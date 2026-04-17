@@ -50,6 +50,9 @@ Current mitigation:
   - `orphan_risk_possible`
   - `cancellation_scope=local_cli_only`
   - a bounded reinvocation hint for founders
+- Step 20 adds a second reconciliation audit so replay distinguishes:
+  - cancellation intent
+  - local reconciliation / bounded orphan-risk finalization
 - transport tests and CLI tests now cover the cancellation path explicitly
 
 ## Capability Gate
@@ -59,11 +62,13 @@ Current mitigation:
   not silently become hidden provider spend
 
 ## Issue Link
-- GitHub Issue: #23
+- GitHub Issue: #23, #46
 
 ## Doc Links
 - ADR: ../../adr/0009-production-planner-transport-seam.md
+- ADR: ../../adr/0018-snapshot-freshness-and-cancellation-reconciliation.md
 - Design note: ../../implementation-notes/STEP_10C_PRODUCTION_TRANSPORT_HARDENING.md
+- Design note: ../../implementation-notes/STEP_20_SNAPSHOT_FRESHNESS_AND_CANCELLATION_RECONCILIATION.md
 
 ## Exit Criteria
 
@@ -75,3 +80,4 @@ Current mitigation:
 ## Last Updated
 - 2026-04-17
 - 2026-04-17 (mitigating)
+- 2026-04-17 (Step 20 reconciliation audit)

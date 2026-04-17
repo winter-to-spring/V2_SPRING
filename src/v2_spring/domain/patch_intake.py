@@ -134,18 +134,31 @@ class PatchReviewView(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     intake: PatchIntakeView
+    snapshot_hash: str = Field(min_length=64, max_length=64)
+    freshness_generation: int = Field(ge=0)
     patch_body: str = Field(min_length=1, max_length=200000)
     receipt_preview: str = Field(min_length=1, max_length=2000)
     changed_lines_added: int = Field(ge=0)
     changed_lines_removed: int = Field(ge=0)
     raw_receipt: str | None = Field(default=None, max_length=40000)
 
+    @field_validator("snapshot_hash")
+    @classmethod
+    def ensure_snapshot_hash(cls, value: str) -> str:
+        cleaned = value.strip().lower()
+        if len(cleaned) != 64 or any(character not in "0123456789abcdef" for character in cleaned):
+            raise ValueError("snapshot_hash must be a 64-character hexadecimal string")
+        return cleaned
+
     @field_validator("patch_body", "receipt_preview", "raw_receipt")
     @classmethod
     def ensure_text(cls, value: str | None) -> str | None:
         if value is None:
             return None
-        return value.rstrip()
+        cleaned = value.rstrip()
+        if not cleaned:
+            raise ValueError("value must not be blank when provided")
+        return cleaned
 
 
 class PatchResolutionView(BaseModel):

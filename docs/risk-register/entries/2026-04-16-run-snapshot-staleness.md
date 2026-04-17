@@ -1,7 +1,7 @@
 # Risk ID: RISK-0005
-Title: RunSnapshot may become stale under concurrent writes
+Title: ~~RunSnapshot may become stale under concurrent writes~~
 Class: Before Scale
-Status: Mitigating
+Status: Resolved
 Owner: Core / Planner boundary
 Observed In: Step 7 - RunSnapshot + possible actions; Step 12-a dispatch planning
 
@@ -51,6 +51,11 @@ Current mitigation:
   blocks approval-sensitive mutation lanes
 - expired claims can now be reclaimed and surfaced explicitly instead of
   lingering as silent ownership ambiguity
+- Step 20 adds `freshness_generation` alongside `state_hash`
+- founder/operator mutation lanes now reject stale anchors through typed
+  `SnapshotFreshnessRefusalView` responses
+- progress and patch-review surfaces expose the freshness anchors required for
+  safe follow-up mutation commands
 
 ## Capability Gate
 - Capability: dispatching execution work beyond simple bounded local execution
@@ -58,12 +63,14 @@ Current mitigation:
 - Blocked until: a stronger snapshot freshness strategy is chosen
 
 ## Issue Link
-- GitHub Issue: #28, #41
+- GitHub Issue: #28, #41, #46
 
 ## Doc Links
 - ADR: docs/adr/0004-deterministic-substrate.md
+- ADR: docs/adr/0018-snapshot-freshness-and-cancellation-reconciliation.md
 - Design note: docs/implementation-notes/STEP_7_RUN_SNAPSHOT_POSSIBLE_ACTIONS.md
 - Design note: docs/implementation-notes/STEP_12A_EXECUTION_PLANE_ROUTING_POLICY.md
+- Design note: docs/implementation-notes/STEP_20_SNAPSHOT_FRESHNESS_AND_CANCELLATION_RECONCILIATION.md
 
 ## Exit Criteria
 
@@ -74,3 +81,4 @@ Current mitigation:
 - 2026-04-16
 - 2026-04-17
 - 2026-04-17 (mitigating in Step 17)
+- 2026-04-17 (resolved in Step 20)

@@ -111,7 +111,7 @@ Observed In:
 - ~~[RISK-0002 Approval reject reason missing](entries/2026-04-16-approval-reject-reason.md)~~
 - ~~[RISK-0003 Pending approval write barrier missing](entries/2026-04-16-pending-approval-write-barrier.md)~~
 - ~~[RISK-0004 Service-level approval barrier race window](entries/2026-04-16-service-level-barrier-race-window.md)~~
-- [RISK-0005 RunSnapshot staleness under concurrent writes](entries/2026-04-16-run-snapshot-staleness.md)
+- ~~[RISK-0005 RunSnapshot staleness under concurrent writes](entries/2026-04-16-run-snapshot-staleness.md)~~
 - [RISK-0006 Snapshot/action read-model growth](entries/2026-04-16-snapshot-read-model-growth.md)
 - ~~[RISK-0007 Possible-actions engine purity drift](entries/2026-04-16-possible-actions-engine-purity.md)~~
 - ~~[RISK-0008 Planner proposal loop lacks retry bounds and idempotency policy](entries/2026-04-16-planner-proposal-loop-control.md)~~
@@ -145,13 +145,19 @@ Observed In:
 - [RISK-0036 Container worker image growth may inflate pull latency and erode execution-plane responsiveness](entries/2026-04-17-container-image-bloat-and-pull-latency.md)
 - ~~[RISK-0037 Local metadata snapshots may drift across environments and make routing decisions non-deterministic](entries/2026-04-17-metadata-snapshot-fragmentation.md)~~
 - ~~[RISK-0038 Tail-only log hygiene may hide the real root cause when failures originate at process startup](entries/2026-04-17-log-diagnostic-sandwich-blindspot.md)~~
-- [RISK-0039 Static capability manifests may drift away from actual runtime health and create false preflight confidence](entries/2026-04-17-manifest-reality-gap.md)
+- ~~[RISK-0039 Static capability manifests may drift away from actual runtime health and create false preflight confidence](entries/2026-04-17-manifest-reality-gap.md)~~
 - ~~[RISK-0040 Semantic chain reaction may bypass founder review when low-risk auto-apply touches central files](entries/2026-04-17-semantic-chain-reaction-on-auto-apply.md)~~
 - ~~[RISK-0041 Planner may game bounded auto-apply by slicing one risky change into many trivial patches](entries/2026-04-17-auto-apply-salami-attack.md)~~
 - ~~[RISK-0042 Obfuscated dangerous patterns may bypass simple keyword scans in bounded auto-apply](entries/2026-04-17-obfuscated-dangerous-pattern-bypass.md)~~
 - ~~[RISK-0043 Detailed repair feedback may still trap the planner in a bounded but wasteful repair loop](entries/2026-04-17-repair-loop-deadlock-after-detailed-feedback.md)~~
 - ~~[RISK-0044 Lightweight structural scan may create founder friction through false positives](entries/2026-04-17-structural-scan-false-positive-friction.md)~~
 - [RISK-0045 Static protected-path lists may miss semantically central files outside the initial trust boundary](entries/2026-04-17-shadow-centrality-beyond-protected-paths.md)
-- [RISK-0046 Lease TTL may starve long-running work or delay reclaim when ownership lasts too long](entries/2026-04-17-lease-starvation-and-reclaim-deadlock.md)
-- [RISK-0047 Execution claim acquisition may still depend on store-level serialization without stronger atomic CAS semantics](entries/2026-04-17-atomic-claim-failure.md)
-- [RISK-0048 Reclaim may reopen ownership before old worker side-effects are fully fenced](entries/2026-04-17-reclaim-side-effects-without-fencing.md)
+- ~~[RISK-0046 Lease TTL may starve long-running work or delay reclaim when ownership lasts too long](entries/2026-04-17-lease-starvation-and-reclaim-deadlock.md)~~
+- ~~[RISK-0047 Execution claim acquisition may still depend on store-level serialization without stronger atomic CAS semantics](entries/2026-04-17-atomic-claim-failure.md)~~
+- ~~[RISK-0048 Reclaim may reopen ownership before old worker side-effects are fully fenced](entries/2026-04-17-reclaim-side-effects-without-fencing.md)~~
+- ~~[RISK-0049 Lease renewal heartbeats may amplify control-plane write load as worker count grows](entries/2026-04-17-heartbeat-storm-under-lease-renewal.md)~~
+- ~~[RISK-0050 Lease expiry may become non-deterministic when worker clocks drift from store/server time](entries/2026-04-17-clock-drift-in-lease-expiry.md)~~
+- [RISK-0051 External side-effects may outlive reclaimed lease ownership even when stale results are fenced](entries/2026-04-17-external-side-effect-ghost-after-reclaim.md)
+- [RISK-0055 PostgreSQL connection exhaustion may appear when worker/controller fanout grows](entries/2026-04-17-postgres-connection-exhaustion-under-worker-fanout.md)
+- ~~[RISK-0056 Schema drift may break Postgres migration without versioned migration control](entries/2026-04-17-schema-drift-during-postgres-migration.md)~~
+- [RISK-0057 Postgres write lock contention may reduce execution throughput under claim and renewal load](entries/2026-04-17-postgres-write-lock-contention-under-execution-load.md)

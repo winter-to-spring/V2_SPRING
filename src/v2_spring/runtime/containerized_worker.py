@@ -133,6 +133,7 @@ def execute_containerized_worker_proof(
     execution_context_id: str | None = None,
     run_id: str | None = None,
     requirements: ExecutionRequirements | None = None,
+    force_dynamic_preflight: bool = False,
 ) -> ContainerizedWorkerReceipt:
     """Run the Step 13 worker proof inside a container with copy-in/out isolation."""
 
@@ -153,7 +154,12 @@ def execute_containerized_worker_proof(
     _run_static_preflight(manifest, requirements=requirements)
     _ensure_static_image(manifest)
     dynamic_check_performed = False
-    if manifest.dynamic_admission_tools:
+    if force_dynamic_preflight:
+        if not manifest.dynamic_admission_tools:
+            raise ContainerizedWorkerPreflightRefusal(
+                refusal_code="dynamic_check_not_supported",
+                message="Runtime trust escalation requested a dynamic preflight, but the manifest defines no dynamic admission tools.",
+            )
         _run_dynamic_admission_checks(manifest)
         dynamic_check_performed = True
     image_digest = _inspect_local_image_digest(manifest.worker_image_tag)

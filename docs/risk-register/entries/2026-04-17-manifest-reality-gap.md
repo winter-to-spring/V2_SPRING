@@ -1,7 +1,7 @@
 # Risk ID: RISK-0039
-Title: Static capability manifests may drift away from actual runtime health and create false preflight confidence
+Title: ~~Static capability manifests may drift away from actual runtime health and create false preflight confidence~~
 Class: Before Scale
-Status: Mitigating
+Status: Resolved
 Owner: Execution plane / Capability preflight
 Observed In: Step 14 static-first preflight planning
 
@@ -36,14 +36,14 @@ declared capability to observed capability.
 
 Current mitigation:
 
-- Step 14 keeps static manifest checks as the default preflight
-- selected tools can be promoted to lightweight dynamic admission checks
-- dynamic mismatches now fail as typed preflight refusals instead of vague
-  runtime crashes
-
-Operational priority: medium-to-low for the first Step 14 slice. The first pass
-should keep static-first checks, while preserving a clear path to selective
-dynamic admission checks as containerized worker capabilities broaden.
+- Step 19 adds central runtime trust state for execution runtimes
+- repeated capability mismatches now record trust strikes instead of remaining
+  invisible
+- three consecutive mismatch failures promote the runtime into dynamic
+  preflight
+- two successful dynamic-preflight executions recover the runtime back to
+  static-first mode
+- founder/operator surfaces can inspect the active trust mode directly
 
 ## Capability Gate
 - Capability: broader containerized worker capability expansion
@@ -52,11 +52,12 @@ dynamic admission checks as containerized worker capabilities broaden.
   just static declarations
 
 ## Issue Link
-- GitHub Issue: #37
+- GitHub Issue: #45
 
 ## Doc Links
 - ADR: ../../adr/0012-container-runtime-provenance-and-guardrails.md
-- Design note: ../../implementation-notes/STEP_14_CONTAINER_RUNTIME_PROVENANCE_AND_GUARDRAILS.md
+- ADR: ../../adr/0017-runtime-trust-feedback-and-heartbeat-hygiene.md
+- Design note: ../../implementation-notes/STEP_19_RUNTIME_TRUST_FEEDBACK_AND_HEARTBEAT_HYGIENE.md
 
 ## Exit Criteria
 
@@ -67,3 +68,4 @@ dynamic admission checks as containerized worker capabilities broaden.
 ## Last Updated
 - 2026-04-17
 - 2026-04-17 (mitigating in Step 14)
+- 2026-04-17 (resolved in Step 19)

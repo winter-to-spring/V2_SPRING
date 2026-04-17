@@ -174,6 +174,7 @@ def test_execute_containerized_worker_proof_records_metadata_provenance(
             write_scope=WriteScope.SINGLE_FILE,
             expected_output_kind=ExpectedOutputKind.UNIFIED_PATCH,
         ),
+        force_dynamic_preflight=True,
     )
 
     assert call_order == ["ensure", "dynamic"]

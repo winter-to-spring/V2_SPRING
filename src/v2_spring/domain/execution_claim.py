@@ -14,6 +14,12 @@ class ExecutionClaimStatus(StrEnum):
     EXPIRED = "expired"
 
 
+class ExecutionClaimRenewalPressure(StrEnum):
+    HEALTHY = "healthy"
+    RENEW_WINDOW = "renew_window"
+    COALESCED = "coalesced"
+
+
 class ExecutionClaimView(BaseModel):
     """Compact, typed execution lease visible to founder/operator surfaces."""
 
@@ -25,12 +31,16 @@ class ExecutionClaimView(BaseModel):
     runtime: str = Field(min_length=1, max_length=120)
     owner: str = Field(min_length=1, max_length=120)
     lease_token: str = Field(min_length=1, max_length=120)
+    fencing_token: int = Field(ge=1)
     status: ExecutionClaimStatus
     acquired_at: datetime
     heartbeat_at: datetime
     expires_at: datetime
     released_at: datetime | None
     reclaim_reason: str | None = Field(default=None, max_length=1000)
+    renew_threshold_seconds: int | None = Field(default=None, ge=1, le=600)
+    min_renew_cadence_seconds: int | None = Field(default=None, ge=1, le=600)
+    renewal_pressure: ExecutionClaimRenewalPressure | None = None
 
     @field_validator("runtime", "owner", "lease_token", "reclaim_reason")
     @classmethod

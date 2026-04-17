@@ -12,7 +12,9 @@ import textwrap
 from typing import Iterator
 from uuid import uuid4
 
-from sqlalchemy import create_engine, inspect, select, text, update
+from sqlalchemy import create_engine, func, inspect, select, text, update
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from v2_spring.domain.approval import ApprovalStatus, ApprovalView
@@ -21,6 +23,7 @@ from v2_spring.domain.decision import DecisionKind, DecisionView
 from v2_spring.domain.execution_claim import (
     ExecutionClaimRefusalCode,
     ExecutionClaimRefusalView,
+    ExecutionClaimRenewalPressure,
     ExecutionClaimStatus,
     ExecutionClaimView,
 )
@@ -82,6 +85,7 @@ from v2_spring.domain.routing import (
     route_task,
 )
 from v2_spring.domain.run import RunCreateInput, RunStatus, RunView
+from v2_spring.domain.runtime_trust import RuntimeTrustMode, RuntimeTrustView
 from v2_spring.domain.snapshot import (
     ArtifactHeadlineView,
     PendingPatchIntakeView,
@@ -91,6 +95,10 @@ from v2_spring.domain.snapshot import (
     PossibleActionName,
     RunSnapshotView,
     SnapshotActionState,
+    SnapshotFreshnessConflictError,
+    SnapshotFreshnessRefusalCode,
+    SnapshotFreshnessRefusalView,
+    SnapshotFreshnessView,
     TaskHeadlineView,
     TaskStatusSummary,
 )
@@ -114,6 +122,7 @@ from v2_spring.ledger.models import (
     PatchIntakeRecord,
     PlannerAttemptRecord,
     RunRecord,
+    RuntimeTrustRecord,
     TaskRecord,
     utc_now,
 )
@@ -169,6 +178,23 @@ class ExecutionClaimConflictError(PermissionError):
         self.refusal = refusal
 
 
+class SchemaBootstrapRequiredError(RuntimeError):
+    """Raised when a migration-controlled database has not been bootstrapped yet."""
+
+
+@dataclass(frozen=True)
+class SchemaStatus:
+    """Compact schema-management status for doctor/bootstrap surfaces."""
+
+    dialect_name: str
+    management_mode: str
+    ready: bool
+    bootstrap_required: bool
+    migration_controlled: bool
+    current_revision: str | None
+    missing_tables: tuple[str, ...]
+
+
 class LedgerStore:
     """Typed persistence boundary for V2_SPRING tracer-bullet state and events."""
 
@@ -195,9 +221,26 @@ class LedgerStore:
     _PATCH_POLICY_WINDOW = timedelta(hours=1)
     _PATCH_AUTO_APPLY_MAX_CHANGED_LINES = 10
     _EXECUTION_LEASE_SLACK = timedelta(seconds=15)
+    _EXECUTION_LEASE_RENEW_THRESHOLD = timedelta(seconds=10)
+    _EXECUTION_LEASE_MIN_RENEW_CADENCE = timedelta(seconds=5)
+    _RUNTIME_TRUST_MISMATCH_STRIKE_THRESHOLD = 3
+    _RUNTIME_TRUST_RECOVERY_SUCCESS_THRESHOLD = 2
 
     def __init__(self, database_url: str) -> None:
-        self._engine = create_engine(database_url, future=True)
+        self._database_url = database_url
+        self._dialect_name = make_url(database_url).get_backend_name()
+        self._schema_ready = False
+        engine_kwargs: dict[str, object] = {"future": True}
+        if self._dialect_name == "postgresql":
+            engine_kwargs.update(
+                {
+                    "pool_pre_ping": True,
+                    "pool_size": 5,
+                    "max_overflow": 10,
+                    "pool_recycle": 1800,
+                },
+            )
+        self._engine = create_engine(database_url, **engine_kwargs)
         self._session_factory = sessionmaker(
             bind=self._engine,
             autoflush=False,
@@ -205,10 +248,73 @@ class LedgerStore:
             future=True,
         )
 
+    @property
+    def dialect_name(self) -> str:
+        return self._dialect_name
+
+    @property
+    def supports_row_level_locking(self) -> bool:
+        return self._dialect_name == "postgresql"
+
+    @property
+    def supports_jsonb(self) -> bool:
+        return self._dialect_name == "postgresql"
+
+    def inspect_schema_status(self) -> SchemaStatus:
+        expected_tables = tuple(sorted(Base.metadata.tables.keys()))
+        with self._engine.begin() as connection:
+            inspector = inspect(connection)
+            table_names = set(inspector.get_table_names())
+            migration_controlled = "alembic_version" in table_names
+            current_revision = None
+            if migration_controlled:
+                current_revision = connection.execute(
+                    text("SELECT version_num FROM alembic_version LIMIT 1"),
+                ).scalar_one_or_none()
+            missing_tables = tuple(
+                table_name for table_name in expected_tables if table_name not in table_names
+            )
+
+        if self._dialect_name == "postgresql":
+            bootstrap_required = (not migration_controlled) or bool(missing_tables)
+            management_mode = "alembic_migration"
+            ready = not bootstrap_required
+        else:
+            bootstrap_required = False
+            management_mode = "sqlite_self_bootstrap"
+            ready = True
+
+        return SchemaStatus(
+            dialect_name=self._dialect_name,
+            management_mode=management_mode,
+            ready=ready,
+            bootstrap_required=bootstrap_required,
+            migration_controlled=migration_controlled,
+            current_revision=current_revision,
+            missing_tables=missing_tables,
+        )
+
     def ensure_schema(self) -> None:
+        if self._schema_ready:
+            return
+        if self._dialect_name == "postgresql":
+            status = self.inspect_schema_status()
+            if status.bootstrap_required:
+                missing_tables = ", ".join(status.missing_tables) if status.missing_tables else "-"
+                raise SchemaBootstrapRequiredError(
+                    "PostgreSQL schema is not bootstrapped yet. "
+                    "Run Alembic migrations before using the control plane. "
+                    f"current_revision={status.current_revision or '-'}; missing_tables={missing_tables}. "
+                    "Suggested command: `. .venv/bin/activate && DATABASE_URL=... alembic upgrade head`.",
+                )
+            self._backfill_approval_expirations()
+            self._schema_ready = True
+            return
+
         Base.metadata.create_all(self._engine)
         self._ensure_schema_columns()
         self._backfill_approval_expirations()
+        self._schema_ready = True
 
     def _ensure_schema_columns(self) -> None:
         with self._engine.begin() as connection:
@@ -218,6 +324,12 @@ class LedgerStore:
             approval_columns = {column["name"] for column in inspector.get_columns("approvals")}
             if "expires_at" not in approval_columns:
                 connection.execute(text("ALTER TABLE approvals ADD COLUMN expires_at DATETIME"))
+            if "tasks" in inspector.get_table_names():
+                task_columns = {column["name"] for column in inspector.get_columns("tasks")}
+                if "execution_claim_token" not in task_columns:
+                    connection.execute(text("ALTER TABLE tasks ADD COLUMN execution_claim_token VARCHAR(120)"))
+                if "execution_claim_fencing_token" not in task_columns:
+                    connection.execute(text("ALTER TABLE tasks ADD COLUMN execution_claim_fencing_token INTEGER"))
 
     def _backfill_approval_expirations(self) -> None:
         with self.session() as session:
@@ -250,6 +362,20 @@ class LedgerStore:
         return timedelta(seconds=timeout_seconds) + cls._EXECUTION_LEASE_SLACK
 
     @staticmethod
+    def _build_execution_claim_renew_threshold(timeout_seconds: int) -> timedelta:
+        return min(
+            timedelta(seconds=max(5, timeout_seconds // 3)),
+            LedgerStore._EXECUTION_LEASE_RENEW_THRESHOLD,
+        )
+
+    @staticmethod
+    def _build_execution_claim_renew_cadence(timeout_seconds: int) -> timedelta:
+        return min(
+            timedelta(seconds=max(2, timeout_seconds // 6)),
+            LedgerStore._EXECUTION_LEASE_MIN_RENEW_CADENCE,
+        )
+
+    @staticmethod
     def _coerce_utc_datetime(value: datetime | None) -> datetime | None:
         if value is None:
             return None
@@ -258,7 +384,31 @@ class LedgerStore:
         return value.astimezone(timezone.utc)
 
     @classmethod
-    def _to_execution_claim_view(cls, record: ExecutionClaimRecord) -> ExecutionClaimView:
+    def _to_execution_claim_view(
+        cls,
+        record: ExecutionClaimRecord,
+        *,
+        task_timeout_seconds: int | None = None,
+    ) -> ExecutionClaimView:
+        renew_threshold_seconds: int | None = None
+        min_renew_cadence_seconds: int | None = None
+        renewal_pressure: ExecutionClaimRenewalPressure | None = None
+        if task_timeout_seconds is not None and task_timeout_seconds > 0:
+            renew_threshold = cls._build_execution_claim_renew_threshold(task_timeout_seconds)
+            renew_cadence = cls._build_execution_claim_renew_cadence(task_timeout_seconds)
+            renew_threshold_seconds = int(renew_threshold.total_seconds())
+            min_renew_cadence_seconds = int(renew_cadence.total_seconds())
+            expires_at = cls._coerce_utc_datetime(record.expires_at)
+            heartbeat_at = cls._coerce_utc_datetime(record.heartbeat_at)
+            if expires_at is not None and heartbeat_at is not None:
+                now = utc_now()
+                remaining = expires_at - now
+                if remaining > renew_threshold:
+                    renewal_pressure = ExecutionClaimRenewalPressure.HEALTHY
+                elif now - heartbeat_at < renew_cadence:
+                    renewal_pressure = ExecutionClaimRenewalPressure.COALESCED
+                else:
+                    renewal_pressure = ExecutionClaimRenewalPressure.RENEW_WINDOW
         return ExecutionClaimView.model_validate(
             {
                 "id": record.id,
@@ -267,18 +417,100 @@ class LedgerStore:
                 "runtime": record.runtime,
                 "owner": record.owner,
                 "lease_token": record.lease_token,
+                "fencing_token": record.version,
                 "status": record.status.value,
                 "acquired_at": cls._coerce_utc_datetime(record.acquired_at),
                 "heartbeat_at": cls._coerce_utc_datetime(record.heartbeat_at),
                 "expires_at": cls._coerce_utc_datetime(record.expires_at),
                 "released_at": cls._coerce_utc_datetime(record.released_at),
                 "reclaim_reason": record.reclaim_reason,
+                "renew_threshold_seconds": renew_threshold_seconds,
+                "min_renew_cadence_seconds": min_renew_cadence_seconds,
+                "renewal_pressure": renewal_pressure,
             },
         )
 
     @staticmethod
-    def _load_execution_claim(session: Session, run_id: str) -> ExecutionClaimRecord | None:
-        return session.scalar(select(ExecutionClaimRecord).where(ExecutionClaimRecord.run_id == run_id).limit(1))
+    def _build_execution_claim_select(
+        run_id: str,
+        *,
+        for_update: bool = False,
+        skip_locked: bool = False,
+        dialect_name: str | None = None,
+    ):
+        statement = select(ExecutionClaimRecord).where(ExecutionClaimRecord.run_id == run_id).limit(1)
+        if for_update and dialect_name == "postgresql":
+            statement = statement.with_for_update(skip_locked=skip_locked)
+        return statement
+
+    @classmethod
+    def _load_execution_claim(
+        cls,
+        session: Session,
+        run_id: str,
+        *,
+        for_update: bool = False,
+        skip_locked: bool = False,
+        dialect_name: str | None = None,
+    ) -> ExecutionClaimRecord | None:
+        return session.scalar(
+            cls._build_execution_claim_select(
+                run_id,
+                for_update=for_update,
+                skip_locked=skip_locked,
+                dialect_name=dialect_name,
+            ),
+        )
+
+    def _load_run_for_claim_mutation(self, session: Session, run_id: str) -> RunRecord | None:
+        if self.supports_row_level_locking:
+            return session.scalar(
+                select(RunRecord).where(RunRecord.id == run_id).with_for_update().limit(1),
+            )
+        return session.get(RunRecord, run_id)
+
+    @classmethod
+    def _to_runtime_trust_view(cls, record: RuntimeTrustRecord) -> RuntimeTrustView:
+        return RuntimeTrustView.model_validate(
+            {
+                "runtime": record.runtime,
+                "mode": record.mode,
+                "dynamic_preflight_required": record.dynamic_preflight_required,
+                "mismatch_strike_threshold": record.mismatch_strike_threshold,
+                "recovery_success_threshold": record.recovery_success_threshold,
+                "consecutive_mismatch_failures": record.consecutive_mismatch_failures,
+                "total_mismatch_failures": record.total_mismatch_failures,
+                "recovery_success_streak": record.recovery_success_streak,
+                "last_failure_reason": record.last_failure_reason,
+                "last_failure_at": cls._coerce_utc_datetime(record.last_failure_at),
+                "last_success_at": cls._coerce_utc_datetime(record.last_success_at),
+            },
+        )
+
+    @staticmethod
+    def _load_runtime_trust(session: Session, runtime: ExecutionRuntime) -> RuntimeTrustRecord | None:
+        return session.get(RuntimeTrustRecord, runtime)
+
+    def _ensure_runtime_trust_record(self, session: Session, runtime: ExecutionRuntime) -> RuntimeTrustRecord:
+        record = self._load_runtime_trust(session, runtime)
+        if record is not None:
+            return record
+        record = RuntimeTrustRecord(
+            runtime=runtime,
+            mode=RuntimeTrustMode.STATIC_MANIFEST,
+            dynamic_preflight_required=False,
+            mismatch_strike_threshold=self._RUNTIME_TRUST_MISMATCH_STRIKE_THRESHOLD,
+            recovery_success_threshold=self._RUNTIME_TRUST_RECOVERY_SUCCESS_THRESHOLD,
+            consecutive_mismatch_failures=0,
+            total_mismatch_failures=0,
+            recovery_success_streak=0,
+            last_failure_reason=None,
+            last_failure_at=None,
+            last_success_at=None,
+        )
+        session.add(record)
+        session.flush()
+        return record
 
     def _raise_execution_claim_conflict(self, record: ExecutionClaimRecord, *, mutation_name: str) -> None:
         claim = self._to_execution_claim_view(record)
@@ -292,6 +524,28 @@ class LedgerStore:
                 existing_claim=claim,
             ),
         )
+
+    @staticmethod
+    def _task_claim_matches_record(task: TaskRecord, claim: ExecutionClaimRecord) -> bool:
+        if task.execution_claim_token is None or task.execution_claim_fencing_token is None:
+            return False
+        return (
+            claim.task_id == task.id
+            and claim.lease_token == task.execution_claim_token
+            and claim.version == task.execution_claim_fencing_token
+        )
+
+    def _build_execution_claim_view(
+        self,
+        session: Session,
+        claim: ExecutionClaimRecord,
+    ) -> ExecutionClaimView:
+        task_timeout_seconds: int | None = None
+        if claim.task_id is not None:
+            task = session.get(TaskRecord, claim.task_id)
+            if task is not None:
+                task_timeout_seconds = task.timeout_seconds
+        return self._to_execution_claim_view(claim, task_timeout_seconds=task_timeout_seconds)
 
     def _reclaim_execution_claim_locked(
         self,
@@ -348,6 +602,7 @@ class LedgerStore:
                     "task_id": claim.task_id,
                     "runtime": claim.runtime,
                     "owner": claim.owner,
+                    "fencing_token": claim.version,
                     "reason": reason,
                     "hard_reclaim_attempted": hard_reclaim_attempted,
                     "hard_reclaim_succeeded": hard_reclaim_succeeded,
@@ -360,7 +615,8 @@ class LedgerStore:
             summary="Execution claim was reclaimed after expiry or orphan detection.",
             details=(
                 f"error_code=execution_claim_reclaimed; claim_id={claim.id}; task_id={claim.task_id}; "
-                f"runtime={claim.runtime}; reason={reason}; hard_reclaim_attempted={hard_reclaim_attempted}; "
+                f"runtime={claim.runtime}; fencing_token={claim.version}; reason={reason}; "
+                f"hard_reclaim_attempted={hard_reclaim_attempted}; "
                 f"hard_reclaim_succeeded={hard_reclaim_succeeded}."
             ),
         )
@@ -386,7 +642,12 @@ class LedgerStore:
         run: RunRecord,
         mutation_name: str,
     ) -> None:
-        claim = self._load_execution_claim(session, run.id)
+        claim = self._load_execution_claim(
+            session,
+            run.id,
+            for_update=True,
+            dialect_name=self._dialect_name,
+        )
         if claim is None or claim.status != ExecutionClaimStatus.ACTIVE:
             return
         now = utc_now()
@@ -413,6 +674,10 @@ class LedgerStore:
         timeout_seconds: int,
         owner: str,
     ) -> ExecutionClaimRecord:
+        locked_run = self._load_run_for_claim_mutation(session, run.id)
+        if locked_run is None:  # pragma: no cover - defensive impossible edge
+            raise LookupError(f"Run {run.id} was not found while acquiring an execution claim.")
+        run = locked_run
         self._ensure_no_live_execution_claim(
             session=session,
             run=run,
@@ -420,7 +685,12 @@ class LedgerStore:
         )
         now = utc_now()
         lease_token = str(uuid4())
-        claim = self._load_execution_claim(session, run.id)
+        claim = self._load_execution_claim(
+            session,
+            run.id,
+            for_update=True,
+            dialect_name=self._dialect_name,
+        )
         if claim is None:
             claim = ExecutionClaimRecord(
                 run_id=run.id,
@@ -437,20 +707,67 @@ class LedgerStore:
                 version=1,
             )
             session.add(claim)
-            session.flush()
+            try:
+                session.flush()
+            except IntegrityError as exc:  # pragma: no cover - defensive concurrent guard
+                raise ExecutionClaimConflictError(
+                    ExecutionClaimRefusalView(
+                        code=ExecutionClaimRefusalCode.ACTIVE_CLAIM_HELD,
+                        message=(
+                            f"Run {run.id} hit a concurrent execution-claim insert and dispatch was refused "
+                            "to preserve single-owner semantics."
+                        ),
+                        existing_claim=self._to_execution_claim_view(
+                            self._load_execution_claim(
+                                session,
+                                run.id,
+                                for_update=True,
+                                dialect_name=self._dialect_name,
+                            )
+                            or claim,
+                        ),
+                    ),
+                ) from exc
         else:
-            claim.task_id = task.id
-            claim.runtime = runtime.value
-            claim.owner = owner
-            claim.lease_token = lease_token
-            claim.status = ExecutionClaimStatus.ACTIVE
-            claim.acquired_at = now
-            claim.heartbeat_at = now
-            claim.expires_at = now + self._build_execution_claim_ttl(timeout_seconds)
-            claim.released_at = None
-            claim.reclaim_reason = None
-            claim.version += 1
+            prior_version = claim.version
+            expires_at = now + self._build_execution_claim_ttl(timeout_seconds)
+            update_result = session.execute(
+                update(ExecutionClaimRecord)
+                .where(
+                    ExecutionClaimRecord.id == claim.id,
+                    ExecutionClaimRecord.version == prior_version,
+                )
+                .values(
+                    task_id=task.id,
+                    runtime=runtime.value,
+                    owner=owner,
+                    lease_token=lease_token,
+                    status=ExecutionClaimStatus.ACTIVE,
+                    acquired_at=now,
+                    heartbeat_at=now,
+                    expires_at=expires_at,
+                    released_at=None,
+                    reclaim_reason=None,
+                    version=prior_version + 1,
+                ),
+            )
+            if update_result.rowcount != 1:
+                session.expire_all()
+                current_claim = self._load_execution_claim(session, run.id)
+                if current_claim is None:  # pragma: no cover - defensive impossible edge
+                    raise RuntimeError("Execution claim disappeared during atomic acquisition.")
+                self._raise_execution_claim_conflict(
+                    current_claim,
+                    mutation_name="bounded execution dispatch",
+                )
+            session.expire(claim)
             session.flush()
+            claim = session.get(ExecutionClaimRecord, claim.id)
+            if claim is None:  # pragma: no cover - defensive impossible edge
+                raise RuntimeError("Execution claim disappeared after atomic acquisition.")
+
+        task.execution_claim_token = claim.lease_token
+        task.execution_claim_fencing_token = claim.version
 
         session.add(
             EventLedgerRecord(
@@ -462,6 +779,7 @@ class LedgerStore:
                     "runtime": runtime.value,
                     "owner": owner,
                     "lease_token": lease_token,
+                    "fencing_token": claim.version,
                     "expires_at": claim.expires_at.isoformat(),
                 },
             ),
@@ -472,7 +790,8 @@ class LedgerStore:
             summary="Execution claim was acquired for a bounded worker dispatch.",
             details=(
                 f"error_code=execution_claim_acquired; claim_id={claim.id}; task_id={task.id}; "
-                f"runtime={runtime.value}; owner={owner}; expires_at={claim.expires_at.isoformat()}."
+                f"runtime={runtime.value}; owner={owner}; fencing_token={claim.version}; "
+                f"expires_at={claim.expires_at.isoformat()}."
             ),
         )
         session.add(observation)
@@ -498,7 +817,12 @@ class LedgerStore:
         execution_context_id: str,
         reason: str,
     ) -> None:
-        claim = self._load_execution_claim(session, run_id)
+        claim = self._load_execution_claim(
+            session,
+            run_id,
+            for_update=True,
+            dialect_name=self._dialect_name,
+        )
         if claim is None:
             return
         if claim.status != ExecutionClaimStatus.ACTIVE:
@@ -512,6 +836,8 @@ class LedgerStore:
         claim.heartbeat_at = now
         claim.reclaim_reason = reason
         claim.version += 1
+        task.execution_claim_token = claim.lease_token
+        task.execution_claim_fencing_token = claim.version
         session.add(
             EventLedgerRecord(
                 run_id=run_id,
@@ -521,6 +847,7 @@ class LedgerStore:
                     "task_id": claim.task_id,
                     "runtime": claim.runtime,
                     "owner": claim.owner,
+                    "fencing_token": claim.version,
                     "reason": reason,
                 },
             ),
@@ -531,7 +858,8 @@ class LedgerStore:
             summary="Execution claim was released after bounded execution finished.",
             details=(
                 f"error_code=execution_claim_released; claim_id={claim.id}; task_id={claim.task_id}; "
-                f"runtime={claim.runtime}; owner={claim.owner}; reason={reason}."
+                f"runtime={claim.runtime}; owner={claim.owner}; fencing_token={claim.version}; "
+                f"reason={reason}."
             ),
         )
         session.add(observation)
@@ -554,7 +882,118 @@ class LedgerStore:
             claim = self._load_execution_claim(session, run_id)
             if claim is None:
                 return None
-            return self._to_execution_claim_view(claim)
+            return self._build_execution_claim_view(session, claim)
+
+    def renew_execution_claim(
+        self,
+        *,
+        run_id: str,
+        execution_context_id: str,
+        lease_token: str,
+        fencing_token: int,
+        timeout_seconds: int,
+        owner: str,
+    ) -> ExecutionClaimView | None:
+        self.ensure_schema()
+        with self.session() as session:
+            locked_run = self._load_run_for_claim_mutation(session, run_id)
+            if locked_run is None:
+                return None
+            claim = self._load_execution_claim(
+                session,
+                run_id,
+                for_update=True,
+                dialect_name=self._dialect_name,
+            )
+            if claim is None or claim.status != ExecutionClaimStatus.ACTIVE:
+                return None
+            task = session.get(TaskRecord, claim.task_id) if claim.task_id is not None else None
+            if task is None or task.execution_context_id != execution_context_id:
+                return None
+            if task.execution_claim_token != lease_token or task.execution_claim_fencing_token != fencing_token:
+                return None
+            if claim.lease_token != lease_token or claim.version != fencing_token:
+                return None
+
+            now = utc_now()
+            claim_expires_at = self._coerce_utc_datetime(claim.expires_at)
+            if claim_expires_at is not None:
+                remaining = claim_expires_at - now
+                if remaining > self._build_execution_claim_renew_threshold(timeout_seconds):
+                    cadence = self._build_execution_claim_renew_cadence(timeout_seconds)
+                    last_heartbeat = self._coerce_utc_datetime(claim.heartbeat_at)
+                    if last_heartbeat is not None and now - last_heartbeat < cadence:
+                        return self._to_execution_claim_view(
+                            claim,
+                            task_timeout_seconds=timeout_seconds,
+                        )
+                    return self._to_execution_claim_view(claim, task_timeout_seconds=timeout_seconds)
+
+            last_heartbeat = self._coerce_utc_datetime(claim.heartbeat_at)
+            cadence = self._build_execution_claim_renew_cadence(timeout_seconds)
+            if last_heartbeat is not None and now - last_heartbeat < cadence:
+                return self._to_execution_claim_view(claim, task_timeout_seconds=timeout_seconds)
+
+            expires_at = now + self._build_execution_claim_ttl(timeout_seconds)
+            update_result = session.execute(
+                update(ExecutionClaimRecord)
+                .where(
+                    ExecutionClaimRecord.id == claim.id,
+                    ExecutionClaimRecord.status == ExecutionClaimStatus.ACTIVE,
+                    ExecutionClaimRecord.version == fencing_token,
+                    ExecutionClaimRecord.lease_token == lease_token,
+                )
+                .values(
+                    heartbeat_at=now,
+                    expires_at=expires_at,
+                ),
+            )
+            if update_result.rowcount != 1:
+                return None
+            session.expire(claim)
+            session.flush()
+            claim = session.get(ExecutionClaimRecord, claim.id)
+            if claim is None:  # pragma: no cover - defensive impossible edge
+                return None
+            session.add(
+                EventLedgerRecord(
+                    run_id=run_id,
+                    event_type=LedgerEventType.EXECUTION_CLAIM_RENEWED,
+                    payload={
+                        "claim_id": claim.id,
+                        "task_id": claim.task_id,
+                        "runtime": claim.runtime,
+                        "owner": owner,
+                        "lease_token": lease_token,
+                        "fencing_token": claim.version,
+                        "expires_at": claim.expires_at.isoformat(),
+                    },
+                ),
+            )
+            observation = ObservationRecord(
+                run_id=run_id,
+                kind=ObservationKind.SYSTEM_AUDIT,
+                summary="Execution claim lease was renewed by an active worker heartbeat.",
+                details=(
+                    f"error_code=execution_claim_renewed; claim_id={claim.id}; task_id={claim.task_id}; "
+                    f"runtime={claim.runtime}; owner={owner}; fencing_token={claim.version}; "
+                    f"expires_at={claim.expires_at.isoformat()}."
+                ),
+            )
+            session.add(observation)
+            session.flush()
+            session.add(
+                EventLedgerRecord(
+                    run_id=run_id,
+                    event_type=LedgerEventType.OBSERVATION_RECORDED,
+                    payload={
+                        "observation_id": observation.id,
+                        "kind": observation.kind.value,
+                        "summary": observation.summary,
+                    },
+                ),
+            )
+            return self._to_execution_claim_view(claim, task_timeout_seconds=timeout_seconds)
 
     def reclaim_execution_claims(self, run_id: str | None = None) -> list[ExecutionClaimView]:
         self.ensure_schema()
@@ -562,6 +1001,8 @@ class LedgerStore:
             statement = select(ExecutionClaimRecord).where(ExecutionClaimRecord.status == ExecutionClaimStatus.ACTIVE)
             if run_id is not None:
                 statement = statement.where(ExecutionClaimRecord.run_id == run_id)
+            if self.supports_row_level_locking:
+                statement = statement.with_for_update(skip_locked=True)
             claims = list(session.scalars(statement.order_by(ExecutionClaimRecord.acquired_at.asc())).all())
             reclaimed: list[ExecutionClaimView] = []
             for claim in claims:
@@ -577,9 +1018,152 @@ class LedgerStore:
                     claim=claim,
                     reason="Execution lease expired and was reclaimed by the Step 17 reconciliation path.",
                 )
-                reclaimed.append(self._to_execution_claim_view(reclaimed_record))
+                reclaimed.append(self._build_execution_claim_view(session, reclaimed_record))
             session.flush()
             return reclaimed
+
+    def get_runtime_trust(self, runtime: ExecutionRuntime) -> RuntimeTrustView:
+        self.ensure_schema()
+        with self.session() as session:
+            record = self._ensure_runtime_trust_record(session, runtime)
+            return self._to_runtime_trust_view(record)
+
+    def list_runtime_trust(self) -> list[RuntimeTrustView]:
+        self.ensure_schema()
+        with self.session() as session:
+            records = list(session.scalars(select(RuntimeTrustRecord).order_by(RuntimeTrustRecord.runtime)).all())
+            if not records:
+                self._ensure_runtime_trust_record(session, ExecutionRuntime.CONTAINERIZED_WORKER)
+                records = list(session.scalars(select(RuntimeTrustRecord).order_by(RuntimeTrustRecord.runtime)).all())
+            return [self._to_runtime_trust_view(record) for record in records]
+
+    @staticmethod
+    def _classify_container_runtime_mismatch(
+        *,
+        receipt: ContainerizedWorkerReceipt | None = None,
+        preflight_refusal_code: str | None = None,
+        failure_summary: str | None = None,
+    ) -> str | None:
+        if preflight_refusal_code == "dynamic_tool_check_failed":
+            return "dynamic_tool_check_failed"
+        text = "\n".join(
+            part
+            for part in (
+                failure_summary,
+                receipt.summary if receipt is not None else None,
+                receipt.stderr_preview if receipt is not None else None,
+            )
+            if part
+        ).lower()
+        if any(
+            token in text
+            for token in (
+                "command not found",
+                "not found",
+                "no such file or directory",
+                "exec format error",
+            )
+        ):
+            return "runtime_tool_missing_or_broken"
+        return None
+
+    def _record_runtime_trust_failure(
+        self,
+        *,
+        run_id: str,
+        runtime: ExecutionRuntime,
+        reason_code: str,
+        details: str,
+    ) -> RuntimeTrustView:
+        self.ensure_schema()
+        with self.session() as session:
+            record = self._ensure_runtime_trust_record(session, runtime)
+            now = utc_now()
+            record.consecutive_mismatch_failures += 1
+            record.total_mismatch_failures += 1
+            record.recovery_success_streak = 0
+            record.last_failure_reason = reason_code
+            record.last_failure_at = now
+            if record.consecutive_mismatch_failures >= record.mismatch_strike_threshold:
+                record.dynamic_preflight_required = True
+                record.mode = RuntimeTrustMode.DYNAMIC_PROMOTED
+
+            observation = ObservationRecord(
+                run_id=run_id,
+                kind=ObservationKind.SYSTEM_AUDIT,
+                summary="Runtime trust strike recorded after a capability mismatch.",
+                details=(
+                    f"error_code=runtime_trust_strike_recorded; runtime={runtime.value}; reason_code={reason_code}; "
+                    f"consecutive_failures={record.consecutive_mismatch_failures}; total_failures={record.total_mismatch_failures}; "
+                    f"dynamic_preflight_required={record.dynamic_preflight_required}; "
+                    f"details={self._sanitize_planner_text(details, limit=1800) or '-'}."
+                ),
+            )
+            session.add(observation)
+            session.flush()
+            session.add(
+                EventLedgerRecord(
+                    run_id=run_id,
+                    event_type=LedgerEventType.OBSERVATION_RECORDED,
+                    payload={
+                        "observation_id": observation.id,
+                        "kind": observation.kind.value,
+                        "summary": observation.summary,
+                    },
+                ),
+            )
+            return self._to_runtime_trust_view(record)
+
+    def _record_runtime_trust_success(
+        self,
+        *,
+        run_id: str,
+        runtime: ExecutionRuntime,
+        dynamic_preflight_performed: bool,
+    ) -> RuntimeTrustView:
+        self.ensure_schema()
+        with self.session() as session:
+            record = self._ensure_runtime_trust_record(session, runtime)
+            now = utc_now()
+            record.last_success_at = now
+            record.consecutive_mismatch_failures = 0
+
+            should_emit_recovery_observation = False
+            if record.dynamic_preflight_required and dynamic_preflight_performed:
+                record.recovery_success_streak += 1
+                if record.recovery_success_streak >= record.recovery_success_threshold:
+                    record.dynamic_preflight_required = False
+                    record.mode = RuntimeTrustMode.STATIC_MANIFEST
+                    record.recovery_success_streak = 0
+                    should_emit_recovery_observation = True
+            else:
+                record.recovery_success_streak = 0
+
+            if should_emit_recovery_observation:
+                observation = ObservationRecord(
+                    run_id=run_id,
+                    kind=ObservationKind.SYSTEM_AUDIT,
+                    summary="Runtime trust recovered back to static-first preflight.",
+                    details=(
+                        f"error_code=runtime_trust_recovered; runtime={runtime.value}; "
+                        f"recovery_success_threshold={record.recovery_success_threshold}; "
+                        "dynamic_preflight_required=false."
+                    ),
+                )
+                session.add(observation)
+                session.flush()
+                session.add(
+                    EventLedgerRecord(
+                        run_id=run_id,
+                        event_type=LedgerEventType.OBSERVATION_RECORDED,
+                        payload={
+                            "observation_id": observation.id,
+                            "kind": observation.kind.value,
+                            "summary": observation.summary,
+                        },
+                    ),
+                )
+            return self._to_runtime_trust_view(record)
 
     def create_run(self, run_input: RunCreateInput) -> RunView:
         self.ensure_schema()
@@ -1000,6 +1584,7 @@ class LedgerStore:
 
     def build_patch_review(self, run_id: str, *, include_raw: bool = False) -> PatchReviewView:
         self.ensure_schema()
+        snapshot = self.build_run_snapshot(run_id)
         with self.session() as session:
             record = next(
                 (
@@ -1034,6 +1619,8 @@ class LedgerStore:
 
             return PatchReviewView(
                 intake=self._to_patch_intake_view(record),
+                snapshot_hash=snapshot.state_hash,
+                freshness_generation=snapshot.freshness_generation,
                 patch_body=patch_body,
                 receipt_preview=(
                     f"runtime={receipt_payload.get('runtime', '-')}; "
@@ -1045,8 +1632,25 @@ class LedgerStore:
                 raw_receipt=raw_receipt if include_raw else None,
             )
 
-    def approve_patch_intake(self, patch_intake_id: str) -> PatchResolutionView:
+    def approve_patch_intake(
+        self,
+        patch_intake_id: str,
+        *,
+        snapshot_hash: str | None = None,
+        freshness_generation: int | None = None,
+    ) -> PatchResolutionView:
         self.ensure_schema()
+        with self.session() as session:
+            patch_intake = session.get(PatchIntakeRecord, patch_intake_id)
+            if patch_intake is None:
+                raise LookupError(f"Patch intake {patch_intake_id} was not found.")
+            run_id = patch_intake.run_id
+        self._assert_snapshot_freshness(
+            run_id=run_id,
+            mutation_name="patch approval",
+            snapshot_hash=snapshot_hash,
+            freshness_generation=freshness_generation,
+        )
         with self.session() as session:
             patch_intake = session.get(PatchIntakeRecord, patch_intake_id)
             if patch_intake is None:
@@ -1083,11 +1687,29 @@ class LedgerStore:
                 message=message,
             )
 
-    def reject_patch_intake(self, patch_intake_id: str, *, reason: str) -> PatchResolutionView:
+    def reject_patch_intake(
+        self,
+        patch_intake_id: str,
+        *,
+        reason: str,
+        snapshot_hash: str | None = None,
+        freshness_generation: int | None = None,
+    ) -> PatchResolutionView:
         self.ensure_schema()
         normalized_reason = self._normalize_optional_text(reason)
         if normalized_reason is None:
             raise ValueError("Patch rejection requires a non-blank founder reason.")
+        with self.session() as session:
+            patch_intake = session.get(PatchIntakeRecord, patch_intake_id)
+            if patch_intake is None:
+                raise LookupError(f"Patch intake {patch_intake_id} was not found.")
+            run_id = patch_intake.run_id
+        self._assert_snapshot_freshness(
+            run_id=run_id,
+            mutation_name="patch rejection",
+            snapshot_hash=snapshot_hash,
+            freshness_generation=freshness_generation,
+        )
         with self.session() as session:
             patch_intake = session.get(PatchIntakeRecord, patch_intake_id)
             if patch_intake is None:
@@ -1215,7 +1837,7 @@ class LedgerStore:
             )
             execution_claim = self._load_execution_claim(session, run_id)
             active_execution_claim = (
-                self._to_execution_claim_view(execution_claim)
+                self._build_execution_claim_view(session, execution_claim)
                 if execution_claim is not None and execution_claim.status == ExecutionClaimStatus.ACTIVE
                 else None
             )
@@ -1225,6 +1847,14 @@ class LedgerStore:
                     .where(FounderInterventionRecord.run_id == run_id)
                     .order_by(FounderInterventionRecord.created_at.asc(), FounderInterventionRecord.id.asc()),
                 ).all(),
+            )
+            freshness_generation = int(
+                session.scalar(
+                    select(func.count())
+                    .select_from(EventLedgerRecord)
+                    .where(EventLedgerRecord.run_id == run_id),
+                )
+                or 0,
             )
             patch_intake_records = list(
                 session.scalars(
@@ -1380,9 +2010,17 @@ class LedgerStore:
                     .order_by(PatchIntakeRecord.created_at.asc(), PatchIntakeRecord.id.asc()),
                 ).all(),
             )
+            freshness_generation = int(
+                session.scalar(
+                    select(func.count())
+                    .select_from(EventLedgerRecord)
+                    .where(EventLedgerRecord.run_id == run_id),
+                )
+                or 0,
+            )
             execution_claim = self._load_execution_claim(session, run_id)
             active_execution_claim = (
-                self._to_execution_claim_view(execution_claim)
+                self._build_execution_claim_view(session, execution_claim)
                 if execution_claim is not None and execution_claim.status == ExecutionClaimStatus.ACTIVE
                 else None
             )
@@ -1450,6 +2088,7 @@ class LedgerStore:
 
             snapshot_payload = {
                 "policy_version": POSSIBLE_ACTIONS_ENGINE_VERSION,
+                "freshness_generation": freshness_generation,
                 "run": self._to_run_view(run_record).model_dump(mode="json"),
                 "pending_approval": pending_approval.model_dump(mode="json") if pending_approval else None,
                 "pending_founder_escalation": (
@@ -1493,6 +2132,7 @@ class LedgerStore:
                 snapshot_timestamp=utc_now(),
                 policy_version=POSSIBLE_ACTIONS_ENGINE_VERSION,
                 state_hash=state_hash,
+                freshness_generation=freshness_generation,
                 run=self._to_run_view(run_record),
                 action_state=SnapshotActionState.STUCK,
                 action_state_reason="Possible actions have not been evaluated yet.",
@@ -1525,6 +2165,52 @@ class LedgerStore:
                 latest_artifact=latest_artifact,
                 recent_founder_interventions=recent_founder_interventions,
             )
+
+    @staticmethod
+    def _build_snapshot_freshness_view(snapshot: RunSnapshotView) -> SnapshotFreshnessView:
+        return SnapshotFreshnessView(
+            snapshot_hash=snapshot.state_hash,
+            freshness_generation=snapshot.freshness_generation,
+        )
+
+    def _assert_snapshot_freshness(
+        self,
+        *,
+        run_id: str,
+        mutation_name: str,
+        snapshot_hash: str | None = None,
+        freshness_generation: int | None = None,
+    ) -> None:
+        if snapshot_hash is None and freshness_generation is None:
+            return
+
+        current_snapshot = self.build_run_snapshot(run_id)
+        current = self._build_snapshot_freshness_view(current_snapshot)
+        hash_mismatch = snapshot_hash is not None and snapshot_hash != current.snapshot_hash
+        generation_mismatch = (
+            freshness_generation is not None and freshness_generation != current.freshness_generation
+        )
+        if not hash_mismatch and not generation_mismatch:
+            return
+
+        expected = SnapshotFreshnessView(
+            snapshot_hash=snapshot_hash or current.snapshot_hash,
+            freshness_generation=(
+                current.freshness_generation if freshness_generation is None else freshness_generation
+            ),
+        )
+        raise SnapshotFreshnessConflictError(
+            SnapshotFreshnessRefusalView(
+                code=SnapshotFreshnessRefusalCode.STALE_SNAPSHOT,
+                mutation_name=mutation_name,
+                message=(
+                    f"Run {run_id} changed since the snapshot you inspected; {mutation_name} is blocked until "
+                    "you refresh the current founder/operator surface."
+                ),
+                expected=expected,
+                current=current,
+            ),
+        )
 
     def build_run_progress(
         self,
@@ -1563,6 +2249,7 @@ class LedgerStore:
             trace_mode=trace_mode,
             run=snapshot.run,
             snapshot_hash=snapshot.state_hash,
+            snapshot_generation=snapshot.freshness_generation,
             action_state=snapshot.action_state,
             surface_status=surface_status,
             action_required_by=action_required_by,
@@ -3015,10 +3702,18 @@ class LedgerStore:
         workspace: Path,
         artifact_root: Path,
         timeout_seconds: int = 30,
+        snapshot_hash: str | None = None,
+        freshness_generation: int | None = None,
     ) -> IsolatedWorkerDispatchResult:
         """Dispatch one bounded isolated-worker proof and persist its trail."""
 
         self.ensure_schema()
+        self._assert_snapshot_freshness(
+            run_id=run_id,
+            mutation_name="task dispatch",
+            snapshot_hash=snapshot_hash,
+            freshness_generation=freshness_generation,
+        )
         workspace = workspace.expanduser().resolve()
         artifact_root = artifact_root.expanduser().resolve()
         requirements = ExecutionRequirements(
@@ -3087,9 +3782,9 @@ class LedgerStore:
                 session=session,
                 run=run,
                 task=task,
-                runtime=ExecutionRuntime.CONTAINERIZED_WORKER,
+                runtime=ExecutionRuntime.ISOLATED_WORKER,
                 timeout_seconds=timeout_seconds,
-                owner="containerized_worker_dispatch",
+                owner="isolated_worker_dispatch",
             )
             session.add(
                 EventLedgerRecord(
@@ -3207,10 +3902,18 @@ class LedgerStore:
         workspace: Path,
         artifact_root: Path,
         timeout_seconds: int = 30,
+        snapshot_hash: str | None = None,
+        freshness_generation: int | None = None,
     ) -> IsolatedWorkerDispatchResult:
         """Dispatch one bounded containerized-worker proof and persist its trail."""
 
         self.ensure_schema()
+        self._assert_snapshot_freshness(
+            run_id=run_id,
+            mutation_name="task dispatch",
+            snapshot_hash=snapshot_hash,
+            freshness_generation=freshness_generation,
+        )
         workspace = workspace.expanduser().resolve()
         artifact_root = artifact_root.expanduser().resolve()
         requirements = ExecutionRequirements(
@@ -3237,6 +3940,7 @@ class LedgerStore:
             raise PermissionError(
                 f"Run {run_id} currently routes to {inspection.outcome.runtime.value}, not containerized_worker.",
             )
+        runtime_trust = self.get_runtime_trust(ExecutionRuntime.CONTAINERIZED_WORKER)
 
         with self.session() as session:
             run = self._get_run_for_execution(session, run_id)
@@ -3279,6 +3983,14 @@ class LedgerStore:
             )
             session.add(task)
             session.flush()
+            self._acquire_execution_claim(
+                session=session,
+                run=run,
+                task=task,
+                runtime=ExecutionRuntime.CONTAINERIZED_WORKER,
+                timeout_seconds=timeout_seconds,
+                owner="containerized_worker_dispatch",
+            )
             session.add(
                 EventLedgerRecord(
                     run_id=run.id,
@@ -3327,6 +4039,7 @@ class LedgerStore:
                 execution_context_id=execution_context_id,
                 run_id=run_id,
                 requirements=requirements,
+                force_dynamic_preflight=runtime_trust.dynamic_preflight_required,
             )
         except ContainerizedWorkerPreflightRefusal as exc:
             summary = f"Containerized worker preflight refusal: {exc}"
@@ -3337,13 +4050,25 @@ class LedgerStore:
                 summary=summary,
                 preflight_refusal_code=exc.refusal_code,
             )
-            return self._finalize_failed_isolated_task(
+            result = self._finalize_failed_isolated_task(
                 run_id=run_id,
                 task_id=task_id,
                 artifact_root=artifact_root,
                 receipt=synthetic_receipt,
                 failure_summary=summary,
             )
+            reason_code = self._classify_container_runtime_mismatch(
+                preflight_refusal_code=exc.refusal_code,
+                failure_summary=summary,
+            )
+            if reason_code is not None:
+                self._record_runtime_trust_failure(
+                    run_id=run_id,
+                    runtime=ExecutionRuntime.CONTAINERIZED_WORKER,
+                    reason_code=reason_code,
+                    details=summary,
+                )
+            return result
         except (ContainerizedWorkerTimeout, FileNotFoundError, NotADirectoryError) as exc:
             synthetic_receipt = self._build_failed_containerized_receipt(
                 workspace=workspace,
@@ -3351,59 +4076,127 @@ class LedgerStore:
                 timeout_seconds=timeout_seconds,
                 summary=str(exc),
             )
-            return self._finalize_failed_isolated_task(
+            result = self._finalize_failed_isolated_task(
                 run_id=run_id,
                 task_id=task_id,
                 artifact_root=artifact_root,
                 receipt=synthetic_receipt,
                 failure_summary=str(exc),
             )
+            reason_code = self._classify_container_runtime_mismatch(
+                receipt=synthetic_receipt,
+                failure_summary=str(exc),
+            )
+            if reason_code is not None:
+                self._record_runtime_trust_failure(
+                    run_id=run_id,
+                    runtime=ExecutionRuntime.CONTAINERIZED_WORKER,
+                    reason_code=reason_code,
+                    details=str(exc),
+                )
+            return result
         except Exception as exc:  # pragma: no cover - defensive guard
+            failure_summary = f"Unexpected containerized worker failure: {exc}"
             synthetic_receipt = self._build_failed_containerized_receipt(
                 workspace=workspace,
                 execution_context_id=execution_context_id,
                 timeout_seconds=timeout_seconds,
-                summary=f"Unexpected containerized worker failure: {exc}",
+                summary=failure_summary,
             )
-            return self._finalize_failed_isolated_task(
+            result = self._finalize_failed_isolated_task(
                 run_id=run_id,
                 task_id=task_id,
                 artifact_root=artifact_root,
                 receipt=synthetic_receipt,
-                failure_summary=f"Unexpected containerized worker failure: {exc}",
+                failure_summary=failure_summary,
             )
+            reason_code = self._classify_container_runtime_mismatch(
+                receipt=synthetic_receipt,
+                failure_summary=failure_summary,
+            )
+            if reason_code is not None:
+                self._record_runtime_trust_failure(
+                    run_id=run_id,
+                    runtime=ExecutionRuntime.CONTAINERIZED_WORKER,
+                    reason_code=reason_code,
+                    details=failure_summary,
+                )
+            return result
 
         if receipt.timed_out or receipt.returncode not in (0, None):
-            return self._finalize_failed_isolated_task(
+            result = self._finalize_failed_isolated_task(
                 run_id=run_id,
                 task_id=task_id,
                 artifact_root=artifact_root,
                 receipt=receipt,
                 failure_summary=receipt.summary,
             )
+            reason_code = self._classify_container_runtime_mismatch(
+                receipt=receipt,
+                failure_summary=receipt.summary,
+            )
+            if reason_code is not None:
+                self._record_runtime_trust_failure(
+                    run_id=run_id,
+                    runtime=ExecutionRuntime.CONTAINERIZED_WORKER,
+                    reason_code=reason_code,
+                    details=receipt.summary,
+                )
+            return result
         if not receipt.patch_body:
-            return self._finalize_failed_isolated_task(
+            result = self._finalize_failed_isolated_task(
                 run_id=run_id,
                 task_id=task_id,
                 artifact_root=artifact_root,
                 receipt=receipt,
                 failure_summary="Containerized worker proof completed without producing a bounded patch.",
             )
+            reason_code = self._classify_container_runtime_mismatch(
+                receipt=receipt,
+                failure_summary=receipt.summary,
+            )
+            if reason_code is not None:
+                self._record_runtime_trust_failure(
+                    run_id=run_id,
+                    runtime=ExecutionRuntime.CONTAINERIZED_WORKER,
+                    reason_code=reason_code,
+                    details=receipt.summary,
+                )
+            return result
         try:
-            return self._finalize_completed_isolated_task(
+            result = self._finalize_completed_isolated_task(
                 run_id=run_id,
                 task_id=task_id,
                 artifact_root=artifact_root,
                 receipt=receipt,
             )
+            self._record_runtime_trust_success(
+                run_id=run_id,
+                runtime=ExecutionRuntime.CONTAINERIZED_WORKER,
+                dynamic_preflight_performed=receipt.dynamic_check_performed,
+            )
+            return result
         except Exception as exc:
-            return self._finalize_failed_isolated_task(
+            failure_summary = f"Patch/receipt persistence failed after containerized execution: {exc}"
+            result = self._finalize_failed_isolated_task(
                 run_id=run_id,
                 task_id=task_id,
                 artifact_root=artifact_root,
                 receipt=receipt,
-                failure_summary=f"Patch/receipt persistence failed after containerized execution: {exc}",
+                failure_summary=failure_summary,
             )
+            reason_code = self._classify_container_runtime_mismatch(
+                receipt=receipt,
+                failure_summary=failure_summary,
+            )
+            if reason_code is not None:
+                self._record_runtime_trust_failure(
+                    run_id=run_id,
+                    runtime=ExecutionRuntime.CONTAINERIZED_WORKER,
+                    reason_code=reason_code,
+                    details=failure_summary,
+                )
+            return result
 
     @staticmethod
     def _build_run_created_event(record: RunRecord) -> EventLedgerRecord:
@@ -4246,6 +5039,118 @@ class LedgerStore:
             return "Containerized worker proof"
         return "Isolated worker proof"
 
+    def _build_stale_execution_result_rejection(
+        self,
+        *,
+        session: Session,
+        run: RunRecord,
+        task: TaskRecord,
+        receipt: IsolatedWorkerReceipt | ContainerizedWorkerReceipt,
+        receipt_path: Path,
+        receipt_hash: str,
+        receipt_bytes: bytes,
+        runtime_phrase: str,
+        reason: str,
+    ) -> IsolatedWorkerDispatchResult:
+        receipt_artifact = ArtifactRecord(
+            run_id=run.id,
+            task_id=task.id,
+            decision_id=task.decision_id,
+            artifact_type=ArtifactType.EXECUTION_RECEIPT,
+            title=f"{runtime_phrase} execution receipt (rejected stale result)",
+            storage_kind=ArtifactStorageKind.FILESYSTEM_PATH,
+            path=str(receipt_path),
+            size_bytes=len(receipt_bytes),
+            sha256=receipt_hash,
+            execution_context_id=receipt.execution_context_id,
+            command=receipt.command,
+            cwd=receipt.sandbox_cwd,
+        )
+        session.add(receipt_artifact)
+        session.flush()
+
+        observation = ObservationRecord(
+            run_id=run.id,
+            kind=ObservationKind.SYSTEM_AUDIT,
+            summary="Late worker result was rejected because its execution claim was no longer current.",
+            details=(
+                f"error_code=stale_execution_result_rejected; task_id={task.id}; "
+                f"execution_context_id={receipt.execution_context_id}; "
+                f"task_claim_token={task.execution_claim_token}; "
+                f"task_fencing_token={task.execution_claim_fencing_token}; "
+                f"reason={reason}."
+            ),
+        )
+        session.add(observation)
+        session.flush()
+
+        session.add(
+            EventLedgerRecord(
+                run_id=run.id,
+                event_type=LedgerEventType.ARTIFACT_RECORDED,
+                payload={
+                    "artifact_id": receipt_artifact.id,
+                    "task_id": task.id,
+                    "decision_id": task.decision_id,
+                    "execution_context_id": receipt_artifact.execution_context_id,
+                    "path": receipt_artifact.path,
+                    "sha256": receipt_artifact.sha256,
+                },
+            ),
+        )
+        session.add(
+            EventLedgerRecord(
+                run_id=run.id,
+                event_type=LedgerEventType.EXECUTION_RESULT_REJECTED,
+                payload={
+                    "task_id": task.id,
+                    "decision_id": task.decision_id,
+                    "execution_context_id": receipt.execution_context_id,
+                    "runtime": receipt.runtime,
+                    "reason": reason,
+                    "task_claim_token": task.execution_claim_token,
+                    "task_fencing_token": task.execution_claim_fencing_token,
+                },
+            ),
+        )
+        session.add(
+            EventLedgerRecord(
+                run_id=run.id,
+                event_type=LedgerEventType.OBSERVATION_RECORDED,
+                payload={
+                    "observation_id": observation.id,
+                    "kind": observation.kind.value,
+                    "summary": observation.summary,
+                },
+            ),
+        )
+        session.flush()
+        return IsolatedWorkerDispatchResult(
+            task=self._to_task_view(task),
+            artifacts=[self._to_artifact_view(receipt_artifact)],
+            observation=self._to_observation_view(observation),
+            receipt=receipt,
+        )
+
+    def _validate_current_execution_claim_for_task(
+        self,
+        *,
+        session: Session,
+        run_id: str,
+        task: TaskRecord,
+    ) -> str | None:
+        claim = self._load_execution_claim(session, run_id)
+        if claim is None:
+            return "no execution claim is present for the run"
+        if claim.status != ExecutionClaimStatus.ACTIVE:
+            return f"claim status is {claim.status.value}"
+        if not self._task_claim_matches_record(task, claim):
+            return (
+                f"active claim mismatch: claim_task_id={claim.task_id}; "
+                f"claim_token={claim.lease_token}; claim_fencing_token={claim.version}"
+            )
+        return None
+
     def _finalize_failed_isolated_task(
         self,
         *,
@@ -4271,6 +5176,23 @@ class LedgerStore:
             task = session.get(TaskRecord, task_id)
             if run is None or task is None:
                 raise LookupError("Isolated task finalization failed because the run or task no longer exists.")
+            stale_reason = self._validate_current_execution_claim_for_task(
+                session=session,
+                run_id=run.id,
+                task=task,
+            )
+            if stale_reason is not None:
+                return self._build_stale_execution_result_rejection(
+                    session=session,
+                    run=run,
+                    task=task,
+                    receipt=receipt,
+                    receipt_path=receipt_path,
+                    receipt_hash=receipt_hash,
+                    receipt_bytes=receipt_bytes,
+                    runtime_phrase=runtime_phrase,
+                    reason=stale_reason,
+                )
 
             task.execution_context_id = receipt.execution_context_id
             task.command = receipt.command
@@ -4390,6 +5312,23 @@ class LedgerStore:
                 task = session.get(TaskRecord, task_id)
                 if run is None or task is None:
                     raise LookupError("Isolated task finalization failed because the run or task no longer exists.")
+                stale_reason = self._validate_current_execution_claim_for_task(
+                    session=session,
+                    run_id=run.id,
+                    task=task,
+                )
+                if stale_reason is not None:
+                    return self._build_stale_execution_result_rejection(
+                        session=session,
+                        run=run,
+                        task=task,
+                        receipt=receipt,
+                        receipt_path=receipt_path,
+                        receipt_hash=receipt_hash,
+                        receipt_bytes=receipt_bytes,
+                        runtime_phrase=runtime_phrase,
+                        reason=stale_reason,
+                    )
 
                 task.execution_context_id = receipt.execution_context_id
                 task.command = receipt.command
