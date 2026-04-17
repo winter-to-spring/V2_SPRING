@@ -40,6 +40,10 @@ Current mitigation:
   status/expiry and runtime/status lookups
 - targeted regression tests now cover the generated locking SQL and JSONB
   variants used by the ledger
+- Step 22 makes run-first / claim-second lock ordering more explicit across the
+  release and reclaim hot paths
+- Step 22 adds a live contention smoke probe that measures lock waiting and
+  contender latency against a real PostgreSQL backend
 
 ## Capability Gate
 - Capability: multi-writer execution with Postgres as the primary store
@@ -52,8 +56,10 @@ Current mitigation:
 
 ## Doc Links
 - ADR: ../../adr/0019-postgres-migration-and-transactional-concurrency.md
+- ADR: ../../adr/0020-postgres-contention-soak-and-controller-boundary.md
 - Design note: ../../issues/STEP_21_POSTGRES_MIGRATION_AND_TRANSACTIONAL_CONCURRENCY.md
 - Design note: ../../implementation-notes/STEP_21_POSTGRES_MIGRATION_AND_TRANSACTIONAL_CONCURRENCY.md
+- Design note: ../../implementation-notes/STEP_22_POSTGRES_CONTENTION_AND_CONTROLLER_DB_BOUNDARY.md
 
 ## Exit Criteria
 
@@ -63,3 +69,4 @@ Current mitigation:
 ## Last Updated
 - 2026-04-17
 - 2026-04-17 (mitigating in Step 21)
+- 2026-04-17 (mitigating with Step 22 contention diagnostics and lock-order hardening)

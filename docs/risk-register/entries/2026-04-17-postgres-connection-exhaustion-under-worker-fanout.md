@@ -39,6 +39,10 @@ Current mitigation:
   gain direct ledger writes in this slice
 - the migration issue now treats connection ownership as a first-class design
   constraint instead of an afterthought
+- Step 22 exposes pool sizing, checked-out connections, overflow, and
+  utilization through `v2-spring doctor`
+- Step 22 adds a live PostgreSQL contention smoke probe so pool pressure is
+  observed rather than assumed
 
 ## Capability Gate
 - Capability: multi-worker / multi-agent execution on Postgres
@@ -51,8 +55,10 @@ Current mitigation:
 
 ## Doc Links
 - ADR: ../../adr/0019-postgres-migration-and-transactional-concurrency.md
+- ADR: ../../adr/0020-postgres-contention-soak-and-controller-boundary.md
 - Design note: ../../issues/STEP_21_POSTGRES_MIGRATION_AND_TRANSACTIONAL_CONCURRENCY.md
 - Design note: ../../implementation-notes/STEP_21_POSTGRES_MIGRATION_AND_TRANSACTIONAL_CONCURRENCY.md
+- Design note: ../../implementation-notes/STEP_22_POSTGRES_CONTENTION_AND_CONTROLLER_DB_BOUNDARY.md
 
 ## Exit Criteria
 
@@ -63,3 +69,4 @@ Current mitigation:
 ## Last Updated
 - 2026-04-17
 - 2026-04-17 (mitigating in Step 21)
+- 2026-04-17 (mitigating with Step 22 doctor diagnostics and live contention smoke)

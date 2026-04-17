@@ -161,3 +161,7 @@ Observed In:
 - [RISK-0055 PostgreSQL connection exhaustion may appear when worker/controller fanout grows](entries/2026-04-17-postgres-connection-exhaustion-under-worker-fanout.md)
 - ~~[RISK-0056 Schema drift may break Postgres migration without versioned migration control](entries/2026-04-17-schema-drift-during-postgres-migration.md)~~
 - [RISK-0057 Postgres write lock contention may reduce execution throughput under claim and renewal load](entries/2026-04-17-postgres-write-lock-contention-under-execution-load.md)
+- ~~[RISK-0058 Postgres multi-table transactional writes may deadlock under contention](entries/2026-04-17-postgres-deadlock-contention-under-multi-table-writes.md)~~
+- [RISK-0059 JSONB-heavy ledger writes may amplify Postgres write cost under audit load](entries/2026-04-17-postgres-jsonb-write-penalty-under-audit-load.md)
+- [RISK-0060 WAL and storage pressure may rise sharply under heartbeat and audit churn](entries/2026-04-17-postgres-wal-and-storage-pressure-under-control-plane-churn.md)
+- [RISK-0061 Controller-mediated DB access may become a throughput bottleneck or SPOF](entries/2026-04-17-controller-throughput-and-spof-under-db-mediation.md)

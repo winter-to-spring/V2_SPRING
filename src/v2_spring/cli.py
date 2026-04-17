@@ -55,9 +55,11 @@ from v2_spring.domain.snapshot import (
 )
 from v2_spring.ledger.store import (
     BoundedExecutionResult,
+    DatabaseDoctorReport,
     ExecutionClaimConflictError,
     IsolatedWorkerDispatchResult,
     LedgerStore,
+    PostgresContentionSmokeResult,
     SchemaStatus,
     SchemaBootstrapRequiredError,
 )
@@ -91,6 +93,17 @@ def build_parser() -> argparse.ArgumentParser:
         default="pretty",
         choices=["pretty", "json"],
         help="Output format. Defaults to pretty.",
+    )
+    doctor_parser.add_argument(
+        "--contention-smoke",
+        action="store_true",
+        help="Run a live PostgreSQL contention smoke probe after printing doctor diagnostics.",
+    )
+    doctor_parser.add_argument(
+        "--hold-seconds",
+        default=1.0,
+        type=float,
+        help="How long the blocking Step 22 smoke transaction should hold row locks. Defaults to 1.0.",
     )
     subparsers.add_parser("tracer-bullet", help="Print tracer bullet entrypoint guidance.")
 
@@ -1429,8 +1442,8 @@ def _render_schema_status(status: SchemaStatus) -> str:
     missing_tables = ", ".join(status.missing_tables) if status.missing_tables else "-"
     return dedent(
         f"""\
-        Database doctor
-        ---------------
+        Schema status
+        -------------
         dialect:              {status.dialect_name}
         management_mode:      {status.management_mode}
         ready:                {str(status.ready).lower()}
@@ -1438,6 +1451,74 @@ def _render_schema_status(status: SchemaStatus) -> str:
         migration_controlled: {str(status.migration_controlled).lower()}
         current_revision:     {status.current_revision or '-'}
         missing_tables:       {missing_tables}
+        """,
+    ).strip()
+
+
+def _render_database_doctor(report: DatabaseDoctorReport) -> str:
+    lines = [
+        "Database doctor",
+        "---------------",
+        _render_schema_status(report.schema),
+        "",
+        "Controller DB boundary",
+        "----------------------",
+        f"boundary_mode:        {report.controller_db_boundary}",
+        f"blocked_worker_env:   {', '.join(report.blocked_worker_env_vars)}",
+    ]
+    if report.postgres_pool is not None:
+        utilization = (
+            f"{report.postgres_pool.utilization_ratio:.2f}"
+            if report.postgres_pool.utilization_ratio is not None
+            else "-"
+        )
+        lines.extend(
+            [
+                "",
+                "Postgres pool",
+                "-------------",
+                f"pool_size:            {report.postgres_pool.pool_size if report.postgres_pool.pool_size is not None else '-'}",
+                f"checked_out:          {report.postgres_pool.checked_out if report.postgres_pool.checked_out is not None else '-'}",
+                f"checked_in:           {report.postgres_pool.checked_in if report.postgres_pool.checked_in is not None else '-'}",
+                f"current_overflow:     {report.postgres_pool.current_overflow if report.postgres_pool.current_overflow is not None else '-'}",
+                f"max_overflow:         {report.postgres_pool.max_overflow if report.postgres_pool.max_overflow is not None else '-'}",
+                f"utilization_ratio:    {utilization}",
+            ],
+        )
+    if report.postgres_contention is not None:
+        lines.extend(
+            [
+                "",
+                "Postgres contention",
+                "-------------------",
+                f"total_connections:    {report.postgres_contention.total_connections}",
+                f"active_connections:   {report.postgres_contention.active_connections}",
+                f"lock_waiting:         {report.postgres_contention.lock_waiting_connections}",
+                f"idle_in_txn:          {report.postgres_contention.idle_in_transaction_connections}",
+                f"longest_txn_ms:       {report.postgres_contention.longest_transaction_ms:.1f}",
+                f"max_connections:      {report.postgres_contention.max_connections if report.postgres_contention.max_connections is not None else '-'}",
+            ],
+        )
+    return "\n".join(lines)
+
+
+def _render_contention_smoke(result: PostgresContentionSmokeResult) -> str:
+    utilization = (
+        f"{result.peak_connection_utilization_ratio:.2f}"
+        if result.peak_connection_utilization_ratio is not None
+        else "-"
+    )
+    return dedent(
+        f"""\
+        Contention smoke
+        ----------------
+        hold_seconds:         {result.hold_seconds:.2f}
+        renewed_successfully: {str(result.renewed_successfully).lower()}
+        lock_waiting_observed:{' ' * 1}{str(result.lock_waiting_observed).lower()}
+        peak_lock_waiting:    {result.peak_lock_waiting_connections}
+        contender_latency_ms: {result.contender_latency_ms:.1f}
+        peak_checked_out:     {result.peak_checked_out_connections if result.peak_checked_out_connections is not None else '-'}
+        peak_utilization:     {utilization}
         """,
     ).strip()
 
@@ -2376,25 +2457,76 @@ def main() -> None:
 
     if args.command == "doctor":
         store = _build_store(args.database_url, validate_schema=False)
-        status = store.inspect_schema_status()
+        report = store.inspect_database_doctor()
+        smoke: PostgresContentionSmokeResult | None = None
+        if args.contention_smoke:
+            try:
+                smoke = store.run_postgres_contention_smoke(hold_seconds=args.hold_seconds)
+            except SchemaBootstrapRequiredError as exc:
+                print(str(exc))
+                raise SystemExit(1) from exc
         if args.format == "json":
             print(
                 json.dumps(
                     {
-                        "dialect_name": status.dialect_name,
-                        "management_mode": status.management_mode,
-                        "ready": status.ready,
-                        "bootstrap_required": status.bootstrap_required,
-                        "migration_controlled": status.migration_controlled,
-                        "current_revision": status.current_revision,
-                        "missing_tables": list(status.missing_tables),
+                        "schema": {
+                            "dialect_name": report.schema.dialect_name,
+                            "management_mode": report.schema.management_mode,
+                            "ready": report.schema.ready,
+                            "bootstrap_required": report.schema.bootstrap_required,
+                            "migration_controlled": report.schema.migration_controlled,
+                            "current_revision": report.schema.current_revision,
+                            "missing_tables": list(report.schema.missing_tables),
+                        },
+                        "controller_db_boundary": report.controller_db_boundary,
+                        "blocked_worker_env_vars": list(report.blocked_worker_env_vars),
+                        "postgres_pool": (
+                            None
+                            if report.postgres_pool is None
+                            else {
+                                "pool_size": report.postgres_pool.pool_size,
+                                "checked_out": report.postgres_pool.checked_out,
+                                "checked_in": report.postgres_pool.checked_in,
+                                "current_overflow": report.postgres_pool.current_overflow,
+                                "max_overflow": report.postgres_pool.max_overflow,
+                                "utilization_ratio": report.postgres_pool.utilization_ratio,
+                            }
+                        ),
+                        "postgres_contention": (
+                            None
+                            if report.postgres_contention is None
+                            else {
+                                "total_connections": report.postgres_contention.total_connections,
+                                "active_connections": report.postgres_contention.active_connections,
+                                "lock_waiting_connections": report.postgres_contention.lock_waiting_connections,
+                                "idle_in_transaction_connections": report.postgres_contention.idle_in_transaction_connections,
+                                "longest_transaction_ms": report.postgres_contention.longest_transaction_ms,
+                                "max_connections": report.postgres_contention.max_connections,
+                            }
+                        ),
+                        "contention_smoke": (
+                            None
+                            if smoke is None
+                            else {
+                                "hold_seconds": smoke.hold_seconds,
+                                "renewed_successfully": smoke.renewed_successfully,
+                                "lock_waiting_observed": smoke.lock_waiting_observed,
+                                "peak_lock_waiting_connections": smoke.peak_lock_waiting_connections,
+                                "contender_latency_ms": smoke.contender_latency_ms,
+                                "peak_checked_out_connections": smoke.peak_checked_out_connections,
+                                "peak_connection_utilization_ratio": smoke.peak_connection_utilization_ratio,
+                            }
+                        ),
                     },
                     indent=2,
                     ensure_ascii=False,
                 ),
             )
         else:
-            print(_render_schema_status(status))
+            print(_render_database_doctor(report))
+            if smoke is not None:
+                print()
+                print(_render_contention_smoke(smoke))
         return
 
     if args.command == "tracer-bullet":
