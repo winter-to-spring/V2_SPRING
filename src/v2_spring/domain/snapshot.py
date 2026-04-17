@@ -10,6 +10,7 @@ from v2_spring.domain.actions import PossibleActionName
 from v2_spring.domain.approval import ApprovalView
 from v2_spring.domain.founder_intervention import FounderInterventionDigest
 from v2_spring.domain.artifact import ArtifactType
+from v2_spring.domain.execution_claim import ExecutionClaimView
 from v2_spring.domain.patch_intake import PatchIntakeStatus, PatchRiskClass
 from v2_spring.domain.run import RunView
 from v2_spring.domain.task import TaskKind, TaskStatus
@@ -133,6 +134,7 @@ class RunSnapshotView(BaseModel):
     pending_approval: ApprovalView | None
     pending_founder_escalation: PendingFounderEscalationView | None
     pending_patch_intake: PendingPatchIntakeView | None
+    active_execution_claim: ExecutionClaimView | None = None
     latest_founder_intervention_summary: str | None
     latest_rejection_reason: str | None
     latest_decision_summary: str | None

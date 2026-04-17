@@ -17,12 +17,13 @@ from v2_spring.adapters.langgraph_planner import (
 )
 from v2_spring.config import AppConfig, load_config
 from v2_spring.domain.approval import ApprovalStatus
+from v2_spring.domain.execution_claim import ExecutionClaimView
 from v2_spring.domain.founder_intervention import (
     FOUNDER_REPLY_INPUT_ADAPTER,
     FounderInterventionView,
 )
 from v2_spring.domain.observation import ObservationKind
-from v2_spring.domain.patch_intake import PatchResolutionView, PatchReviewView
+from v2_spring.domain.patch_intake import PatchResolutionView, PatchReviewView, PatchWarningCode
 from v2_spring.domain.planner_adapter import (
     ActionProposal,
     EscalationProposal,
@@ -46,6 +47,7 @@ from v2_spring.domain.routing import (
 from v2_spring.domain.snapshot import PossibleActionEvaluationView, PossibleActionName, RunSnapshotView
 from v2_spring.ledger.store import (
     BoundedExecutionResult,
+    ExecutionClaimConflictError,
     IsolatedWorkerDispatchResult,
     LedgerStore,
 )
@@ -339,6 +341,40 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output format. Defaults to pretty.",
     )
     task_dispatch_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Override DATABASE_URL for this invocation.",
+    )
+
+    task_claim_parser = task_subparsers.add_parser(
+        "claim",
+        help="Inspect the current execution claim for a run.",
+    )
+    task_claim_parser.add_argument("run_id", help="Run id to inspect.")
+    task_claim_parser.add_argument(
+        "--format",
+        default="pretty",
+        choices=["pretty", "json"],
+        help="Output format. Defaults to pretty.",
+    )
+    task_claim_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Override DATABASE_URL for this invocation.",
+    )
+
+    task_reconcile_claims_parser = task_subparsers.add_parser(
+        "reconcile-claims",
+        help="Reclaim expired execution claims for a run.",
+    )
+    task_reconcile_claims_parser.add_argument("run_id", help="Run id to reconcile.")
+    task_reconcile_claims_parser.add_argument(
+        "--format",
+        default="pretty",
+        choices=["pretty", "json"],
+        help="Output format. Defaults to pretty.",
+    )
+    task_reconcile_claims_parser.add_argument(
         "--database-url",
         default=None,
         help="Override DATABASE_URL for this invocation.",
@@ -1119,6 +1155,28 @@ def _render_isolated_worker_result(result: IsolatedWorkerDispatchResult) -> str:
         observation:         {result.observation.summary}
         artifacts:
         {artifact_lines}
+        """,
+    ).strip()
+
+
+def _render_execution_claim(claim: ExecutionClaimView | None) -> str:
+    if claim is None:
+        return "No execution claim is currently recorded for this run."
+    return dedent(
+        f"""\
+        Execution claim
+        ---------------
+        claim_id:            {claim.id}
+        task_id:             {claim.task_id or '-'}
+        runtime:             {claim.runtime}
+        owner:               {claim.owner}
+        status:              {claim.status.value}
+        lease_token:         {claim.lease_token}
+        acquired_at:         {claim.acquired_at.isoformat()}
+        heartbeat_at:        {claim.heartbeat_at.isoformat()}
+        expires_at:          {claim.expires_at.isoformat()}
+        released_at:         {claim.released_at.isoformat() if claim.released_at else '-'}
+        reclaim_reason:      {claim.reclaim_reason or '-'}
         """,
     ).strip()
 
@@ -2085,7 +2143,7 @@ def _render_patch_review(review: PatchReviewView) -> str:
     if intake.warnings:
         lines.extend(["", "Warnings", "--------"])
         for warning in intake.warnings:
-            lines.append(f"- {warning.code.value}: {warning.message}")
+            lines.append(f"- [{_patch_warning_severity_label(warning.code)}] {warning.code.value}: {warning.message}")
     if intake.changed_files:
         lines.extend(["", "Touched files", "-------------"])
         for changed_file in intake.changed_files:
@@ -2095,6 +2153,18 @@ def _render_patch_review(review: PatchReviewView) -> str:
     if review.raw_receipt is not None:
         lines.extend(["", "Raw receipt", "-----------", review.raw_receipt.rstrip()])
     return "\n".join(lines)
+
+
+def _patch_warning_severity_label(code: PatchWarningCode) -> str:
+    if code in {
+        PatchWarningCode.DANGEROUS_KEYWORD,
+        PatchWarningCode.SENSITIVE_PATH,
+        PatchWarningCode.CENTRAL_FILE,
+        PatchWarningCode.AUTO_APPLY_BURST,
+        PatchWarningCode.STRUCTURAL_DANGER,
+    }:
+        return "BLOCK"
+    return "WARN"
 
 
 def _render_patch_resolution(resolution: PatchResolutionView) -> str:
@@ -2345,9 +2415,47 @@ def main() -> None:
                 )
             else:
                 print(_render_isolated_worker_result(result))
+        except ExecutionClaimConflictError as exc:
+            if args.format == "json":
+                print(json.dumps(exc.refusal.model_dump(mode="json"), indent=2, ensure_ascii=False))
+            else:
+                print(str(exc))
+                print()
+                print(_render_execution_claim(exc.refusal.existing_claim))
+            raise SystemExit(1) from exc
         except (LookupError, ValueError, PermissionError, FileNotFoundError, NotADirectoryError) as exc:
             print(str(exc))
             raise SystemExit(1) from exc
+        return
+
+    if args.command == "task" and args.task_command == "claim":
+        store = _build_store(args.database_url)
+        claim = store.get_execution_claim(args.run_id)
+        if args.format == "json":
+            print(json.dumps(claim.model_dump(mode="json") if claim is not None else None, indent=2, ensure_ascii=False))
+        else:
+            print(_render_execution_claim(claim))
+        return
+
+    if args.command == "task" and args.task_command == "reconcile-claims":
+        store = _build_store(args.database_url)
+        reclaimed = store.reclaim_execution_claims(args.run_id)
+        if args.format == "json":
+            print(
+                json.dumps(
+                    [claim.model_dump(mode="json") for claim in reclaimed],
+                    indent=2,
+                    ensure_ascii=False,
+                ),
+            )
+        else:
+            if not reclaimed:
+                print("No expired execution claims needed reconciliation.")
+            else:
+                print(f"Reclaimed {len(reclaimed)} execution claim(s).")
+                for claim in reclaimed:
+                    print()
+                    print(_render_execution_claim(claim))
         return
 
     if args.command == "artifact" and args.artifact_command == "list":

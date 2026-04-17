@@ -128,10 +128,10 @@ Observed In:
 - ~~[RISK-0019 Single-provider structured output may leak vendor semantics into the core planner transport seam](entries/2026-04-17-provider-schema-lock-in.md)~~
 - ~~[RISK-0020 Provider/network errors may bypass planner governance if they are not normalized at the adapter edge](entries/2026-04-17-provider-error-normalization-leak.md)~~
 - [RISK-0021 Local CLI cancellation may leave an in-flight provider call orphaned after the terminal exits](entries/2026-04-17-provider-cancellation-orphan.md)
-- [RISK-0022 Multi-worker approval gating still needs lease-aware concurrency controls](entries/2026-04-17-multi-worker-approval-concurrency.md)
+- ~~[RISK-0022 Multi-worker approval gating still needs lease-aware concurrency controls](entries/2026-04-17-multi-worker-approval-concurrency.md)~~
 - ~~[RISK-0023 Isolated worker proof may leak secrets or main workspace access if isolation is only logical](entries/2026-04-17-isolated-worker-sandbox-leakage.md)~~
 - ~~[RISK-0024 Isolated worker may crash or hang without a reclaim path, leaving running tasks stuck](entries/2026-04-17-silent-worker-crash-reclaim-gap.md)~~
-- [RISK-0025 Founder review may become a throughput bottleneck without risk-based patch intake routing](entries/2026-04-17-patch-review-fatigue-and-routing.md)
+- ~~[RISK-0025 Founder review may become a throughput bottleneck without risk-based patch intake routing](entries/2026-04-17-patch-review-fatigue-and-routing.md)~~
 - [RISK-0026 Explicit dispatcher rules may sprawl into a hard-to-audit routing blob as runtimes grow](entries/2026-04-17-routing-policy-sprawl.md)
 - ~~[RISK-0027 Soft-isolated worker proof lacks OS/container-level isolation for unrestricted bypass safety](entries/2026-04-17-lack-of-os-level-worker-isolation.md)~~
 - ~~[RISK-0028 Patch may apply syntactically while still introducing semantic or validation-breaking drift](entries/2026-04-17-patch-semantic-conflict-after-apply.md)~~
@@ -139,3 +139,19 @@ Observed In:
 - ~~[RISK-0030 Containerized worker may escape isolation if docker socket or privileged mode is exposed](entries/2026-04-17-docker-socket-and-privileged-container-escape.md)~~
 - ~~[RISK-0031 Containerized worker artifacts may be unreadable or undeletable on the host due to UID/GID mismatch](entries/2026-04-17-container-artifact-ownership-mismatch.md)~~
 - ~~[RISK-0032 Containerized worker may leave orphan containers behind after interruption or crash](entries/2026-04-17-container-orphan-garbage-collection-gap.md)~~
+- ~~[RISK-0033 Containerized worker image tags may drift and break deterministic replay without digest-pinned provenance](entries/2026-04-17-container-image-integrity-and-replay-drift.md)~~
+- ~~[RISK-0034 Containerized worker log explosion may exhaust host disk during copy-out or receipt collection](entries/2026-04-17-container-log-explosion-and-copy-out-disk-risk.md)~~
+- ~~[RISK-0035 Containerized worker capability expansion may fail because runtime dependencies diverge from host assumptions](entries/2026-04-17-container-runtime-environment-gap.md)~~
+- [RISK-0036 Container worker image growth may inflate pull latency and erode execution-plane responsiveness](entries/2026-04-17-container-image-bloat-and-pull-latency.md)
+- ~~[RISK-0037 Local metadata snapshots may drift across environments and make routing decisions non-deterministic](entries/2026-04-17-metadata-snapshot-fragmentation.md)~~
+- ~~[RISK-0038 Tail-only log hygiene may hide the real root cause when failures originate at process startup](entries/2026-04-17-log-diagnostic-sandwich-blindspot.md)~~
+- [RISK-0039 Static capability manifests may drift away from actual runtime health and create false preflight confidence](entries/2026-04-17-manifest-reality-gap.md)
+- ~~[RISK-0040 Semantic chain reaction may bypass founder review when low-risk auto-apply touches central files](entries/2026-04-17-semantic-chain-reaction-on-auto-apply.md)~~
+- ~~[RISK-0041 Planner may game bounded auto-apply by slicing one risky change into many trivial patches](entries/2026-04-17-auto-apply-salami-attack.md)~~
+- ~~[RISK-0042 Obfuscated dangerous patterns may bypass simple keyword scans in bounded auto-apply](entries/2026-04-17-obfuscated-dangerous-pattern-bypass.md)~~
+- ~~[RISK-0043 Detailed repair feedback may still trap the planner in a bounded but wasteful repair loop](entries/2026-04-17-repair-loop-deadlock-after-detailed-feedback.md)~~
+- ~~[RISK-0044 Lightweight structural scan may create founder friction through false positives](entries/2026-04-17-structural-scan-false-positive-friction.md)~~
+- [RISK-0045 Static protected-path lists may miss semantically central files outside the initial trust boundary](entries/2026-04-17-shadow-centrality-beyond-protected-paths.md)
+- [RISK-0046 Lease TTL may starve long-running work or delay reclaim when ownership lasts too long](entries/2026-04-17-lease-starvation-and-reclaim-deadlock.md)
+- [RISK-0047 Execution claim acquisition may still depend on store-level serialization without stronger atomic CAS semantics](entries/2026-04-17-atomic-claim-failure.md)
+- [RISK-0048 Reclaim may reopen ownership before old worker side-effects are fully fenced](entries/2026-04-17-reclaim-side-effects-without-fencing.md)

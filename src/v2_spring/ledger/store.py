@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import ast
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 import json
 from pathlib import Path
 import re
+import textwrap
 from typing import Iterator
 from uuid import uuid4
 
@@ -16,6 +18,12 @@ from sqlalchemy.orm import Session, sessionmaker
 from v2_spring.domain.approval import ApprovalStatus, ApprovalView
 from v2_spring.domain.artifact import ArtifactStorageKind, ArtifactType, ArtifactView
 from v2_spring.domain.decision import DecisionKind, DecisionView
+from v2_spring.domain.execution_claim import (
+    ExecutionClaimRefusalCode,
+    ExecutionClaimRefusalView,
+    ExecutionClaimStatus,
+    ExecutionClaimView,
+)
 from v2_spring.domain.founder_intervention import (
     FounderInterventionDigest,
     FounderInterventionView,
@@ -99,6 +107,7 @@ from v2_spring.ledger.models import (
     Base,
     DecisionRecord,
     EventLedgerRecord,
+    ExecutionClaimRecord,
     FounderInterventionRecord,
     LedgerEventType,
     ObservationRecord,
@@ -119,6 +128,7 @@ from v2_spring.planner.proposals import (
     TransportDuplicatePlannerProposalError,
 )
 from v2_spring.runtime import (
+    ContainerizedWorkerPreflightRefusal,
     ContainerizedWorkerReceipt,
     ContainerizedWorkerTimeout,
     IsolatedWorkerReceipt,
@@ -128,6 +138,7 @@ from v2_spring.runtime import (
     apply_patch_strict,
     execute_containerized_worker_proof,
     execute_isolated_worker_proof,
+    reclaim_containerized_worker_execution,
 )
 
 
@@ -148,6 +159,14 @@ class IsolatedWorkerDispatchResult:
     artifacts: list[ArtifactView]
     observation: ObservationView
     receipt: IsolatedWorkerReceipt | ContainerizedWorkerReceipt
+
+
+class ExecutionClaimConflictError(PermissionError):
+    """Raised when a live execution claim blocks a new dispatch or mutation."""
+
+    def __init__(self, refusal: ExecutionClaimRefusalView) -> None:
+        super().__init__(refusal.message)
+        self.refusal = refusal
 
 
 class LedgerStore:
@@ -171,6 +190,11 @@ class LedgerStore:
             PlannerAttemptOutcome.REJECTED_DUPLICATE_COGNITIVE,
         },
     )
+    _PATCH_AUTO_APPLY_BURST_LIMIT = 2
+    _PATCH_REPAIR_QUOTA_LIMIT = 3
+    _PATCH_POLICY_WINDOW = timedelta(hours=1)
+    _PATCH_AUTO_APPLY_MAX_CHANGED_LINES = 10
+    _EXECUTION_LEASE_SLACK = timedelta(seconds=15)
 
     def __init__(self, database_url: str) -> None:
         self._engine = create_engine(database_url, future=True)
@@ -220,6 +244,342 @@ class LedgerStore:
             raise
         finally:
             session.close()
+
+    @classmethod
+    def _build_execution_claim_ttl(cls, timeout_seconds: int) -> timedelta:
+        return timedelta(seconds=timeout_seconds) + cls._EXECUTION_LEASE_SLACK
+
+    @staticmethod
+    def _coerce_utc_datetime(value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    @classmethod
+    def _to_execution_claim_view(cls, record: ExecutionClaimRecord) -> ExecutionClaimView:
+        return ExecutionClaimView.model_validate(
+            {
+                "id": record.id,
+                "run_id": record.run_id,
+                "task_id": record.task_id,
+                "runtime": record.runtime,
+                "owner": record.owner,
+                "lease_token": record.lease_token,
+                "status": record.status.value,
+                "acquired_at": cls._coerce_utc_datetime(record.acquired_at),
+                "heartbeat_at": cls._coerce_utc_datetime(record.heartbeat_at),
+                "expires_at": cls._coerce_utc_datetime(record.expires_at),
+                "released_at": cls._coerce_utc_datetime(record.released_at),
+                "reclaim_reason": record.reclaim_reason,
+            },
+        )
+
+    @staticmethod
+    def _load_execution_claim(session: Session, run_id: str) -> ExecutionClaimRecord | None:
+        return session.scalar(select(ExecutionClaimRecord).where(ExecutionClaimRecord.run_id == run_id).limit(1))
+
+    def _raise_execution_claim_conflict(self, record: ExecutionClaimRecord, *, mutation_name: str) -> None:
+        claim = self._to_execution_claim_view(record)
+        raise ExecutionClaimConflictError(
+            ExecutionClaimRefusalView(
+                code=ExecutionClaimRefusalCode.ACTIVE_CLAIM_HELD,
+                message=(
+                    f"Run {record.run_id} already has a live execution claim; {mutation_name} is blocked "
+                    f"until the current owner releases or is reclaimed."
+                ),
+                existing_claim=claim,
+            ),
+        )
+
+    def _reclaim_execution_claim_locked(
+        self,
+        *,
+        session: Session,
+        run: RunRecord,
+        claim: ExecutionClaimRecord,
+        reason: str,
+    ) -> ExecutionClaimRecord:
+        now = utc_now()
+        task = session.get(TaskRecord, claim.task_id) if claim.task_id is not None else None
+        hard_reclaim_attempted = False
+        hard_reclaim_succeeded = False
+        if claim.runtime == ExecutionRuntime.CONTAINERIZED_WORKER.value and task is not None:
+            hard_reclaim_attempted = True
+            hard_reclaim_succeeded = reclaim_containerized_worker_execution(
+                execution_context_id=task.execution_context_id,
+            )
+
+        claim.status = ExecutionClaimStatus.RECLAIMED
+        claim.released_at = now
+        claim.reclaim_reason = reason
+        claim.version += 1
+        claim.heartbeat_at = now
+
+        if task is not None and task.status == TaskStatus.RUNNING:
+            task.status = TaskStatus.FAILED
+            task.completed_at = now
+            task.stderr = reason
+            if run.status == RunStatus.RUNNING:
+                run.status = RunStatus.READY
+            session.add(
+                EventLedgerRecord(
+                    run_id=run.id,
+                    event_type=LedgerEventType.TASK_FAILED,
+                    payload={
+                        "task_id": task.id,
+                        "decision_id": task.decision_id,
+                        "execution_context_id": task.execution_context_id,
+                        "status": task.status.value,
+                        "error": reason,
+                        "timed_out": False,
+                        "reclaimed": True,
+                    },
+                ),
+            )
+
+        session.add(
+            EventLedgerRecord(
+                run_id=run.id,
+                event_type=LedgerEventType.EXECUTION_CLAIM_RECLAIMED,
+                payload={
+                    "claim_id": claim.id,
+                    "task_id": claim.task_id,
+                    "runtime": claim.runtime,
+                    "owner": claim.owner,
+                    "reason": reason,
+                    "hard_reclaim_attempted": hard_reclaim_attempted,
+                    "hard_reclaim_succeeded": hard_reclaim_succeeded,
+                },
+            ),
+        )
+        observation = ObservationRecord(
+            run_id=run.id,
+            kind=ObservationKind.SYSTEM_AUDIT,
+            summary="Execution claim was reclaimed after expiry or orphan detection.",
+            details=(
+                f"error_code=execution_claim_reclaimed; claim_id={claim.id}; task_id={claim.task_id}; "
+                f"runtime={claim.runtime}; reason={reason}; hard_reclaim_attempted={hard_reclaim_attempted}; "
+                f"hard_reclaim_succeeded={hard_reclaim_succeeded}."
+            ),
+        )
+        session.add(observation)
+        session.flush()
+        session.add(
+            EventLedgerRecord(
+                run_id=run.id,
+                event_type=LedgerEventType.OBSERVATION_RECORDED,
+                payload={
+                    "observation_id": observation.id,
+                    "kind": observation.kind.value,
+                    "summary": observation.summary,
+                },
+            ),
+        )
+        return claim
+
+    def _ensure_no_live_execution_claim(
+        self,
+        *,
+        session: Session,
+        run: RunRecord,
+        mutation_name: str,
+    ) -> None:
+        claim = self._load_execution_claim(session, run.id)
+        if claim is None or claim.status != ExecutionClaimStatus.ACTIVE:
+            return
+        now = utc_now()
+        claim_expires_at = self._coerce_utc_datetime(claim.expires_at)
+        if claim_expires_at is not None and claim_expires_at <= now:
+            self._reclaim_execution_claim_locked(
+                session=session,
+                run=run,
+                claim=claim,
+                reason=(
+                    f"Execution lease expired before {mutation_name}; the claim was reclaimed pessimistically."
+                ),
+            )
+            return
+        self._raise_execution_claim_conflict(claim, mutation_name=mutation_name)
+
+    def _acquire_execution_claim(
+        self,
+        *,
+        session: Session,
+        run: RunRecord,
+        task: TaskRecord,
+        runtime: ExecutionRuntime,
+        timeout_seconds: int,
+        owner: str,
+    ) -> ExecutionClaimRecord:
+        self._ensure_no_live_execution_claim(
+            session=session,
+            run=run,
+            mutation_name="bounded execution dispatch",
+        )
+        now = utc_now()
+        lease_token = str(uuid4())
+        claim = self._load_execution_claim(session, run.id)
+        if claim is None:
+            claim = ExecutionClaimRecord(
+                run_id=run.id,
+                task_id=task.id,
+                runtime=runtime.value,
+                owner=owner,
+                lease_token=lease_token,
+                status=ExecutionClaimStatus.ACTIVE,
+                acquired_at=now,
+                heartbeat_at=now,
+                expires_at=now + self._build_execution_claim_ttl(timeout_seconds),
+                released_at=None,
+                reclaim_reason=None,
+                version=1,
+            )
+            session.add(claim)
+            session.flush()
+        else:
+            claim.task_id = task.id
+            claim.runtime = runtime.value
+            claim.owner = owner
+            claim.lease_token = lease_token
+            claim.status = ExecutionClaimStatus.ACTIVE
+            claim.acquired_at = now
+            claim.heartbeat_at = now
+            claim.expires_at = now + self._build_execution_claim_ttl(timeout_seconds)
+            claim.released_at = None
+            claim.reclaim_reason = None
+            claim.version += 1
+            session.flush()
+
+        session.add(
+            EventLedgerRecord(
+                run_id=run.id,
+                event_type=LedgerEventType.EXECUTION_CLAIM_ACQUIRED,
+                payload={
+                    "claim_id": claim.id,
+                    "task_id": task.id,
+                    "runtime": runtime.value,
+                    "owner": owner,
+                    "lease_token": lease_token,
+                    "expires_at": claim.expires_at.isoformat(),
+                },
+            ),
+        )
+        observation = ObservationRecord(
+            run_id=run.id,
+            kind=ObservationKind.SYSTEM_AUDIT,
+            summary="Execution claim was acquired for a bounded worker dispatch.",
+            details=(
+                f"error_code=execution_claim_acquired; claim_id={claim.id}; task_id={task.id}; "
+                f"runtime={runtime.value}; owner={owner}; expires_at={claim.expires_at.isoformat()}."
+            ),
+        )
+        session.add(observation)
+        session.flush()
+        session.add(
+            EventLedgerRecord(
+                run_id=run.id,
+                event_type=LedgerEventType.OBSERVATION_RECORDED,
+                payload={
+                    "observation_id": observation.id,
+                    "kind": observation.kind.value,
+                    "summary": observation.summary,
+                },
+            ),
+        )
+        return claim
+
+    def _release_execution_claim(
+        self,
+        *,
+        session: Session,
+        run_id: str,
+        execution_context_id: str,
+        reason: str,
+    ) -> None:
+        claim = self._load_execution_claim(session, run_id)
+        if claim is None:
+            return
+        if claim.status != ExecutionClaimStatus.ACTIVE:
+            return
+        task = session.get(TaskRecord, claim.task_id) if claim.task_id is not None else None
+        if task is None or task.execution_context_id != execution_context_id:
+            return
+        now = utc_now()
+        claim.status = ExecutionClaimStatus.RELEASED
+        claim.released_at = now
+        claim.heartbeat_at = now
+        claim.reclaim_reason = reason
+        claim.version += 1
+        session.add(
+            EventLedgerRecord(
+                run_id=run_id,
+                event_type=LedgerEventType.EXECUTION_CLAIM_RELEASED,
+                payload={
+                    "claim_id": claim.id,
+                    "task_id": claim.task_id,
+                    "runtime": claim.runtime,
+                    "owner": claim.owner,
+                    "reason": reason,
+                },
+            ),
+        )
+        observation = ObservationRecord(
+            run_id=run_id,
+            kind=ObservationKind.SYSTEM_AUDIT,
+            summary="Execution claim was released after bounded execution finished.",
+            details=(
+                f"error_code=execution_claim_released; claim_id={claim.id}; task_id={claim.task_id}; "
+                f"runtime={claim.runtime}; owner={claim.owner}; reason={reason}."
+            ),
+        )
+        session.add(observation)
+        session.flush()
+        session.add(
+            EventLedgerRecord(
+                run_id=run_id,
+                event_type=LedgerEventType.OBSERVATION_RECORDED,
+                payload={
+                    "observation_id": observation.id,
+                    "kind": observation.kind.value,
+                    "summary": observation.summary,
+                },
+            ),
+        )
+
+    def get_execution_claim(self, run_id: str) -> ExecutionClaimView | None:
+        self.ensure_schema()
+        with self.session() as session:
+            claim = self._load_execution_claim(session, run_id)
+            if claim is None:
+                return None
+            return self._to_execution_claim_view(claim)
+
+    def reclaim_execution_claims(self, run_id: str | None = None) -> list[ExecutionClaimView]:
+        self.ensure_schema()
+        with self.session() as session:
+            statement = select(ExecutionClaimRecord).where(ExecutionClaimRecord.status == ExecutionClaimStatus.ACTIVE)
+            if run_id is not None:
+                statement = statement.where(ExecutionClaimRecord.run_id == run_id)
+            claims = list(session.scalars(statement.order_by(ExecutionClaimRecord.acquired_at.asc())).all())
+            reclaimed: list[ExecutionClaimView] = []
+            for claim in claims:
+                run = session.get(RunRecord, claim.run_id)
+                if run is None:
+                    continue
+                claim_expires_at = self._coerce_utc_datetime(claim.expires_at)
+                if claim_expires_at is not None and claim_expires_at > utc_now():
+                    continue
+                reclaimed_record = self._reclaim_execution_claim_locked(
+                    session=session,
+                    run=run,
+                    claim=claim,
+                    reason="Execution lease expired and was reclaimed by the Step 17 reconciliation path.",
+                )
+                reclaimed.append(self._to_execution_claim_view(reclaimed_record))
+            session.flush()
+            return reclaimed
 
     def create_run(self, run_input: RunCreateInput) -> RunView:
         self.ensure_schema()
@@ -370,6 +730,11 @@ class LedgerStore:
                 approval.run_id,
                 mutation_name="approval resolution",
                 allow_during_waiting_approval=True,
+            )
+            self._ensure_no_live_execution_claim(
+                session=session,
+                run=run,
+                mutation_name="approval resolution",
             )
             run.status = RunStatus.READY if approved else RunStatus.REJECTED
 
@@ -699,129 +1064,23 @@ class LedgerStore:
                 raise LookupError(
                     f"Patch intake {patch_intake_id} is missing one of its required run/task/artifact links.",
                 )
-
-            patch_body = Path(patch_artifact.path).read_text(encoding="utf-8")
-            receipt_payload = json.loads(Path(receipt_artifact.path).read_text(encoding="utf-8"))
-            apply_receipt = apply_patch_strict(
-                workspace=Path(patch_intake.source_workspace),
-                patch_body=patch_body,
-                patch_sha256=patch_intake.patch_sha256,
-                changed_files=list(patch_intake.changed_files),
-                base_file_hashes=dict(receipt_payload.get("base_file_hashes", {})),
+            self._ensure_no_live_execution_claim(
+                session=session,
+                run=run,
+                mutation_name="patch approval",
             )
-
-            validation_artifact = self._persist_validation_receipt_artifact(
+            message, _, _ = self._apply_patch_intake_resolution(
                 session=session,
                 run=run,
                 task=task,
                 patch_intake=patch_intake,
                 patch_artifact=patch_artifact,
-                receipt=apply_receipt,
+                receipt_artifact=receipt_artifact,
+                approval_mode="founder",
             )
-            patch_intake.validation_artifact_id = validation_artifact.id
-            patch_intake.validation_command = apply_receipt.validation_command
-
-            if apply_receipt.outcome == PatchApplyOutcome.APPLIED:
-                patch_intake.status = PatchIntakeStatus.APPLIED
-                patch_intake.resolved_at = apply_receipt.finished_at
-                patch_intake.resolution_code = PatchResolutionCode.FOUNDER_APPROVED
-                patch_intake.resolution_reason = apply_receipt.summary
-                run.status = RunStatus.COMPLETED
-                session.add(
-                    EventLedgerRecord(
-                        run_id=run.id,
-                        event_type=LedgerEventType.PATCH_INTAKE_APPLIED,
-                        payload={
-                            "patch_intake_id": patch_intake.id,
-                            "task_id": task.id,
-                            "patch_artifact_id": patch_artifact.id,
-                            "validation_artifact_id": validation_artifact.id,
-                            "resolution_code": patch_intake.resolution_code.value,
-                        },
-                    ),
-                )
-                observation = ObservationRecord(
-                    run_id=run.id,
-                    kind=ObservationKind.SYSTEM_AUDIT,
-                    summary="Founder approved the patch intake and strict apply succeeded.",
-                    details=(
-                        f"error_code={patch_intake.resolution_code.value}; "
-                        f"patch_intake_id={patch_intake.id}; "
-                        f"validation_artifact_id={validation_artifact.id}; "
-                        f"validation_command={apply_receipt.validation_command}."
-                    ),
-                )
-                session.add(observation)
-                session.flush()
-                session.add(
-                    EventLedgerRecord(
-                        run_id=run.id,
-                        event_type=LedgerEventType.OBSERVATION_RECORDED,
-                        payload={
-                            "observation_id": observation.id,
-                            "kind": observation.kind.value,
-                            "summary": observation.summary,
-                        },
-                    ),
-                )
-                session.flush()
-                return PatchResolutionView(
-                    intake=self._to_patch_intake_view(patch_intake),
-                    message="Patch was applied strictly and the run is now completed.",
-                )
-
-            resolution_map = {
-                PatchApplyOutcome.BASE_HASH_CONFLICT: PatchResolutionCode.BASE_HASH_CONFLICT,
-                PatchApplyOutcome.APPLY_CHECK_FAILED: PatchResolutionCode.APPLY_CHECK_FAILED,
-                PatchApplyOutcome.VALIDATION_FAILED: PatchResolutionCode.VALIDATION_FAILED,
-            }
-            patch_intake.status = PatchIntakeStatus.REJECTED
-            patch_intake.resolved_at = apply_receipt.finished_at
-            patch_intake.resolution_code = resolution_map[apply_receipt.outcome]
-            patch_intake.resolution_reason = apply_receipt.summary
-            patch_intake.validation_command = apply_receipt.validation_command
-            run.status = RunStatus.READY
-            session.add(
-                EventLedgerRecord(
-                    run_id=run.id,
-                    event_type=LedgerEventType.PATCH_INTAKE_REJECTED,
-                    payload={
-                        "patch_intake_id": patch_intake.id,
-                        "task_id": task.id,
-                        "patch_artifact_id": patch_artifact.id,
-                        "validation_artifact_id": validation_artifact.id,
-                        "resolution_code": patch_intake.resolution_code.value,
-                    },
-                ),
-            )
-            observation = ObservationRecord(
-                run_id=run.id,
-                kind=ObservationKind.SYSTEM_AUDIT,
-                summary="Founder approved the patch review, but intake was rejected by strict apply or validation.",
-                details=(
-                    f"error_code={patch_intake.resolution_code.value}; "
-                    f"patch_intake_id={patch_intake.id}; "
-                    f"validation_artifact_id={validation_artifact.id}; "
-                    f"reason={patch_intake.resolution_reason}."
-                ),
-            )
-            session.add(observation)
-            session.flush()
-            session.add(
-                EventLedgerRecord(
-                    run_id=run.id,
-                    event_type=LedgerEventType.OBSERVATION_RECORDED,
-                    payload={
-                        "observation_id": observation.id,
-                        "kind": observation.kind.value,
-                        "summary": observation.summary,
-                    },
-                ),
-            )
-            session.flush()
             return PatchResolutionView(
                 intake=self._to_patch_intake_view(patch_intake),
-                message=patch_intake.resolution_reason or "Patch intake was rejected.",
+                message=message,
             )
 
     def reject_patch_intake(self, patch_intake_id: str, *, reason: str) -> PatchResolutionView:
@@ -840,6 +1099,11 @@ class LedgerStore:
             run = session.get(RunRecord, patch_intake.run_id)
             if run is None:
                 raise LookupError(f"Run {patch_intake.run_id} was not found.")
+            self._ensure_no_live_execution_claim(
+                session=session,
+                run=run,
+                mutation_name="patch rejection",
+            )
 
             patch_intake.status = PatchIntakeStatus.REJECTED
             patch_intake.resolved_at = utc_now()
@@ -948,6 +1212,12 @@ class LedgerStore:
                     .where(PatchIntakeRecord.run_id == run_id)
                     .order_by(PatchIntakeRecord.created_at.asc(), PatchIntakeRecord.id.asc()),
                 ).all(),
+            )
+            execution_claim = self._load_execution_claim(session, run_id)
+            active_execution_claim = (
+                self._to_execution_claim_view(execution_claim)
+                if execution_claim is not None and execution_claim.status == ExecutionClaimStatus.ACTIVE
+                else None
             )
             founder_intervention_records = list(
                 session.scalars(
@@ -1110,6 +1380,12 @@ class LedgerStore:
                     .order_by(PatchIntakeRecord.created_at.asc(), PatchIntakeRecord.id.asc()),
                 ).all(),
             )
+            execution_claim = self._load_execution_claim(session, run_id)
+            active_execution_claim = (
+                self._to_execution_claim_view(execution_claim)
+                if execution_claim is not None and execution_claim.status == ExecutionClaimStatus.ACTIVE
+                else None
+            )
 
             pending_approval = next(
                 (approval for approval in reversed(approvals) if approval.status == ApprovalStatus.PENDING),
@@ -1182,6 +1458,9 @@ class LedgerStore:
                 "pending_patch_intake": (
                     pending_patch_intake.model_dump(mode="json") if pending_patch_intake else None
                 ),
+                "active_execution_claim": (
+                    active_execution_claim.model_dump(mode="json") if active_execution_claim else None
+                ),
                 "latest_founder_intervention_summary": latest_founder_intervention_summary,
                 "latest_rejection_reason": latest_rejection_reason,
                 "latest_decision_summary": latest_decision_summary,
@@ -1220,6 +1499,7 @@ class LedgerStore:
                 pending_approval=pending_approval,
                 pending_founder_escalation=pending_founder_escalation,
                 pending_patch_intake=self._build_pending_patch_intake(pending_patch_intake),
+                active_execution_claim=active_execution_claim,
                 latest_founder_intervention_summary=latest_founder_intervention_summary,
                 latest_rejection_reason=latest_rejection_reason,
                 latest_decision_summary=latest_decision_summary,
@@ -1292,6 +1572,7 @@ class LedgerStore:
             pending_approval=snapshot.pending_approval,
             pending_founder_escalation=snapshot.pending_founder_escalation,
             pending_patch_intake=snapshot.pending_patch_intake,
+            active_execution_claim=snapshot.active_execution_claim,
             planner_budget_remaining=snapshot.planner_budget_remaining,
             planner_phase_exhausted=snapshot.planner_phase_exhausted,
             planner_stale_quota_remaining=snapshot.planner_stale_quota_remaining,
@@ -2002,28 +2283,72 @@ class LedgerStore:
 
     def build_failure_report(self, run_id: str) -> FailureReportView | None:
         """Return the latest sanitized execution failure summary for planner context."""
+        self.ensure_schema()
+        with self.session() as session:
+            failed_task_records = list(
+                session.scalars(
+                    select(TaskRecord)
+                    .where(TaskRecord.run_id == run_id)
+                    .where(TaskRecord.status == TaskStatus.FAILED)
+                    .order_by(TaskRecord.completed_at.asc(), TaskRecord.id.asc()),
+                ).all(),
+            )
+            rejected_patch_records = list(
+                session.scalars(
+                    select(PatchIntakeRecord)
+                    .where(PatchIntakeRecord.run_id == run_id)
+                    .where(PatchIntakeRecord.status == PatchIntakeStatus.REJECTED)
+                    .order_by(PatchIntakeRecord.resolved_at.asc(), PatchIntakeRecord.id.asc()),
+                ).all(),
+            )
 
-        replay = self.build_run_replay(run_id)
-        failed_tasks = [task for task in replay.tasks if task.task.status == TaskStatus.FAILED]
-        if not failed_tasks:
-            return None
+            latest_failed_task = failed_task_records[-1] if failed_task_records else None
+            latest_rejected_patch = rejected_patch_records[-1] if rejected_patch_records else None
 
-        latest_failed = failed_tasks[-1]
-        failure_text = latest_failed.task.stderr or latest_failed.task.failure_hint or latest_failed.task.summary
+            if latest_failed_task is None and latest_rejected_patch is None:
+                return None
+
+            if latest_rejected_patch is not None and (
+                latest_failed_task is None
+                or (latest_rejected_patch.resolved_at or latest_rejected_patch.created_at)
+                >= (latest_failed_task.completed_at or latest_failed_task.created_at)
+            ):
+                return self._build_patch_failure_report(
+                    session=session,
+                    run_id=run_id,
+                    rejected_patch=latest_rejected_patch,
+                    rejected_patch_records=rejected_patch_records,
+                )
+
+            assert latest_failed_task is not None
+            return self._build_task_failure_report(
+                run_id=run_id,
+                latest_failed_task=latest_failed_task,
+                failed_task_records=failed_task_records,
+            )
+
+    def _build_task_failure_report(
+        self,
+        *,
+        run_id: str,
+        latest_failed_task: TaskRecord,
+        failed_task_records: list[TaskRecord],
+    ) -> FailureReportView:
+        failure_text = latest_failed_task.stderr or latest_failed_task.failure_hint or latest_failed_task.summary
         failure_class, error_code = self._classify_failure(failure_text)
         deterministic = failure_class == FailureClass.DETERMINISTIC_RUNTIME
         normalized_signature = self._build_failure_signature(
             error_code=error_code,
-            task_kind=latest_failed.task.kind.value,
+            task_kind=latest_failed_task.kind.value,
             failure_text=failure_text,
         )
         streak = 0
-        for task_replay in reversed(failed_tasks):
-            comparison_text = task_replay.task.stderr or task_replay.task.failure_hint or task_replay.task.summary
-            comparison_class, comparison_error_code = self._classify_failure(comparison_text)
+        for task_record in reversed(failed_task_records):
+            comparison_text = task_record.stderr or task_record.failure_hint or task_record.summary
+            _, comparison_error_code = self._classify_failure(comparison_text)
             comparison_signature = self._build_failure_signature(
                 error_code=comparison_error_code,
-                task_kind=task_replay.task.kind.value,
+                task_kind=task_record.kind.value,
                 failure_text=comparison_text,
             )
             if comparison_signature != normalized_signature:
@@ -2031,7 +2356,7 @@ class LedgerStore:
             streak += 1
 
         proposals = self.list_planner_proposals_for_run(run_id)
-        failure_anchor = latest_failed.task.started_at or latest_failed.task.created_at
+        failure_anchor = latest_failed_task.started_at or latest_failed_task.created_at
         latest_proposal = next(
             (
                 proposal
@@ -2058,12 +2383,94 @@ class LedgerStore:
                 else None
             ),
             observed_outcome=self._sanitize_planner_text(
-                latest_failed.task.stderr or latest_failed.task.summary,
+                latest_failed_task.stderr or latest_failed_task.summary,
                 limit=500,
             )
             or "Task failed without a normalized failure hint.",
             repeated_failure_streak=max(streak, 1),
             deterministic=deterministic,
+        )
+
+    def _build_patch_failure_report(
+        self,
+        *,
+        session: Session,
+        run_id: str,
+        rejected_patch: PatchIntakeRecord,
+        rejected_patch_records: list[PatchIntakeRecord],
+    ) -> FailureReportView:
+        failure_text = rejected_patch.resolution_reason or rejected_patch.summary
+        error_code = (
+            rejected_patch.resolution_code.value
+            if rejected_patch.resolution_code is not None
+            else "patch_rejected"
+        )
+        normalized_signature = self._build_failure_signature(
+            error_code=error_code,
+            task_kind="patch_intake",
+            failure_text=failure_text,
+        )
+        streak = 0
+        for record in reversed(rejected_patch_records):
+            comparison_signature = self._build_failure_signature(
+                error_code=record.resolution_code.value if record.resolution_code is not None else "patch_rejected",
+                task_kind="patch_intake",
+                failure_text=record.resolution_reason or record.summary,
+            )
+            if comparison_signature != normalized_signature:
+                break
+            streak += 1
+
+        proposals = self.list_planner_proposals_for_run(run_id)
+        failure_anchor = rejected_patch.resolved_at or rejected_patch.created_at
+        latest_proposal = next(
+            (
+                proposal
+                for proposal in reversed(proposals)
+                if proposal.created_at <= failure_anchor
+            ),
+            None,
+        )
+        if latest_proposal is None:
+            latest_proposal = proposals[-1] if proposals else None
+
+        short_traceback = None
+        observed_outcome = self._sanitize_planner_text(rejected_patch.resolution_reason or rejected_patch.summary, limit=500)
+        if rejected_patch.validation_artifact_id is not None:
+            validation_artifact = session.get(ArtifactRecord, rejected_patch.validation_artifact_id)
+            if validation_artifact is not None and Path(validation_artifact.path).exists():
+                payload = json.loads(Path(validation_artifact.path).read_text(encoding="utf-8"))
+                short_traceback = self._sanitize_planner_text(
+                    payload.get("validation_stderr_preview")
+                    or payload.get("apply_check_stderr")
+                    or payload.get("validation_stdout_preview")
+                    or rejected_patch.resolution_reason
+                    or rejected_patch.summary,
+                    limit=500,
+                )
+                observed_outcome = self._sanitize_planner_text(
+                    payload.get("summary") or rejected_patch.resolution_reason or rejected_patch.summary,
+                    limit=500,
+                )
+
+        return FailureReportView(
+            failure_class=FailureClass.DETERMINISTIC_RUNTIME,
+            error_code=error_code,
+            short_traceback=short_traceback,
+            normalized_failure_signature=normalized_signature,
+            previous_rationale=(
+                self._sanitize_planner_text(latest_proposal.rationale, limit=4000)
+                if latest_proposal is not None
+                else None
+            ),
+            previous_expected_outcome=(
+                self._sanitize_planner_text(latest_proposal.expected_outcome, limit=4000)
+                if latest_proposal is not None
+                else None
+            ),
+            observed_outcome=observed_outcome or "Patch intake was rejected without a detailed validation receipt.",
+            repeated_failure_streak=max(streak, 1),
+            deterministic=True,
         )
 
     def build_planner_context(self, run_id: str) -> PlannerContextWindow:
@@ -2339,6 +2746,14 @@ class LedgerStore:
                 raise ValueError(
                     f"Planner escalation {target_escalation_id} already has a founder reply recorded.",
                 )
+            run = session.get(RunRecord, run_id)
+            if run is None:
+                raise LookupError(f"Run {run_id} was not found.")
+            self._ensure_no_live_execution_claim(
+                session=session,
+                run=run,
+                mutation_name="founder reply",
+            )
 
             record = FounderInterventionRecord(
                 run_id=run_id,
@@ -2519,6 +2934,14 @@ class LedgerStore:
             )
             session.add(task)
             session.flush()
+            self._acquire_execution_claim(
+                session=session,
+                run=run,
+                task=task,
+                runtime=ExecutionRuntime.ISOLATED_WORKER,
+                timeout_seconds=timeout_seconds,
+                owner="isolated_worker_dispatch",
+            )
             session.add(
                 EventLedgerRecord(
                     run_id=run.id,
@@ -2619,13 +3042,6 @@ class LedgerStore:
 
         with self.session() as session:
             run = self._get_run_for_execution(session, run_id)
-            existing_task_count = session.scalar(
-                select(TaskRecord).where(TaskRecord.run_id == run.id).limit(1),
-            )
-            if existing_task_count is not None:
-                raise PermissionError(
-                    f"Run {run_id} already has execution evidence and cannot dispatch another proof in Step 12-b.",
-                )
 
             decision = DecisionRecord(
                 run_id=run.id,
@@ -2667,6 +3083,14 @@ class LedgerStore:
             )
             session.add(task)
             session.flush()
+            self._acquire_execution_claim(
+                session=session,
+                run=run,
+                task=task,
+                runtime=ExecutionRuntime.CONTAINERIZED_WORKER,
+                timeout_seconds=timeout_seconds,
+                owner="containerized_worker_dispatch",
+            )
             session.add(
                 EventLedgerRecord(
                     run_id=run.id,
@@ -2816,13 +3240,6 @@ class LedgerStore:
 
         with self.session() as session:
             run = self._get_run_for_execution(session, run_id)
-            existing_task_count = session.scalar(
-                select(TaskRecord).where(TaskRecord.run_id == run.id).limit(1),
-            )
-            if existing_task_count is not None:
-                raise PermissionError(
-                    f"Run {run_id} already has execution evidence and cannot dispatch another proof in Step 13.",
-                )
 
             decision = DecisionRecord(
                 run_id=run.id,
@@ -2909,6 +3326,23 @@ class LedgerStore:
                 timeout_seconds=timeout_seconds,
                 execution_context_id=execution_context_id,
                 run_id=run_id,
+                requirements=requirements,
+            )
+        except ContainerizedWorkerPreflightRefusal as exc:
+            summary = f"Containerized worker preflight refusal: {exc}"
+            synthetic_receipt = self._build_failed_containerized_receipt(
+                workspace=workspace,
+                execution_context_id=execution_context_id,
+                timeout_seconds=timeout_seconds,
+                summary=summary,
+                preflight_refusal_code=exc.refusal_code,
+            )
+            return self._finalize_failed_isolated_task(
+                run_id=run_id,
+                task_id=task_id,
+                artifact_root=artifact_root,
+                receipt=synthetic_receipt,
+                failure_summary=summary,
             )
         except (ContainerizedWorkerTimeout, FileNotFoundError, NotADirectoryError) as exc:
             synthetic_receipt = self._build_failed_containerized_receipt(
@@ -3062,6 +3496,11 @@ class LedgerStore:
 
     @staticmethod
     def _build_progress_execution_summary(snapshot: RunSnapshotView) -> str | None:
+        if snapshot.active_execution_claim is not None and snapshot.latest_task is None:
+            return (
+                f"Execution lease is held by {snapshot.active_execution_claim.owner} "
+                f"until {snapshot.active_execution_claim.expires_at.isoformat()}."
+            )
         latest_task = snapshot.latest_task
         if latest_task is None:
             return None
@@ -3117,6 +3556,17 @@ class LedgerStore:
                 snapshot.pending_approval.reason,
                 "Approve or reject the pending approval gate.",
             )
+        if snapshot.active_execution_claim is not None:
+            return (
+                ProgressSurfaceStatus.RUNNING_EXECUTION,
+                ProgressActionOwner.EXECUTOR,
+                "A bounded execution lease is currently active.",
+                (
+                    f"{snapshot.active_execution_claim.runtime} owned by {snapshot.active_execution_claim.owner} "
+                    f"until {snapshot.active_execution_claim.expires_at.isoformat()}."
+                ),
+                "Wait for execution to finish or reconcile the claim if the lease has expired.",
+            )
         if snapshot.run.status == RunStatus.SUSPENDED:
             return (
                 ProgressSurfaceStatus.SUSPENDED_ON_TIMEOUT,
@@ -3138,8 +3588,16 @@ class LedgerStore:
                 ProgressSurfaceStatus.RUNNING_EXECUTION,
                 ProgressActionOwner.EXECUTOR,
                 "Bounded execution is currently running.",
-                snapshot.latest_task.summary if snapshot.latest_task is not None else None,
-                "Wait for execution to finish or inspect the current task output.",
+                (
+                    snapshot.latest_task.summary
+                    if snapshot.latest_task is not None
+                    else (
+                        f"Execution lease is held by {snapshot.active_execution_claim.owner}."
+                        if snapshot.active_execution_claim is not None
+                        else None
+                    )
+                ),
+                "Wait for execution to finish or inspect the current task output or lease state.",
             )
         if snapshot.run.status == RunStatus.COMPLETED:
             return (
@@ -3195,6 +3653,21 @@ class LedgerStore:
                 purpose="Review the full bounded execution and governance narrative.",
             ),
         ]
+        if snapshot.active_execution_claim is not None:
+            commands.extend(
+                [
+                    ProgressCommandHintView(
+                        label="Claim inspect",
+                        command=f"v2-spring task claim {run_id}",
+                        purpose="Inspect the current execution lease owner and expiry window.",
+                    ),
+                    ProgressCommandHintView(
+                        label="Claim reconcile",
+                        command=f"v2-spring task reconcile-claims {run_id}",
+                        purpose="Reclaim an expired execution lease and record the result as typed audit evidence.",
+                    ),
+                ],
+            )
         if surface_status == ProgressSurfaceStatus.WAITING_ON_APPROVAL and snapshot.pending_approval is not None:
             commands.extend(
                 [
@@ -3705,11 +4178,34 @@ class LedgerStore:
         execution_context_id: str,
         timeout_seconds: int,
         summary: str,
+        preflight_refusal_code: str | None = None,
     ) -> ContainerizedWorkerReceipt:
         now = utc_now()
+        image = "unavailable"
+        base_image_reference: str | None = None
+        metadata_registry_path: str | None = None
+        metadata_registry_schema_version: int | None = None
+        metadata_registry_checksum: str | None = None
+        capability_manifest_tools: list[str] = []
+        try:
+            from v2_spring.runtime.worker_metadata import load_worker_metadata_registry
+
+            metadata_registry = load_worker_metadata_registry()
+            metadata_registry_path = metadata_registry.path
+            metadata_registry_schema_version = metadata_registry.registry.schema_version
+            metadata_registry_checksum = metadata_registry.checksum
+            manifest = metadata_registry.registry.runtimes.get("containerized_worker")
+            if manifest is not None:
+                image = manifest.worker_image_tag
+                base_image_reference = manifest.base_image_reference
+                capability_manifest_tools = list(manifest.required_tools)
+        except Exception:
+            pass
         return ContainerizedWorkerReceipt(
             execution_context_id=execution_context_id,
-            image="unavailable",
+            image=image,
+            image_digest=None,
+            base_image_reference=base_image_reference,
             container_name=f"v2-spring-worker-{execution_context_id[:12]}",
             command=f"containerized_worker_proof --workspace {workspace}",
             source_workspace=str(workspace),
@@ -3719,6 +4215,14 @@ class LedgerStore:
             timeout_seconds=timeout_seconds,
             returncode=None,
             timed_out=False,
+            metadata_registry_path=metadata_registry_path,
+            metadata_registry_schema_version=metadata_registry_schema_version,
+            metadata_registry_checksum=metadata_registry_checksum,
+            preflight_strategy="static_manifest",
+            preflight_refusal_code=preflight_refusal_code,
+            dynamic_check_performed=False,
+            dynamic_check_tools=[],
+            capability_manifest_tools=capability_manifest_tools,
             stdout_preview="",
             stderr_preview=summary,
             stdout_bytes=0,
@@ -3777,6 +4281,12 @@ class LedgerStore:
             task.completed_at = receipt.finished_at
             task.status = TaskStatus.FAILED
             run.status = RunStatus.FAILED
+            self._release_execution_claim(
+                session=session,
+                run_id=run.id,
+                execution_context_id=receipt.execution_context_id,
+                reason="execution_failed",
+            )
 
             receipt_artifact = ArtifactRecord(
                 run_id=run.id,
@@ -3890,8 +4400,16 @@ class LedgerStore:
                 task.completed_at = receipt.finished_at
                 task.status = TaskStatus.COMPLETED
                 run.status = RunStatus.READY
+                self._release_execution_claim(
+                    session=session,
+                    run_id=run.id,
+                    execution_context_id=receipt.execution_context_id,
+                    reason="execution_completed",
+                )
 
-                patch_warnings, risk_class, auto_apply_eligible = self._build_patch_review_policy(
+                patch_warnings, risk_class, auto_apply_eligible, patch_summary = self._build_patch_review_policy(
+                    session=session,
+                    run_id=run.id,
                     patch_body=receipt.patch_body or "",
                     changed_files=receipt.changed_files,
                 )
@@ -3934,9 +4452,7 @@ class LedgerStore:
                     patch_artifact_id=patch_artifact.id,
                     receipt_artifact_id=receipt_artifact.id,
                     status=PatchIntakeStatus.PENDING,
-                    summary=(
-                        f"Founder review is required before applying a patch touching {len(receipt.changed_files)} file(s)."
-                    ),
+                    summary=patch_summary,
                     source_workspace=receipt.source_workspace,
                     changed_files=receipt.changed_files,
                     touched_file_count=len(receipt.changed_files),
@@ -3949,17 +4465,7 @@ class LedgerStore:
                 session.add(patch_intake)
                 session.flush()
 
-                observation = ObservationRecord(
-                    run_id=run.id,
-                    kind=ObservationKind.TASK_EXECUTION,
-                    summary=f"{runtime_phrase} completed and is waiting on founder patch review.",
-                    details=(
-                        f"Task {task.id} produced patch artifact {patch_artifact.id}, receipt artifact {receipt_artifact.id}, "
-                        f"and patch intake {patch_intake.id}. Changed files: {', '.join(receipt.changed_files) if receipt.changed_files else '-'}."
-                    ),
-                )
-                session.add(observation)
-                session.flush()
+                observation: ObservationRecord | None = None
 
                 for artifact in (patch_artifact, receipt_artifact):
                     session.add(
@@ -4007,23 +4513,95 @@ class LedgerStore:
                         },
                     ),
                 )
-                session.add(
-                    EventLedgerRecord(
+                extra_artifacts: list[ArtifactView] = []
+                if patch_intake.auto_apply_eligible:
+                    try:
+                        _, observation, validation_artifact = self._apply_patch_intake_resolution(
+                            session=session,
+                            run=run,
+                            task=task,
+                            patch_intake=patch_intake,
+                            patch_artifact=patch_artifact,
+                            receipt_artifact=receipt_artifact,
+                            approval_mode="auto",
+                        )
+                        extra_artifacts.append(self._to_artifact_view(validation_artifact))
+                    except Exception as exc:
+                        observation = ObservationRecord(
+                            run_id=run.id,
+                            kind=ObservationKind.SYSTEM_AUDIT,
+                            summary="Auto-apply candidate fell back to founder review after an internal gate error.",
+                            details=(
+                                f"error_code=auto_apply_internal_fallback; "
+                                f"patch_intake_id={patch_intake.id}; "
+                                f"reason={exc}."
+                            ),
+                        )
+                        session.add(observation)
+                        session.flush()
+                        session.add(
+                            EventLedgerRecord(
+                                run_id=run.id,
+                                event_type=LedgerEventType.OBSERVATION_RECORDED,
+                                payload={
+                                    "observation_id": observation.id,
+                                    "kind": observation.kind.value,
+                                    "summary": observation.summary,
+                                },
+                            ),
+                        )
+                        observation = ObservationRecord(
+                            run_id=run.id,
+                            kind=ObservationKind.TASK_EXECUTION,
+                            summary=f"{runtime_phrase} completed and is waiting on founder patch review.",
+                            details=(
+                                f"Task {task.id} produced patch artifact {patch_artifact.id}, receipt artifact {receipt_artifact.id}, "
+                                f"and patch intake {patch_intake.id}. Changed files: {', '.join(receipt.changed_files) if receipt.changed_files else '-'}."
+                            ),
+                        )
+                        session.add(observation)
+                        session.flush()
+                        session.add(
+                            EventLedgerRecord(
+                                run_id=run.id,
+                                event_type=LedgerEventType.OBSERVATION_RECORDED,
+                                payload={
+                                    "observation_id": observation.id,
+                                    "kind": observation.kind.value,
+                                    "summary": observation.summary,
+                                },
+                            ),
+                        )
+                else:
+                    observation = ObservationRecord(
                         run_id=run.id,
-                        event_type=LedgerEventType.OBSERVATION_RECORDED,
-                        payload={
-                            "observation_id": observation.id,
-                            "kind": observation.kind.value,
-                            "summary": observation.summary,
-                        },
-                    ),
-                )
+                        kind=ObservationKind.TASK_EXECUTION,
+                        summary=f"{runtime_phrase} completed and is waiting on founder patch review.",
+                        details=(
+                            f"Task {task.id} produced patch artifact {patch_artifact.id}, receipt artifact {receipt_artifact.id}, "
+                            f"and patch intake {patch_intake.id}. Changed files: {', '.join(receipt.changed_files) if receipt.changed_files else '-'}."
+                        ),
+                    )
+                    session.add(observation)
+                    session.flush()
+                    session.add(
+                        EventLedgerRecord(
+                            run_id=run.id,
+                            event_type=LedgerEventType.OBSERVATION_RECORDED,
+                            payload={
+                                "observation_id": observation.id,
+                                "kind": observation.kind.value,
+                                "summary": observation.summary,
+                            },
+                        ),
+                    )
                 session.flush()
                 return IsolatedWorkerDispatchResult(
                     task=self._to_task_view(task),
                     artifacts=[
                         self._to_artifact_view(patch_artifact),
                         self._to_artifact_view(receipt_artifact),
+                        *extra_artifacts,
                     ],
                     observation=self._to_observation_view(observation),
                     receipt=receipt,
@@ -4035,12 +4613,14 @@ class LedgerStore:
                 receipt_path.unlink()
             raise
 
-    @staticmethod
     def _build_patch_review_policy(
+        self,
         *,
+        session: Session,
+        run_id: str,
         patch_body: str,
         changed_files: list[str],
-    ) -> tuple[list[PatchReviewWarningView], PatchRiskClass, bool]:
+    ) -> tuple[list[PatchReviewWarningView], PatchRiskClass, bool, str]:
         warnings: list[PatchReviewWarningView] = []
         lowered_patch = patch_body.lower()
         danger_terms = (
@@ -4059,18 +4639,21 @@ class LedgerStore:
                     message="Dangerous execution keywords were detected in the patch body.",
                 ),
             )
-        sensitive_prefixes = (".github/workflows/", ".env", "pyproject.toml", "src/v2_spring/ledger/")
-        if any(
-            changed_file == prefix or changed_file.startswith(prefix)
-            for changed_file in changed_files
-            for prefix in sensitive_prefixes
-        ):
+        if self._touches_sensitive_path(changed_files):
             warnings.append(
                 PatchReviewWarningView(
                     code=PatchWarningCode.SENSITIVE_PATH,
                     message="The patch touches a sensitive path and should be reviewed carefully.",
                 ),
             )
+        if self._touches_central_file(changed_files):
+            warnings.append(
+                PatchReviewWarningView(
+                    code=PatchWarningCode.CENTRAL_FILE,
+                    message="The patch touches a protected central file and must stay founder-reviewed.",
+                ),
+            )
+        warnings.extend(self._scan_patch_structural_risks(patch_body))
         if len(changed_files) >= 4:
             warnings.append(
                 PatchReviewWarningView(
@@ -4078,22 +4661,258 @@ class LedgerStore:
                     message="The patch touches several files and may be too broad for a trivial founder review.",
                 ),
             )
-        if len(patch_body.encode("utf-8")) >= 12000:
+        lines_added, lines_removed = self._count_patch_lines(patch_body)
+        changed_line_total = lines_added + lines_removed
+        if len(patch_body.encode("utf-8")) >= 12000 or changed_line_total > self._PATCH_AUTO_APPLY_MAX_CHANGED_LINES:
             warnings.append(
                 PatchReviewWarningView(
                     code=PatchWarningCode.LARGE_PATCH,
-                    message="The patch is large and may need to be split or reviewed through the raw diff view.",
+                    message=(
+                        "The patch is large for bounded auto-apply and should be reviewed through the inline diff."
+                    ),
+                ),
+            )
+        if self._recent_auto_apply_burst_detected(session=session, run_id=run_id, changed_files=changed_files):
+            warnings.append(
+                PatchReviewWarningView(
+                    code=PatchWarningCode.AUTO_APPLY_BURST,
+                    message=(
+                        "Recent auto-apply activity already touched this file or module repeatedly, "
+                        "so founder review is required."
+                    ),
                 ),
             )
 
-        if any(warning.code in {PatchWarningCode.DANGEROUS_KEYWORD, PatchWarningCode.SENSITIVE_PATH} for warning in warnings):
+        blocking_codes = {
+            PatchWarningCode.DANGEROUS_KEYWORD,
+            PatchWarningCode.SENSITIVE_PATH,
+            PatchWarningCode.CENTRAL_FILE,
+            PatchWarningCode.AUTO_APPLY_BURST,
+            PatchWarningCode.STRUCTURAL_DANGER,
+        }
+        if any(warning.code in blocking_codes for warning in warnings):
             risk_class = PatchRiskClass.HIGH
         elif warnings:
             risk_class = PatchRiskClass.MEDIUM
         else:
             risk_class = PatchRiskClass.LOW
-        auto_apply_eligible = risk_class == PatchRiskClass.LOW and len(changed_files) <= 1
-        return warnings, risk_class, auto_apply_eligible
+
+        auto_apply_eligible = (
+            risk_class == PatchRiskClass.LOW
+            and len(changed_files) == 1
+            and changed_line_total <= self._PATCH_AUTO_APPLY_MAX_CHANGED_LINES
+        )
+        summary = self._build_patch_intake_summary(
+            warnings=warnings,
+            changed_files=changed_files,
+            auto_apply_eligible=auto_apply_eligible,
+        )
+        return warnings, risk_class, auto_apply_eligible, summary
+
+    @classmethod
+    def _touches_sensitive_path(cls, changed_files: list[str]) -> bool:
+        sensitive_prefixes = (
+            ".github/workflows/",
+            ".env",
+            "pyproject.toml",
+            "src/v2_spring/ledger/",
+        )
+        return any(
+            changed_file == prefix or changed_file.startswith(prefix)
+            for changed_file in changed_files
+            for prefix in sensitive_prefixes
+        )
+
+    @classmethod
+    def _touches_central_file(cls, changed_files: list[str]) -> bool:
+        protected_prefixes = (
+            "src/v2_spring/domain/",
+            "src/v2_spring/planner/",
+            "src/v2_spring/runtime/",
+        )
+        protected_names = {"base.py", "constants.py", "config.py", "settings.py"}
+        for changed_file in changed_files:
+            normalized = changed_file.strip()
+            if any(normalized.startswith(prefix) for prefix in protected_prefixes):
+                return True
+            if Path(normalized).name in protected_names:
+                return True
+        return False
+
+    @classmethod
+    def _scan_patch_structural_risks(cls, patch_body: str) -> list[PatchReviewWarningView]:
+        added_source = cls._extract_added_python_source(patch_body)
+        if not added_source:
+            return []
+        warnings: list[PatchReviewWarningView] = []
+        try:
+            tree = ast.parse(added_source)
+        except SyntaxError:
+            if re.search(r"getattr\(\s*(os|subprocess|shutil|builtins)\s*,", added_source):
+                warnings.append(
+                    PatchReviewWarningView(
+                        code=PatchWarningCode.STRUCTURAL_WARNING,
+                        message="Dynamic attribute access against a sensitive module was detected in added code.",
+                    ),
+                )
+            return warnings
+
+        blocked_hits: set[str] = set()
+        warning_hits: set[str] = set()
+
+        class StructuralVisitor(ast.NodeVisitor):
+            def visit_Call(self, node: ast.Call) -> None:  # noqa: N802
+                qualified_name = cls._resolve_ast_call_name(node.func)
+                if qualified_name in {
+                    "eval",
+                    "exec",
+                    "__import__",
+                    "os.system",
+                    "os.popen",
+                    "shutil.rmtree",
+                    "subprocess.run",
+                    "subprocess.Popen",
+                    "subprocess.call",
+                    "subprocess.check_output",
+                }:
+                    blocked_hits.add(qualified_name)
+                elif qualified_name == "importlib.import_module":
+                    warning_hits.add(qualified_name)
+                elif qualified_name == "getattr":
+                    base_name = cls._resolve_ast_call_name(node.args[0]) if node.args else None
+                    attribute_name = cls._extract_constant_string(node.args[1]) if len(node.args) > 1 else None
+                    if base_name in {"os", "subprocess", "shutil", "builtins"}:
+                        if attribute_name in {"system", "popen", "run", "Popen", "call", "check_output", "rmtree"}:
+                            blocked_hits.add(f"getattr({base_name}, {attribute_name})")
+                        else:
+                            warning_hits.add(f"getattr({base_name}, dynamic)")
+                self.generic_visit(node)
+
+        StructuralVisitor().visit(tree)
+        if blocked_hits:
+            warnings.append(
+                PatchReviewWarningView(
+                    code=PatchWarningCode.STRUCTURAL_DANGER,
+                    message=(
+                        "Structural scan detected dangerous execution patterns: "
+                        + ", ".join(sorted(blocked_hits))
+                        + "."
+                    ),
+                ),
+            )
+        if warning_hits:
+            warnings.append(
+                PatchReviewWarningView(
+                    code=PatchWarningCode.STRUCTURAL_WARNING,
+                    message=(
+                        "Structural scan detected suspicious dynamic patterns that should be founder-reviewed: "
+                        + ", ".join(sorted(warning_hits))
+                        + "."
+                    ),
+                ),
+            )
+        return warnings
+
+    @staticmethod
+    def _extract_added_python_source(patch_body: str) -> str:
+        added_lines: list[str] = []
+        for line in patch_body.splitlines():
+            if line.startswith("+++") or line.startswith("@@"):
+                continue
+            if line.startswith("+"):
+                added_lines.append(line[1:])
+        added_source = "\n".join(added_lines).strip()
+        if not added_source:
+            return ""
+        return textwrap.dedent(added_source)
+
+    @staticmethod
+    def _resolve_ast_call_name(node: ast.AST | None) -> str | None:
+        if node is None:
+            return None
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            base = LedgerStore._resolve_ast_call_name(node.value)
+            return f"{base}.{node.attr}" if base else node.attr
+        return None
+
+    @staticmethod
+    def _extract_constant_string(node: ast.AST | None) -> str | None:
+        if node is None:
+            return None
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            left = LedgerStore._extract_constant_string(node.left)
+            right = LedgerStore._extract_constant_string(node.right)
+            if left is not None and right is not None:
+                return left + right
+        return None
+
+    def _recent_auto_apply_burst_detected(
+        self,
+        *,
+        session: Session,
+        run_id: str,
+        changed_files: list[str],
+    ) -> bool:
+        if not changed_files:
+            return False
+        cutoff = utc_now() - self._PATCH_POLICY_WINDOW
+        records = list(
+            session.scalars(
+                select(PatchIntakeRecord)
+                .where(PatchIntakeRecord.run_id == run_id)
+                .where(PatchIntakeRecord.resolution_code == PatchResolutionCode.AUTO_APPLIED)
+                .where(PatchIntakeRecord.resolved_at.is_not(None))
+                .where(PatchIntakeRecord.resolved_at >= cutoff)
+                .order_by(PatchIntakeRecord.resolved_at.asc(), PatchIntakeRecord.id.asc()),
+            ).all(),
+        )
+        overlap_count = 0
+        for record in records:
+            if self._patch_scope_overlaps(changed_files, list(record.changed_files or [])):
+                overlap_count += 1
+        return overlap_count >= self._PATCH_AUTO_APPLY_BURST_LIMIT
+
+    @classmethod
+    def _patch_scope_overlaps(cls, changed_files: list[str], other_files: list[str]) -> bool:
+        if not changed_files or not other_files:
+            return False
+        if set(changed_files).intersection(other_files):
+            return True
+        current_modules = {cls._module_scope_for_path(path) for path in changed_files}
+        other_modules = {cls._module_scope_for_path(path) for path in other_files}
+        return bool(current_modules.intersection(other_modules))
+
+    @staticmethod
+    def _module_scope_for_path(path: str) -> str:
+        parts = Path(path).parts
+        if len(parts) >= 3:
+            return "/".join(parts[:3])
+        if len(parts) >= 2:
+            return "/".join(parts[:2])
+        return parts[0] if parts else path
+
+    @classmethod
+    def _build_patch_intake_summary(
+        cls,
+        *,
+        warnings: list[PatchReviewWarningView],
+        changed_files: list[str],
+        auto_apply_eligible: bool,
+    ) -> str:
+        touched = len(changed_files)
+        if auto_apply_eligible:
+            return f"Low-risk patch qualified for strict auto-apply after touching {touched} file(s)."
+        if warnings:
+            lead = warnings[0]
+            return (
+                f"Founder review is required before applying a patch touching {touched} file(s): "
+                f"{lead.message}"
+            )
+        return f"Founder review is required before applying a patch touching {touched} file(s)."
 
     @staticmethod
     def _count_patch_lines(patch_body: str) -> tuple[int, int]:
@@ -4173,6 +4992,292 @@ class LedgerStore:
             ),
         )
         return artifact
+
+    def _build_patch_repair_feedback(
+        self,
+        *,
+        patch_intake: PatchIntakeRecord,
+        apply_receipt: PatchApplyReceipt,
+    ) -> str:
+        changed_files = ", ".join(list(patch_intake.changed_files or [])) or "-"
+        details: list[str] = [
+            f"Patch repair failed with {apply_receipt.outcome.value}.",
+            f"changed_files={changed_files}",
+            f"validation_command={apply_receipt.validation_command}",
+        ]
+        if apply_receipt.base_hash_conflicts:
+            details.append(
+                "base_hash_conflicts=" + ", ".join(apply_receipt.base_hash_conflicts),
+            )
+        if apply_receipt.apply_check_stderr:
+            details.append(
+                "apply_check=" + (self._sanitize_planner_text(apply_receipt.apply_check_stderr, limit=800) or "-"),
+            )
+        if apply_receipt.validation_returncode is not None:
+            details.append(f"validation_returncode={apply_receipt.validation_returncode}")
+        if apply_receipt.validation_stdout_preview:
+            details.append(
+                "validation_stdout="
+                + (self._sanitize_planner_text(apply_receipt.validation_stdout_preview, limit=800) or "-"),
+            )
+        if apply_receipt.validation_stderr_preview:
+            details.append(
+                "validation_stderr="
+                + (self._sanitize_planner_text(apply_receipt.validation_stderr_preview, limit=1200) or "-"),
+            )
+        return self._sanitize_planner_text(" ; ".join(details), limit=4000) or apply_receipt.summary
+
+    def _count_patch_repair_failures(
+        self,
+        *,
+        session: Session,
+        run_id: str,
+        changed_files: list[str],
+    ) -> int:
+        cutoff = utc_now() - self._PATCH_POLICY_WINDOW
+        records = list(
+            session.scalars(
+                select(PatchIntakeRecord)
+                .where(PatchIntakeRecord.run_id == run_id)
+                .where(PatchIntakeRecord.status == PatchIntakeStatus.REJECTED)
+                .where(PatchIntakeRecord.resolved_at.is_not(None))
+                .where(PatchIntakeRecord.resolved_at >= cutoff)
+                .where(
+                    PatchIntakeRecord.resolution_code.in_(
+                        (
+                            PatchResolutionCode.BASE_HASH_CONFLICT,
+                            PatchResolutionCode.APPLY_CHECK_FAILED,
+                            PatchResolutionCode.VALIDATION_FAILED,
+                        ),
+                    ),
+                )
+                .order_by(PatchIntakeRecord.resolved_at.asc(), PatchIntakeRecord.id.asc()),
+            ).all(),
+        )
+        failures = 0
+        for record in records:
+            if self._patch_scope_overlaps(changed_files, list(record.changed_files or [])):
+                failures += 1
+        return failures
+
+    def _has_pending_founder_escalation(self, *, session: Session, run_id: str) -> bool:
+        observation_records = list(
+            session.scalars(
+                select(ObservationRecord)
+                .where(ObservationRecord.run_id == run_id)
+                .where(ObservationRecord.kind == ObservationKind.PLANNER_ESCALATION)
+                .order_by(ObservationRecord.created_at.asc(), ObservationRecord.id.asc()),
+            ).all(),
+        )
+        founder_intervention_records = list(
+            session.scalars(
+                select(FounderInterventionRecord)
+                .where(FounderInterventionRecord.run_id == run_id)
+                .order_by(FounderInterventionRecord.created_at.asc(), FounderInterventionRecord.id.asc()),
+            ).all(),
+        )
+        return self._build_pending_founder_escalation(
+            observation_records=observation_records,
+            founder_intervention_records=founder_intervention_records,
+        ) is not None
+
+    def _maybe_record_patch_repair_escalation(
+        self,
+        *,
+        session: Session,
+        run: RunRecord,
+        patch_intake: PatchIntakeRecord,
+        repair_failure_count: int,
+    ) -> None:
+        if repair_failure_count < self._PATCH_REPAIR_QUOTA_LIMIT:
+            return
+        if self._has_pending_founder_escalation(session=session, run_id=run.id):
+            return
+        details = (
+            f"repair_failure_count={repair_failure_count}; "
+            f"patch_intake_id={patch_intake.id}; "
+            f"changed_files={', '.join(list(patch_intake.changed_files or [])) or '-'}; "
+            f"latest_reason={patch_intake.resolution_reason or patch_intake.summary}."
+        )
+        observation = ObservationRecord(
+            run_id=run.id,
+            kind=ObservationKind.PLANNER_ESCALATION,
+            summary="Repeated patch repair failures now require founder guidance.",
+            details=self._sanitize_planner_text(details, limit=4000)
+            or "Repeated patch repair failures now require founder guidance.",
+        )
+        session.add(observation)
+        session.flush()
+        session.add(
+            EventLedgerRecord(
+                run_id=run.id,
+                event_type=LedgerEventType.OBSERVATION_RECORDED,
+                payload={
+                    "observation_id": observation.id,
+                    "kind": observation.kind.value,
+                    "summary": observation.summary,
+                },
+            ),
+        )
+
+    def _apply_patch_intake_resolution(
+        self,
+        *,
+        session: Session,
+        run: RunRecord,
+        task: TaskRecord,
+        patch_intake: PatchIntakeRecord,
+        patch_artifact: ArtifactRecord,
+        receipt_artifact: ArtifactRecord,
+        approval_mode: str,
+    ) -> tuple[str, ObservationRecord, ArtifactRecord]:
+        patch_body = Path(patch_artifact.path).read_text(encoding="utf-8")
+        receipt_payload = json.loads(Path(receipt_artifact.path).read_text(encoding="utf-8"))
+        apply_receipt = apply_patch_strict(
+            workspace=Path(patch_intake.source_workspace),
+            patch_body=patch_body,
+            patch_sha256=patch_intake.patch_sha256,
+            changed_files=list(patch_intake.changed_files),
+            base_file_hashes=dict(receipt_payload.get("base_file_hashes", {})),
+        )
+
+        validation_artifact = self._persist_validation_receipt_artifact(
+            session=session,
+            run=run,
+            task=task,
+            patch_intake=patch_intake,
+            patch_artifact=patch_artifact,
+            receipt=apply_receipt,
+        )
+        patch_intake.validation_artifact_id = validation_artifact.id
+        patch_intake.validation_command = apply_receipt.validation_command
+
+        if apply_receipt.outcome == PatchApplyOutcome.APPLIED:
+            patch_intake.status = PatchIntakeStatus.APPLIED
+            patch_intake.resolved_at = apply_receipt.finished_at
+            patch_intake.resolution_code = (
+                PatchResolutionCode.AUTO_APPLIED
+                if approval_mode == "auto"
+                else PatchResolutionCode.FOUNDER_APPROVED
+            )
+            patch_intake.resolution_reason = apply_receipt.summary
+            run.status = RunStatus.COMPLETED
+            session.add(
+                EventLedgerRecord(
+                    run_id=run.id,
+                    event_type=LedgerEventType.PATCH_INTAKE_APPLIED,
+                    payload={
+                        "patch_intake_id": patch_intake.id,
+                        "task_id": task.id,
+                        "patch_artifact_id": patch_artifact.id,
+                        "validation_artifact_id": validation_artifact.id,
+                        "resolution_code": patch_intake.resolution_code.value,
+                    },
+                ),
+            )
+            if approval_mode == "auto":
+                summary = "Low-risk patch was auto-applied after strict validation."
+                message = "Low-risk patch was auto-applied strictly and the run is now completed."
+            else:
+                summary = "Founder approved the patch intake and strict apply succeeded."
+                message = "Patch was applied strictly and the run is now completed."
+            observation = ObservationRecord(
+                run_id=run.id,
+                kind=ObservationKind.SYSTEM_AUDIT,
+                summary=summary,
+                details=(
+                    f"error_code={patch_intake.resolution_code.value}; "
+                    f"patch_intake_id={patch_intake.id}; "
+                    f"validation_artifact_id={validation_artifact.id}; "
+                    f"validation_command={apply_receipt.validation_command}."
+                ),
+            )
+            session.add(observation)
+            session.flush()
+            session.add(
+                EventLedgerRecord(
+                    run_id=run.id,
+                    event_type=LedgerEventType.OBSERVATION_RECORDED,
+                    payload={
+                        "observation_id": observation.id,
+                        "kind": observation.kind.value,
+                        "summary": observation.summary,
+                    },
+                ),
+            )
+            session.flush()
+            return message, observation, validation_artifact
+
+        resolution_map = {
+            PatchApplyOutcome.BASE_HASH_CONFLICT: PatchResolutionCode.BASE_HASH_CONFLICT,
+            PatchApplyOutcome.APPLY_CHECK_FAILED: PatchResolutionCode.APPLY_CHECK_FAILED,
+            PatchApplyOutcome.VALIDATION_FAILED: PatchResolutionCode.VALIDATION_FAILED,
+        }
+        patch_intake.status = PatchIntakeStatus.REJECTED
+        patch_intake.resolved_at = apply_receipt.finished_at
+        patch_intake.resolution_code = resolution_map[apply_receipt.outcome]
+        patch_intake.resolution_reason = self._build_patch_repair_feedback(
+            patch_intake=patch_intake,
+            apply_receipt=apply_receipt,
+        )
+        patch_intake.validation_command = apply_receipt.validation_command
+        run.status = RunStatus.READY
+        session.add(
+            EventLedgerRecord(
+                run_id=run.id,
+                event_type=LedgerEventType.PATCH_INTAKE_REJECTED,
+                payload={
+                    "patch_intake_id": patch_intake.id,
+                    "task_id": task.id,
+                    "patch_artifact_id": patch_artifact.id,
+                    "validation_artifact_id": validation_artifact.id,
+                    "resolution_code": patch_intake.resolution_code.value,
+                },
+            ),
+        )
+        if approval_mode == "auto":
+            summary = "Auto-apply candidate was rejected by strict apply or validation."
+            message = patch_intake.resolution_reason or "Auto-apply candidate was rejected."
+        else:
+            summary = "Founder approved the patch review, but intake was rejected by strict apply or validation."
+            message = patch_intake.resolution_reason or "Patch intake was rejected."
+        observation = ObservationRecord(
+            run_id=run.id,
+            kind=ObservationKind.SYSTEM_AUDIT,
+            summary=summary,
+            details=(
+                f"error_code={patch_intake.resolution_code.value}; "
+                f"patch_intake_id={patch_intake.id}; "
+                f"validation_artifact_id={validation_artifact.id}; "
+                f"reason={patch_intake.resolution_reason}."
+            ),
+        )
+        session.add(observation)
+        session.flush()
+        session.add(
+            EventLedgerRecord(
+                run_id=run.id,
+                event_type=LedgerEventType.OBSERVATION_RECORDED,
+                payload={
+                    "observation_id": observation.id,
+                    "kind": observation.kind.value,
+                    "summary": observation.summary,
+                },
+            ),
+        )
+        repair_failure_count = self._count_patch_repair_failures(
+            session=session,
+            run_id=run.id,
+            changed_files=list(patch_intake.changed_files or []),
+        )
+        self._maybe_record_patch_repair_escalation(
+            session=session,
+            run=run,
+            patch_intake=patch_intake,
+            repair_failure_count=repair_failure_count,
+        )
+        session.flush()
+        return message, observation, validation_artifact
 
     @staticmethod
     def _to_run_view(record: RunRecord) -> RunView:
