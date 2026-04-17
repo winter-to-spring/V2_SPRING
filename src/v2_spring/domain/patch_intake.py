@@ -22,11 +22,16 @@ class PatchRiskClass(StrEnum):
 class PatchWarningCode(StrEnum):
     DANGEROUS_KEYWORD = "dangerous_keyword"
     SENSITIVE_PATH = "sensitive_path"
+    CENTRAL_FILE = "central_file"
     LARGE_PATCH = "large_patch"
     MANY_FILES = "many_files"
+    AUTO_APPLY_BURST = "auto_apply_burst"
+    STRUCTURAL_DANGER = "structural_danger"
+    STRUCTURAL_WARNING = "structural_warning"
 
 
 class PatchResolutionCode(StrEnum):
+    AUTO_APPLIED = "auto_applied"
     FOUNDER_APPROVED = "founder_approved"
     FOUNDER_REJECTED = "founder_rejected"
     BASE_HASH_CONFLICT = "base_hash_conflict"
