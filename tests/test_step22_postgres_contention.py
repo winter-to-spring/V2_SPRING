@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
+import sys
 import time
 from uuid import uuid4
 
@@ -97,8 +99,16 @@ def _stop_container(container_name: str) -> None:
 
 def _run_alembic_upgrade(root: Path, database_url: str) -> None:
     full_env = {**os.environ, "DATABASE_URL": database_url}
+    candidates = [
+        shutil.which("alembic"),
+        str(Path(sys.executable).with_name("alembic")),
+        str(root / ".venv" / "bin" / "alembic"),
+    ]
+    alembic_cmd = next((candidate for candidate in candidates if candidate and Path(candidate).exists()), None)
+    if alembic_cmd is None:
+        raise AssertionError("Alembic executable was not found in PATH, interpreter bin, or project .venv.")
     subprocess.run(
-        [str(root / ".venv" / "bin" / "alembic"), "upgrade", "head"],
+        [alembic_cmd, "upgrade", "head"],
         cwd=root,
         env=full_env,
         check=True,
