@@ -15,6 +15,7 @@ class ExecutionRuntime(StrEnum):
 
     BOUNDED_LOCAL = "bounded_local"
     ISOLATED_WORKER = "isolated_worker"
+    CONTAINERIZED_WORKER = "containerized_worker"
     CREWAI_TEAM = "crewai_team"
 
 
@@ -221,6 +222,22 @@ def route_task(
         )
 
     if (
+        ExecutionRuntime.CONTAINERIZED_WORKER in system_limits.available_runtimes
+        and _fits_containerized_worker(normalized_requirements)
+    ):
+        rationale = (
+            "The request needs isolated patch-producing execution and a containerized worker runtime is available."
+        )
+        return RoutingDecision(
+            runtime=ExecutionRuntime.CONTAINERIZED_WORKER,
+            matched_policy="containerized_worker_bounded_patch_rule",
+            rationale=rationale,
+            original_requirements=requirements,
+            normalized_requirements=normalized_requirements,
+            guard_notes=guard_notes,
+        )
+
+    if (
         ExecutionRuntime.ISOLATED_WORKER in system_limits.available_runtimes
         and _fits_isolated_worker(normalized_requirements)
     ):
@@ -362,6 +379,10 @@ def _fits_isolated_worker(requirements: ExecutionRequirements) -> bool:
             ExpectedOutputKind.PATCH_AND_ARTIFACT,
         }
     )
+
+
+def _fits_containerized_worker(requirements: ExecutionRequirements) -> bool:
+    return _fits_isolated_worker(requirements)
 
 
 def _complexity_rank(value: TaskComplexity) -> int:

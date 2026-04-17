@@ -119,11 +119,14 @@ from v2_spring.planner.proposals import (
     TransportDuplicatePlannerProposalError,
 )
 from v2_spring.runtime import (
+    ContainerizedWorkerReceipt,
+    ContainerizedWorkerTimeout,
     IsolatedWorkerReceipt,
     IsolatedWorkerTimeout,
     PatchApplyOutcome,
     PatchApplyReceipt,
     apply_patch_strict,
+    execute_containerized_worker_proof,
     execute_isolated_worker_proof,
 )
 
@@ -144,7 +147,7 @@ class IsolatedWorkerDispatchResult:
     task: TaskView
     artifacts: list[ArtifactView]
     observation: ObservationView
-    receipt: IsolatedWorkerReceipt
+    receipt: IsolatedWorkerReceipt | ContainerizedWorkerReceipt
 
 
 class LedgerStore:
@@ -2773,6 +2776,201 @@ class LedgerStore:
                 failure_summary=f"Patch/receipt persistence failed after isolated execution: {exc}",
             )
 
+    def dispatch_containerized_worker_task(
+        self,
+        *,
+        run_id: str,
+        workspace: Path,
+        artifact_root: Path,
+        timeout_seconds: int = 30,
+    ) -> IsolatedWorkerDispatchResult:
+        """Dispatch one bounded containerized-worker proof and persist its trail."""
+
+        self.ensure_schema()
+        workspace = workspace.expanduser().resolve()
+        artifact_root = artifact_root.expanduser().resolve()
+        requirements = ExecutionRequirements(
+            task_complexity="low",
+            needs_isolation=True,
+            requires_network=False,
+            needs_multi_file_context=False,
+            write_scope="single_file",
+            expected_output_kind="unified_patch",
+        )
+        system_limits = SystemLimits(available_runtimes=(ExecutionRuntime.CONTAINERIZED_WORKER,))
+
+        inspection = self.inspect_task_route(
+            run_id,
+            requirements=requirements,
+            system_limits=system_limits,
+            record=True,
+        )
+        if not isinstance(inspection.outcome, RoutingDecision):
+            raise PermissionError(
+                f"Run {run_id} cannot be dispatched to the containerized worker: {inspection.outcome.message}",
+            )
+        if inspection.outcome.runtime != ExecutionRuntime.CONTAINERIZED_WORKER:
+            raise PermissionError(
+                f"Run {run_id} currently routes to {inspection.outcome.runtime.value}, not containerized_worker.",
+            )
+
+        with self.session() as session:
+            run = self._get_run_for_execution(session, run_id)
+            existing_task_count = session.scalar(
+                select(TaskRecord).where(TaskRecord.run_id == run.id).limit(1),
+            )
+            if existing_task_count is not None:
+                raise PermissionError(
+                    f"Run {run_id} already has execution evidence and cannot dispatch another proof in Step 13.",
+                )
+
+            decision = DecisionRecord(
+                run_id=run.id,
+                kind=DecisionKind.CONTAINERIZED_WORKER_SELECTED,
+                summary="A containerized worker proof was selected for dispatch.",
+                rationale=(
+                    "Step 13 intentionally proves the patch/receipt contract behind a containerized runtime boundary."
+                ),
+            )
+            session.add(decision)
+            session.flush()
+            session.add(
+                EventLedgerRecord(
+                    run_id=run.id,
+                    event_type=LedgerEventType.DECISION_RECORDED,
+                    payload={
+                        "decision_id": decision.id,
+                        "kind": decision.kind.value,
+                        "summary": decision.summary,
+                        "runtime": inspection.outcome.runtime.value,
+                        "routing_policy": inspection.outcome.matched_policy,
+                    },
+                ),
+            )
+
+            execution_context_id = str(uuid4())
+            task = TaskRecord(
+                run_id=run.id,
+                decision_id=decision.id,
+                kind=TaskKind.CONTAINERIZED_WORKER_PROOF,
+                status=TaskStatus.READY,
+                summary="Run one bounded patch-producing proof inside a containerized worker runtime.",
+                execution_context_id=execution_context_id,
+                command=f"containerized_worker_proof --workspace {workspace}",
+                cwd="/workspace",
+                timeout_seconds=timeout_seconds,
+            )
+            session.add(task)
+            session.flush()
+            session.add(
+                EventLedgerRecord(
+                    run_id=run.id,
+                    event_type=LedgerEventType.TASK_CREATED,
+                    payload={
+                        "task_id": task.id,
+                        "decision_id": decision.id,
+                        "kind": task.kind.value,
+                        "summary": task.summary,
+                        "status": task.status.value,
+                        "runtime": inspection.outcome.runtime.value,
+                        "requirements": requirements.model_dump(mode="json"),
+                    },
+                ),
+            )
+
+            task.status = TaskStatus.RUNNING
+            task.started_at = utc_now()
+            run.status = RunStatus.RUNNING
+            session.add(
+                EventLedgerRecord(
+                    run_id=run.id,
+                    event_type=LedgerEventType.TASK_STARTED,
+                    payload={
+                        "task_id": task.id,
+                        "decision_id": decision.id,
+                        "kind": task.kind.value,
+                        "status": task.status.value,
+                        "workspace": str(workspace),
+                        "runtime": inspection.outcome.runtime.value,
+                        "snapshot_hash": inspection.snapshot_hash,
+                        "base_context": {
+                            "source_action": inspection.source_action.value if inspection.source_action else None,
+                            "requirements": requirements.model_dump(mode="json"),
+                        },
+                    },
+                ),
+            )
+            session.flush()
+            task_id = task.id
+
+        try:
+            receipt = execute_containerized_worker_proof(
+                workspace=workspace,
+                timeout_seconds=timeout_seconds,
+                execution_context_id=execution_context_id,
+                run_id=run_id,
+            )
+        except (ContainerizedWorkerTimeout, FileNotFoundError, NotADirectoryError) as exc:
+            synthetic_receipt = self._build_failed_containerized_receipt(
+                workspace=workspace,
+                execution_context_id=execution_context_id,
+                timeout_seconds=timeout_seconds,
+                summary=str(exc),
+            )
+            return self._finalize_failed_isolated_task(
+                run_id=run_id,
+                task_id=task_id,
+                artifact_root=artifact_root,
+                receipt=synthetic_receipt,
+                failure_summary=str(exc),
+            )
+        except Exception as exc:  # pragma: no cover - defensive guard
+            synthetic_receipt = self._build_failed_containerized_receipt(
+                workspace=workspace,
+                execution_context_id=execution_context_id,
+                timeout_seconds=timeout_seconds,
+                summary=f"Unexpected containerized worker failure: {exc}",
+            )
+            return self._finalize_failed_isolated_task(
+                run_id=run_id,
+                task_id=task_id,
+                artifact_root=artifact_root,
+                receipt=synthetic_receipt,
+                failure_summary=f"Unexpected containerized worker failure: {exc}",
+            )
+
+        if receipt.timed_out or receipt.returncode not in (0, None):
+            return self._finalize_failed_isolated_task(
+                run_id=run_id,
+                task_id=task_id,
+                artifact_root=artifact_root,
+                receipt=receipt,
+                failure_summary=receipt.summary,
+            )
+        if not receipt.patch_body:
+            return self._finalize_failed_isolated_task(
+                run_id=run_id,
+                task_id=task_id,
+                artifact_root=artifact_root,
+                receipt=receipt,
+                failure_summary="Containerized worker proof completed without producing a bounded patch.",
+            )
+        try:
+            return self._finalize_completed_isolated_task(
+                run_id=run_id,
+                task_id=task_id,
+                artifact_root=artifact_root,
+                receipt=receipt,
+            )
+        except Exception as exc:
+            return self._finalize_failed_isolated_task(
+                run_id=run_id,
+                task_id=task_id,
+                artifact_root=artifact_root,
+                receipt=receipt,
+                failure_summary=f"Patch/receipt persistence failed after containerized execution: {exc}",
+            )
+
     @staticmethod
     def _build_run_created_event(record: RunRecord) -> EventLedgerRecord:
         return EventLedgerRecord(
@@ -3500,18 +3698,63 @@ class LedgerStore:
             secret_surface_present=False,
         )
 
+    def _build_failed_containerized_receipt(
+        self,
+        *,
+        workspace: Path,
+        execution_context_id: str,
+        timeout_seconds: int,
+        summary: str,
+    ) -> ContainerizedWorkerReceipt:
+        now = utc_now()
+        return ContainerizedWorkerReceipt(
+            execution_context_id=execution_context_id,
+            image="unavailable",
+            container_name=f"v2-spring-worker-{execution_context_id[:12]}",
+            command=f"containerized_worker_proof --workspace {workspace}",
+            source_workspace=str(workspace),
+            sandbox_cwd="/workspace",
+            started_at=now,
+            finished_at=now,
+            timeout_seconds=timeout_seconds,
+            returncode=None,
+            timed_out=False,
+            stdout_preview="",
+            stderr_preview=summary,
+            stdout_bytes=0,
+            stderr_bytes=len(summary.encode("utf-8")),
+            stderr_truncated=False,
+            changed_files=[],
+            patch_body=None,
+            summary=summary,
+            base_file_hashes={},
+            excluded_names=[],
+            env_allowlist=[],
+            secret_surface_present=False,
+            ownership_normalized=False,
+            orphan_gc_removed=0,
+            resource_limits={},
+        )
+
+    @staticmethod
+    def _worker_runtime_phrase(runtime: str) -> str:
+        if runtime == "containerized_worker":
+            return "Containerized worker proof"
+        return "Isolated worker proof"
+
     def _finalize_failed_isolated_task(
         self,
         *,
         run_id: str,
         task_id: str,
         artifact_root: Path,
-        receipt: IsolatedWorkerReceipt,
+        receipt: IsolatedWorkerReceipt | ContainerizedWorkerReceipt,
         failure_summary: str,
     ) -> IsolatedWorkerDispatchResult:
+        runtime_phrase = self._worker_runtime_phrase(receipt.runtime)
         artifact_directory = artifact_root / run_id / task_id
         artifact_directory.mkdir(parents=True, exist_ok=True)
-        receipt_path = artifact_directory / "isolated-worker-receipt.json"
+        receipt_path = artifact_directory / f"{receipt.runtime.replace('_', '-')}-receipt.json"
         receipt_path.write_text(
             json.dumps(receipt.model_dump(mode="json"), indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
@@ -3540,7 +3783,7 @@ class LedgerStore:
                 task_id=task.id,
                 decision_id=task.decision_id,
                 artifact_type=ArtifactType.EXECUTION_RECEIPT,
-                title="Isolated worker execution receipt",
+                title=f"{runtime_phrase} execution receipt",
                 storage_kind=ArtifactStorageKind.FILESYSTEM_PATH,
                 path=str(receipt_path),
                 size_bytes=len(receipt_bytes),
@@ -3555,7 +3798,7 @@ class LedgerStore:
             observation = ObservationRecord(
                 run_id=run.id,
                 kind=ObservationKind.TASK_EXECUTION,
-                summary="Isolated worker proof failed before a patch could be accepted.",
+                summary=f"{runtime_phrase} failed before a patch could be accepted.",
                 details=failure_summary,
             )
             session.add(observation)
@@ -3614,12 +3857,13 @@ class LedgerStore:
         run_id: str,
         task_id: str,
         artifact_root: Path,
-        receipt: IsolatedWorkerReceipt,
+        receipt: IsolatedWorkerReceipt | ContainerizedWorkerReceipt,
     ) -> IsolatedWorkerDispatchResult:
+        runtime_phrase = self._worker_runtime_phrase(receipt.runtime)
         artifact_directory = artifact_root / run_id / task_id
         artifact_directory.mkdir(parents=True, exist_ok=True)
-        patch_path = artifact_directory / "isolated-worker-proof.patch"
-        receipt_path = artifact_directory / "isolated-worker-receipt.json"
+        patch_path = artifact_directory / f"{receipt.runtime.replace('_', '-')}-proof.patch"
+        receipt_path = artifact_directory / f"{receipt.runtime.replace('_', '-')}-receipt.json"
         patch_path.write_text(receipt.patch_body or "", encoding="utf-8")
         receipt_path.write_text(
             json.dumps(receipt.model_dump(mode="json"), indent=2, ensure_ascii=False) + "\n",
@@ -3657,7 +3901,7 @@ class LedgerStore:
                     task_id=task.id,
                     decision_id=task.decision_id,
                     artifact_type=ArtifactType.UNIFIED_PATCH,
-                    title="Isolated worker proof patch",
+                    title=f"{runtime_phrase} patch",
                     storage_kind=ArtifactStorageKind.FILESYSTEM_PATH,
                     path=str(patch_path),
                     size_bytes=len(patch_bytes),
@@ -3671,7 +3915,7 @@ class LedgerStore:
                     task_id=task.id,
                     decision_id=task.decision_id,
                     artifact_type=ArtifactType.EXECUTION_RECEIPT,
-                    title="Isolated worker execution receipt",
+                    title=f"{runtime_phrase} execution receipt",
                     storage_kind=ArtifactStorageKind.FILESYSTEM_PATH,
                     path=str(receipt_path),
                     size_bytes=len(receipt_bytes),
@@ -3708,7 +3952,7 @@ class LedgerStore:
                 observation = ObservationRecord(
                     run_id=run.id,
                     kind=ObservationKind.TASK_EXECUTION,
-                    summary="Isolated worker proof completed and is waiting on founder patch review.",
+                    summary=f"{runtime_phrase} completed and is waiting on founder patch review.",
                     details=(
                         f"Task {task.id} produced patch artifact {patch_artifact.id}, receipt artifact {receipt_artifact.id}, "
                         f"and patch intake {patch_intake.id}. Changed files: {', '.join(receipt.changed_files) if receipt.changed_files else '-'}."
@@ -3756,7 +4000,7 @@ class LedgerStore:
                             "decision_id": task.decision_id,
                             "execution_context_id": task.execution_context_id,
                             "status": task.status.value,
-                            "runtime": "isolated_worker",
+                            "runtime": receipt.runtime,
                             "changed_files": receipt.changed_files,
                             "base_file_hashes": receipt.base_file_hashes,
                             "patch_intake_id": patch_intake.id,

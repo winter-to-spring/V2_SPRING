@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 class TaskKind(StrEnum):
     REPOSITORY_SCAN = "repository_scan"
     ISOLATED_WORKER_PROOF = "isolated_worker_proof"
+    CONTAINERIZED_WORKER_PROOF = "containerized_worker_proof"
 
 
 class TaskStatus(StrEnum):

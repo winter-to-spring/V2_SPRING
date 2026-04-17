@@ -307,19 +307,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     task_dispatch_parser = task_subparsers.add_parser(
         "dispatch",
-        help="Dispatch one isolated worker proof for a run.",
+        help="Dispatch one execution-plane worker proof for a run.",
     )
     task_dispatch_parser.add_argument("run_id", help="Run id to dispatch.")
     task_dispatch_parser.add_argument(
         "--runtime",
         required=True,
-        choices=["isolated_worker"],
-        help="Execution runtime to prove. Step 12-b currently supports isolated_worker only.",
+        choices=["isolated_worker", "containerized_worker"],
+        help="Execution runtime to prove. Step 12/13 currently support isolated_worker and containerized_worker.",
     )
     task_dispatch_parser.add_argument(
         "--workspace",
         default=".",
-        help="Source workspace path copied into the isolated worker sandbox.",
+        help="Source workspace path copied into the worker proof runtime.",
     )
     task_dispatch_parser.add_argument(
         "--artifact-root",
@@ -330,7 +330,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--timeout-seconds",
         default=30,
         type=int,
-        help="Hard timeout for the isolated worker proof. Defaults to 30.",
+        help="Hard timeout for the worker proof. Defaults to 30.",
     )
     task_dispatch_parser.add_argument(
         "--format",
@@ -1105,10 +1105,11 @@ def _render_isolated_worker_result(result: IsolatedWorkerDispatchResult) -> str:
         for artifact in result.artifacts
     ) or "-"
     changed_files = ", ".join(result.receipt.changed_files) if result.receipt.changed_files else "-"
+    runtime_title = result.receipt.runtime.replace("_", " ").title()
     return dedent(
         f"""\
-        Isolated worker proof finished
-        -----------------------------
+        {runtime_title} proof finished
+        {'-' * (len(runtime_title) + 15)}
         task_id:             {result.task.id}
         task_status:         {result.task.status.value}
         execution_context:   {result.task.execution_context_id}
@@ -2315,12 +2316,20 @@ def main() -> None:
     if args.command == "task" and args.task_command == "dispatch":
         store = _build_store(args.database_url)
         try:
-            result = store.dispatch_isolated_worker_task(
-                run_id=args.run_id,
-                workspace=Path(args.workspace),
-                artifact_root=Path(args.artifact_root),
-                timeout_seconds=args.timeout_seconds,
-            )
+            if args.runtime == "containerized_worker":
+                result = store.dispatch_containerized_worker_task(
+                    run_id=args.run_id,
+                    workspace=Path(args.workspace),
+                    artifact_root=Path(args.artifact_root),
+                    timeout_seconds=args.timeout_seconds,
+                )
+            else:
+                result = store.dispatch_isolated_worker_task(
+                    run_id=args.run_id,
+                    workspace=Path(args.workspace),
+                    artifact_root=Path(args.artifact_root),
+                    timeout_seconds=args.timeout_seconds,
+                )
             if args.format == "json":
                 print(
                     json.dumps(
