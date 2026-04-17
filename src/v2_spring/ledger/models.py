@@ -5,7 +5,8 @@ from enum import StrEnum
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import DateTime, Enum, ForeignKey, JSON, String, event
+from sqlalchemy import DateTime, Enum, ForeignKey, Index, JSON, String, event
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from v2_spring.domain.approval import ApprovalStatus
@@ -28,6 +29,9 @@ def utc_now() -> datetime:
 
 class Base(DeclarativeBase):
     pass
+
+
+JSON_VARIANT = JSON().with_variant(JSONB, "postgresql")
 
 
 class LedgerEventType(StrEnum):
@@ -265,6 +269,10 @@ class TaskRecord(Base):
 
 class ExecutionClaimRecord(Base):
     __tablename__ = "execution_claims"
+    __table_args__ = (
+        Index("ix_execution_claims_status_expires_at", "status", "expires_at"),
+        Index("ix_execution_claims_runtime_status", "runtime", "status"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     run_id: Mapped[str] = mapped_column(
@@ -411,7 +419,7 @@ class PatchIntakeRecord(Base):
     )
     summary: Mapped[str] = mapped_column(String(400), nullable=False)
     source_workspace: Mapped[str] = mapped_column(String(4000), nullable=False)
-    changed_files: Mapped[list[Any]] = mapped_column(JSON, nullable=False, default=list)
+    changed_files: Mapped[list[Any]] = mapped_column(JSON_VARIANT, nullable=False, default=list)
     touched_file_count: Mapped[int] = mapped_column(nullable=False)
     patch_size_bytes: Mapped[int] = mapped_column(nullable=False)
     patch_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -420,7 +428,7 @@ class PatchIntakeRecord(Base):
         nullable=False,
     )
     auto_apply_eligible: Mapped[bool] = mapped_column(nullable=False, default=False)
-    warnings: Mapped[list[Any]] = mapped_column(JSON, nullable=False, default=list)
+    warnings: Mapped[list[Any]] = mapped_column(JSON_VARIANT, nullable=False, default=list)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -449,6 +457,9 @@ class PatchIntakeRecord(Base):
 
 class EventLedgerRecord(Base):
     __tablename__ = "event_ledger"
+    __table_args__ = (
+        Index("ix_event_ledger_run_recorded_at", "run_id", "recorded_at"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     run_id: Mapped[str] = mapped_column(
@@ -460,7 +471,7 @@ class EventLedgerRecord(Base):
         Enum(LedgerEventType, native_enum=False),
         nullable=False,
     )
-    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON_VARIANT, nullable=False)
     recorded_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

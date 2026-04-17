@@ -158,3 +158,6 @@ Observed In:
 - ~~[RISK-0049 Lease renewal heartbeats may amplify control-plane write load as worker count grows](entries/2026-04-17-heartbeat-storm-under-lease-renewal.md)~~
 - ~~[RISK-0050 Lease expiry may become non-deterministic when worker clocks drift from store/server time](entries/2026-04-17-clock-drift-in-lease-expiry.md)~~
 - [RISK-0051 External side-effects may outlive reclaimed lease ownership even when stale results are fenced](entries/2026-04-17-external-side-effect-ghost-after-reclaim.md)
+- [RISK-0055 PostgreSQL connection exhaustion may appear when worker/controller fanout grows](entries/2026-04-17-postgres-connection-exhaustion-under-worker-fanout.md)
+- [RISK-0056 Schema drift may break Postgres migration without versioned migration control](entries/2026-04-17-schema-drift-during-postgres-migration.md)
+- [RISK-0057 Postgres write lock contention may reduce execution throughput under claim and renewal load](entries/2026-04-17-postgres-write-lock-contention-under-execution-load.md)

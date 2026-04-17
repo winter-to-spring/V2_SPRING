@@ -1,4 +1,4 @@
-.PHONY: env-init infra-up infra-down infra-logs venv install run compile test ci-smoke
+.PHONY: env-init infra-up infra-down infra-logs venv install run compile test ci-smoke db-upgrade db-current db-history
 
 COMPOSE_FILE=docker-compose.yml
 
@@ -32,6 +32,18 @@ compile:
 
 test:
 	PYTHONPATH=src pytest -q
+
+db-upgrade:
+	@DATABASE_URL=$${DATABASE_URL:-postgresql://v2_spring:change_me_postgres@localhost:5432/v2_spring}; \
+	alembic upgrade head
+
+db-current:
+	@DATABASE_URL=$${DATABASE_URL:-postgresql://v2_spring:change_me_postgres@localhost:5432/v2_spring}; \
+	alembic current
+
+db-history:
+	@DATABASE_URL=$${DATABASE_URL:-postgresql://v2_spring:change_me_postgres@localhost:5432/v2_spring}; \
+	alembic history
 
 ci-smoke:
 	@DATABASE_URL=$${DATABASE_URL:-sqlite+pysqlite:///./.local/ci.db}; \

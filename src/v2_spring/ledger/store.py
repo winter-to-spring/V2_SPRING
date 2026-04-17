@@ -13,6 +13,7 @@ from typing import Iterator
 from uuid import uuid4
 
 from sqlalchemy import create_engine, func, inspect, select, text, update
+from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -209,13 +210,37 @@ class LedgerStore:
     _RUNTIME_TRUST_RECOVERY_SUCCESS_THRESHOLD = 2
 
     def __init__(self, database_url: str) -> None:
-        self._engine = create_engine(database_url, future=True)
+        self._database_url = database_url
+        self._dialect_name = make_url(database_url).get_backend_name()
+        engine_kwargs: dict[str, object] = {"future": True}
+        if self._dialect_name == "postgresql":
+            engine_kwargs.update(
+                {
+                    "pool_pre_ping": True,
+                    "pool_size": 5,
+                    "max_overflow": 10,
+                    "pool_recycle": 1800,
+                },
+            )
+        self._engine = create_engine(database_url, **engine_kwargs)
         self._session_factory = sessionmaker(
             bind=self._engine,
             autoflush=False,
             expire_on_commit=False,
             future=True,
         )
+
+    @property
+    def dialect_name(self) -> str:
+        return self._dialect_name
+
+    @property
+    def supports_row_level_locking(self) -> bool:
+        return self._dialect_name == "postgresql"
+
+    @property
+    def supports_jsonb(self) -> bool:
+        return self._dialect_name == "postgresql"
 
     def ensure_schema(self) -> None:
         Base.metadata.create_all(self._engine)
@@ -337,8 +362,43 @@ class LedgerStore:
         )
 
     @staticmethod
-    def _load_execution_claim(session: Session, run_id: str) -> ExecutionClaimRecord | None:
-        return session.scalar(select(ExecutionClaimRecord).where(ExecutionClaimRecord.run_id == run_id).limit(1))
+    def _build_execution_claim_select(
+        run_id: str,
+        *,
+        for_update: bool = False,
+        skip_locked: bool = False,
+        dialect_name: str | None = None,
+    ):
+        statement = select(ExecutionClaimRecord).where(ExecutionClaimRecord.run_id == run_id).limit(1)
+        if for_update and dialect_name == "postgresql":
+            statement = statement.with_for_update(skip_locked=skip_locked)
+        return statement
+
+    @classmethod
+    def _load_execution_claim(
+        cls,
+        session: Session,
+        run_id: str,
+        *,
+        for_update: bool = False,
+        skip_locked: bool = False,
+        dialect_name: str | None = None,
+    ) -> ExecutionClaimRecord | None:
+        return session.scalar(
+            cls._build_execution_claim_select(
+                run_id,
+                for_update=for_update,
+                skip_locked=skip_locked,
+                dialect_name=dialect_name,
+            ),
+        )
+
+    def _load_run_for_claim_mutation(self, session: Session, run_id: str) -> RunRecord | None:
+        if self.supports_row_level_locking:
+            return session.scalar(
+                select(RunRecord).where(RunRecord.id == run_id).with_for_update().limit(1),
+            )
+        return session.get(RunRecord, run_id)
 
     @classmethod
     def _to_runtime_trust_view(cls, record: RuntimeTrustRecord) -> RuntimeTrustView:
@@ -513,7 +573,12 @@ class LedgerStore:
         run: RunRecord,
         mutation_name: str,
     ) -> None:
-        claim = self._load_execution_claim(session, run.id)
+        claim = self._load_execution_claim(
+            session,
+            run.id,
+            for_update=True,
+            dialect_name=self._dialect_name,
+        )
         if claim is None or claim.status != ExecutionClaimStatus.ACTIVE:
             return
         now = utc_now()
@@ -540,6 +605,10 @@ class LedgerStore:
         timeout_seconds: int,
         owner: str,
     ) -> ExecutionClaimRecord:
+        locked_run = self._load_run_for_claim_mutation(session, run.id)
+        if locked_run is None:  # pragma: no cover - defensive impossible edge
+            raise LookupError(f"Run {run.id} was not found while acquiring an execution claim.")
+        run = locked_run
         self._ensure_no_live_execution_claim(
             session=session,
             run=run,
@@ -547,7 +616,12 @@ class LedgerStore:
         )
         now = utc_now()
         lease_token = str(uuid4())
-        claim = self._load_execution_claim(session, run.id)
+        claim = self._load_execution_claim(
+            session,
+            run.id,
+            for_update=True,
+            dialect_name=self._dialect_name,
+        )
         if claim is None:
             claim = ExecutionClaimRecord(
                 run_id=run.id,
@@ -574,7 +648,15 @@ class LedgerStore:
                             f"Run {run.id} hit a concurrent execution-claim insert and dispatch was refused "
                             "to preserve single-owner semantics."
                         ),
-                        existing_claim=self._to_execution_claim_view(self._load_execution_claim(session, run.id) or claim),
+                        existing_claim=self._to_execution_claim_view(
+                            self._load_execution_claim(
+                                session,
+                                run.id,
+                                for_update=True,
+                                dialect_name=self._dialect_name,
+                            )
+                            or claim,
+                        ),
                     ),
                 ) from exc
         else:
@@ -666,7 +748,12 @@ class LedgerStore:
         execution_context_id: str,
         reason: str,
     ) -> None:
-        claim = self._load_execution_claim(session, run_id)
+        claim = self._load_execution_claim(
+            session,
+            run_id,
+            for_update=True,
+            dialect_name=self._dialect_name,
+        )
         if claim is None:
             return
         if claim.status != ExecutionClaimStatus.ACTIVE:
@@ -740,7 +827,15 @@ class LedgerStore:
     ) -> ExecutionClaimView | None:
         self.ensure_schema()
         with self.session() as session:
-            claim = self._load_execution_claim(session, run_id)
+            locked_run = self._load_run_for_claim_mutation(session, run_id)
+            if locked_run is None:
+                return None
+            claim = self._load_execution_claim(
+                session,
+                run_id,
+                for_update=True,
+                dialect_name=self._dialect_name,
+            )
             if claim is None or claim.status != ExecutionClaimStatus.ACTIVE:
                 return None
             task = session.get(TaskRecord, claim.task_id) if claim.task_id is not None else None
@@ -837,6 +932,8 @@ class LedgerStore:
             statement = select(ExecutionClaimRecord).where(ExecutionClaimRecord.status == ExecutionClaimStatus.ACTIVE)
             if run_id is not None:
                 statement = statement.where(ExecutionClaimRecord.run_id == run_id)
+            if self.supports_row_level_locking:
+                statement = statement.with_for_update(skip_locked=True)
             claims = list(session.scalars(statement.order_by(ExecutionClaimRecord.acquired_at.asc())).all())
             reclaimed: list[ExecutionClaimView] = []
             for claim in claims:
