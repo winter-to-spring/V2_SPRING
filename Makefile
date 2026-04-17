@@ -1,6 +1,7 @@
 .PHONY: env-init infra-up infra-down infra-logs venv install run compile test ci-smoke db-upgrade db-current db-history
 
 COMPOSE_FILE=docker-compose.yml
+ALEMBIC_BIN=$(if $(wildcard .venv/bin/alembic),.venv/bin/alembic,alembic)
 
 env-init:
 	@if [ -f .env ]; then \
@@ -35,15 +36,15 @@ test:
 
 db-upgrade:
 	@DATABASE_URL=$${DATABASE_URL:-postgresql://v2_spring:change_me_postgres@localhost:5432/v2_spring}; \
-	alembic upgrade head
+	$(ALEMBIC_BIN) upgrade head
 
 db-current:
 	@DATABASE_URL=$${DATABASE_URL:-postgresql://v2_spring:change_me_postgres@localhost:5432/v2_spring}; \
-	alembic current
+	$(ALEMBIC_BIN) current
 
 db-history:
 	@DATABASE_URL=$${DATABASE_URL:-postgresql://v2_spring:change_me_postgres@localhost:5432/v2_spring}; \
-	alembic history
+	$(ALEMBIC_BIN) history
 
 ci-smoke:
 	@DATABASE_URL=$${DATABASE_URL:-sqlite+pysqlite:///./.local/ci.db}; \

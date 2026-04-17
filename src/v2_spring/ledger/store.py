@@ -178,6 +178,23 @@ class ExecutionClaimConflictError(PermissionError):
         self.refusal = refusal
 
 
+class SchemaBootstrapRequiredError(RuntimeError):
+    """Raised when a migration-controlled database has not been bootstrapped yet."""
+
+
+@dataclass(frozen=True)
+class SchemaStatus:
+    """Compact schema-management status for doctor/bootstrap surfaces."""
+
+    dialect_name: str
+    management_mode: str
+    ready: bool
+    bootstrap_required: bool
+    migration_controlled: bool
+    current_revision: str | None
+    missing_tables: tuple[str, ...]
+
+
 class LedgerStore:
     """Typed persistence boundary for V2_SPRING tracer-bullet state and events."""
 
@@ -212,6 +229,7 @@ class LedgerStore:
     def __init__(self, database_url: str) -> None:
         self._database_url = database_url
         self._dialect_name = make_url(database_url).get_backend_name()
+        self._schema_ready = False
         engine_kwargs: dict[str, object] = {"future": True}
         if self._dialect_name == "postgresql":
             engine_kwargs.update(
@@ -242,10 +260,61 @@ class LedgerStore:
     def supports_jsonb(self) -> bool:
         return self._dialect_name == "postgresql"
 
+    def inspect_schema_status(self) -> SchemaStatus:
+        expected_tables = tuple(sorted(Base.metadata.tables.keys()))
+        with self._engine.begin() as connection:
+            inspector = inspect(connection)
+            table_names = set(inspector.get_table_names())
+            migration_controlled = "alembic_version" in table_names
+            current_revision = None
+            if migration_controlled:
+                current_revision = connection.execute(
+                    text("SELECT version_num FROM alembic_version LIMIT 1"),
+                ).scalar_one_or_none()
+            missing_tables = tuple(
+                table_name for table_name in expected_tables if table_name not in table_names
+            )
+
+        if self._dialect_name == "postgresql":
+            bootstrap_required = (not migration_controlled) or bool(missing_tables)
+            management_mode = "alembic_migration"
+            ready = not bootstrap_required
+        else:
+            bootstrap_required = False
+            management_mode = "sqlite_self_bootstrap"
+            ready = True
+
+        return SchemaStatus(
+            dialect_name=self._dialect_name,
+            management_mode=management_mode,
+            ready=ready,
+            bootstrap_required=bootstrap_required,
+            migration_controlled=migration_controlled,
+            current_revision=current_revision,
+            missing_tables=missing_tables,
+        )
+
     def ensure_schema(self) -> None:
+        if self._schema_ready:
+            return
+        if self._dialect_name == "postgresql":
+            status = self.inspect_schema_status()
+            if status.bootstrap_required:
+                missing_tables = ", ".join(status.missing_tables) if status.missing_tables else "-"
+                raise SchemaBootstrapRequiredError(
+                    "PostgreSQL schema is not bootstrapped yet. "
+                    "Run Alembic migrations before using the control plane. "
+                    f"current_revision={status.current_revision or '-'}; missing_tables={missing_tables}. "
+                    "Suggested command: `. .venv/bin/activate && DATABASE_URL=... alembic upgrade head`.",
+                )
+            self._backfill_approval_expirations()
+            self._schema_ready = True
+            return
+
         Base.metadata.create_all(self._engine)
         self._ensure_schema_columns()
         self._backfill_approval_expirations()
+        self._schema_ready = True
 
     def _ensure_schema_columns(self) -> None:
         with self._engine.begin() as connection:

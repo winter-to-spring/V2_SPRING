@@ -48,7 +48,9 @@ cp .env.example .env
 make infra-up
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e .
+pip install -e '.[dev]'
+make db-upgrade
+v2-spring doctor
 v2-spring --help
 ```
 

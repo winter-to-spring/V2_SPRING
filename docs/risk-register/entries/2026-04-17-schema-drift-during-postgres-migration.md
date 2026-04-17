@@ -37,6 +37,10 @@ Current mitigation:
 - Makefile migration targets now give the repo an explicit migration workflow
 - the PostgreSQL migration issue now treats schema evolution as versioned repo
   state rather than implicit ORM side effects
+- PostgreSQL hot paths now fail closed when migrations are missing, instead of
+  silently bootstrapping drift-prone tables from ORM metadata
+- `v2-spring doctor` can report migration control status and missing tables so
+  bootstrap drift is visible before normal control-plane commands run
 
 ## Capability Gate
 - Capability: Postgres-first primary store
@@ -59,3 +63,4 @@ Current mitigation:
 ## Last Updated
 - 2026-04-17
 - 2026-04-17 (mitigating in Step 21)
+- 2026-04-17 (migration-controlled bootstrap enforced in code)

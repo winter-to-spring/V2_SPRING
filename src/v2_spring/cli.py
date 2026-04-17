@@ -58,6 +58,8 @@ from v2_spring.ledger.store import (
     ExecutionClaimConflictError,
     IsolatedWorkerDispatchResult,
     LedgerStore,
+    SchemaStatus,
+    SchemaBootstrapRequiredError,
 )
 from v2_spring.planner.actions import evaluate_possible_actions
 from v2_spring.planner.proposals import (
@@ -78,7 +80,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command")
 
-    subparsers.add_parser("doctor", help="Show bootstrap status.")
+    doctor_parser = subparsers.add_parser("doctor", help="Show bootstrap and database status.")
+    doctor_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Override DATABASE_URL for this invocation.",
+    )
+    doctor_parser.add_argument(
+        "--format",
+        default="pretty",
+        choices=["pretty", "json"],
+        help="Output format. Defaults to pretty.",
+    )
     subparsers.add_parser("tracer-bullet", help="Print tracer bullet entrypoint guidance.")
 
     run_parser = subparsers.add_parser("run", help="Manage tracer bullet runs.")
@@ -882,8 +895,15 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _build_store(database_url_override: str | None) -> LedgerStore:
-    return LedgerStore(load_config(database_url_override).database_url)
+def _build_store(database_url_override: str | None, *, validate_schema: bool = True) -> LedgerStore:
+    store = LedgerStore(load_config(database_url_override).database_url)
+    if validate_schema:
+        try:
+            store.ensure_schema()
+        except SchemaBootstrapRequiredError as exc:
+            print(str(exc))
+            raise SystemExit(1) from exc
+    return store
 
 
 def _parse_cli_datetime(value: str | None) -> datetime | None:
@@ -1403,6 +1423,23 @@ def _render_snapshot(snapshot: RunSnapshotView) -> str:
                 )
             )
     return "\n".join(lines)
+
+
+def _render_schema_status(status: SchemaStatus) -> str:
+    missing_tables = ", ".join(status.missing_tables) if status.missing_tables else "-"
+    return dedent(
+        f"""\
+        Database doctor
+        ---------------
+        dialect:              {status.dialect_name}
+        management_mode:      {status.management_mode}
+        ready:                {str(status.ready).lower()}
+        bootstrap_required:   {str(status.bootstrap_required).lower()}
+        migration_controlled: {str(status.migration_controlled).lower()}
+        current_revision:     {status.current_revision or '-'}
+        missing_tables:       {missing_tables}
+        """,
+    ).strip()
 
 
 def _render_progress(progress: ProgressSummaryView) -> str:
@@ -2338,8 +2375,26 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.command == "doctor":
-        print("V2_SPRING bootstrap is present.")
-        print("Next milestone: deterministic substrate + CLI tracer bullet.")
+        store = _build_store(args.database_url, validate_schema=False)
+        status = store.inspect_schema_status()
+        if args.format == "json":
+            print(
+                json.dumps(
+                    {
+                        "dialect_name": status.dialect_name,
+                        "management_mode": status.management_mode,
+                        "ready": status.ready,
+                        "bootstrap_required": status.bootstrap_required,
+                        "migration_controlled": status.migration_controlled,
+                        "current_revision": status.current_revision,
+                        "missing_tables": list(status.missing_tables),
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                ),
+            )
+        else:
+            print(_render_schema_status(status))
         return
 
     if args.command == "tracer-bullet":
@@ -2844,7 +2899,7 @@ def main() -> None:
 
     if args.command == "planner" and args.planner_command == "invoke":
         config = load_config(args.database_url)
-        store = LedgerStore(config.database_url)
+        store = _build_store(args.database_url)
         try:
             repeated_failure_escalation = store.open_repeated_failure_founder_escalation_if_needed(args.run_id)
             if repeated_failure_escalation is not None:

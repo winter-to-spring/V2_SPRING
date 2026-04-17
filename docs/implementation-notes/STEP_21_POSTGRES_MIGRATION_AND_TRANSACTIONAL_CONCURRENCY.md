@@ -14,6 +14,14 @@
   - pool pre-ping for PostgreSQL engines
   - row-lock helpers for execution-claim mutation paths
   - `FOR UPDATE` / `SKIP LOCKED` claim access on Postgres
+- made schema bootstrap mode explicit:
+  - SQLite remains self-bootstrapping through ORM metadata create
+  - PostgreSQL now requires migration-controlled bootstrap and refuses
+    implicit ORM table creation on the hot path
+- added a richer `v2-spring doctor` surface so founder/operator flows can see
+  current DB dialect, migration control status, revision, and missing tables
+- Makefile migration helpers now prefer `.venv/bin/alembic` when available,
+  reducing local bootstrap drift
 
 ## Execution-claim focus
 
@@ -45,5 +53,8 @@ competing mutations around the same run or claim row.
 - `RISK-0055` moves to mitigating through controller-first connection ownership
   guidance and Postgres pool pre-ping defaults
 - `RISK-0056` moves to mitigating through Alembic baseline introduction
+- `RISK-0056` is further reduced because PostgreSQL paths now fail closed when
+  migrations have not been applied, instead of silently creating drift-prone
+  tables from ORM metadata
 - `RISK-0057` moves to mitigating through row-lock helpers, claim hot-path
   indexing, and targeted regression coverage

@@ -31,6 +31,10 @@ claim semantics 측면에서 한계가 명확합니다.
 - Postgres `DATABASE_URL` 공식 지원 경로
 - Alembic 기반 schema migration baseline
 - local/dev migration guidance 및 bootstrap
+- Postgres에서는 implicit ORM bootstrap을 금지하고 migration-controlled
+  bootstrap만 허용
+- founder/operator가 현재 DB dialect와 migration 상태를 읽을 수 있는
+  doctor/status surface
 - transactional execution claim acquire / renew / reclaim hardening
 - row-level lock 또는 이에 준하는 stronger mutation guard
 - audit ledger / event write path의 Postgres 호환성 검증
@@ -55,6 +59,8 @@ claim semantics 측면에서 한계가 명확합니다.
 ## Acceptance Criteria
 
 - Postgres를 주 저장소로 사용했을 때 CLI와 core flow가 정상 동작한다
+- Postgres 경로는 migration이 없으면 fail-closed 하며 drift-prone implicit
+  table creation을 하지 않는다
 - execution claim 관련 경로가 stronger transactional semantics를 가진다
 - schema migration 이력이 Alembic 등 코드 기반 도구로 관리된다
 - SQLite에서는 애매했던 동시 mutation 경계가 Postgres 기준으로 명시된다
