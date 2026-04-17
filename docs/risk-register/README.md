@@ -134,5 +134,5 @@ Observed In:
 - [RISK-0025 Founder review may become a throughput bottleneck without risk-based patch intake routing](entries/2026-04-17-patch-review-fatigue-and-routing.md)
 - [RISK-0026 Explicit dispatcher rules may sprawl into a hard-to-audit routing blob as runtimes grow](entries/2026-04-17-routing-policy-sprawl.md)
 - [RISK-0027 Soft-isolated worker proof lacks OS/container-level isolation for unrestricted bypass safety](entries/2026-04-17-lack-of-os-level-worker-isolation.md)
-- [RISK-0028 Patch may apply syntactically while still introducing semantic or validation-breaking drift](entries/2026-04-17-patch-semantic-conflict-after-apply.md)
-- [RISK-0029 Founder review may miss dangerous or over-broad patch changes without guided review signals](entries/2026-04-17-patch-review-danger-blindness.md)
+- ~~[RISK-0028 Patch may apply syntactically while still introducing semantic or validation-breaking drift](entries/2026-04-17-patch-semantic-conflict-after-apply.md)~~
+- ~~[RISK-0029 Founder review may miss dangerous or over-broad patch changes without guided review signals](entries/2026-04-17-patch-review-danger-blindness.md)~~

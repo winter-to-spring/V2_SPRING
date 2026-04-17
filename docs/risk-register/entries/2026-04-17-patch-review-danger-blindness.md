@@ -1,7 +1,7 @@
 # Risk ID: RISK-0029
-Title: Founder review may miss dangerous or over-broad patch changes without guided review signals
+Title: ~~Founder review may miss dangerous or over-broad patch changes without guided review signals~~
 Class: Before Next Phase
-Status: Open
+Status: Resolved
 Owner: Founder review surface / Intake gate
 Observed In: Step 12-c patch intake planning
 
@@ -34,6 +34,15 @@ If the review surface is too raw, the founder becomes the weakest safety link.
 - run a bounded danger-keyword/path scan and display warnings
 - show patch size and touched-file counts prominently
 - keep a raw diff/receipt escape hatch for deeper inspection
+
+Current resolution:
+
+- founder review now exposes a compact patch summary before the raw diff
+- warning signals include danger keywords, sensitive paths, file counts, and
+  oversized patch hints
+- raw diff and receipt data remain available through explicit review flags
+- the review gate stays strict, so guided warnings complement rather than
+  replace final founder approval
 
 ## Capability Gate
 - Capability: founder review gate for patch intake

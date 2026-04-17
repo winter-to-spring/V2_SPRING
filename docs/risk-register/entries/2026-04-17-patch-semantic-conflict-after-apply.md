@@ -1,7 +1,7 @@
 # Risk ID: RISK-0028
-Title: Patch may apply syntactically while still introducing semantic or validation-breaking drift
+Title: ~~Patch may apply syntactically while still introducing semantic or validation-breaking drift~~
 Class: Before Next Phase
-Status: Open
+Status: Resolved
 Owner: Patch intake / Validation boundary
 Observed In: Step 12-c patch intake planning
 
@@ -37,6 +37,15 @@ code corruption while still looking healthy at the ledger level.
 - record validation success/failure in the ledger and founder surface
 - reject applied patches that fail validation instead of treating them as a
   successful intake
+
+Current resolution:
+
+- patch intake now applies unified diffs with a strict all-or-nothing gate
+- base file hashes are checked before apply to reject drifted workspaces
+- bounded validation runs immediately after apply and records a validation
+  receipt artifact
+- failed apply or failed validation deterministically rejects the intake rather
+  than leaving a half-applied success path
 
 ## Capability Gate
 - Capability: patch intake / apply proof (Step 12-c)
